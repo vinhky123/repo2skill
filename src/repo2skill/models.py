@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Literal
+import unicodedata
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,8 @@ class TargetSpec:
 def _validate_repository_path(value: str) -> None:
     if not value or "\x00" in value or "\\" in value:
         raise ValueError("livePath must be a normalized repository-relative path")
+    if unicodedata.normalize("NFC", value) != value:
+        raise ValueError("livePath must use NFC Unicode normalization")
     path = PurePosixPath(value)
     windows = PureWindowsPath(value)
     if path.is_absolute() or windows.is_absolute() or windows.drive:

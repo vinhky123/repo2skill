@@ -130,6 +130,34 @@ def test_resolve_under_preserves_complete_missing_destination(tmp_path: Path) ->
     assert resolved == root / "safe" / "missing" / "destination"
 
 
+def test_root_dot_segments_are_normalized_without_resolving_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "My Project"
+    source = root / "src"
+    source.mkdir(parents=True)
+
+    assert resolve_under(source / "..", Path("AGENTS.md")) == root / "AGENTS.md"
+    assert default_targets(source / "..")[1].livePath == ".agents/skills/my-project"
+
+    monkeypatch.chdir(root)
+    assert resolve_under(Path("."), Path("AGENTS.md")) == root / "AGENTS.md"
+
+
+def test_root_link_before_parent_segment_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    link = root / "unsafe"
+    _make_directory_link(link, outside)
+
+    with pytest.raises(PathBoundaryError, match="symlink or reparse"):
+        resolve_under(link / "..", Path("AGENTS.md"))
+    with pytest.raises(PathBoundaryError, match="symlink or reparse"):
+        resolve_under(link, Path("AGENTS.md"))
+
+
 def test_model_constructors_validate_policy_and_target_invariants() -> None:
     with pytest.raises(ValueError, match="followSymlinks"):
         dataclasses.replace(default_scan_policy(), followSymlinks=True)
@@ -139,3 +167,5 @@ def test_model_constructors_validate_policy_and_target_invariants() -> None:
         TargetSpec("unsafe", "skill", "../outside", "whole-files", "keep")
     with pytest.raises(ValueError, match="livePath"):
         TargetSpec("unsafe", "skill", r"nested\outside", "whole-files", "keep")
+    with pytest.raises(ValueError, match="NFC"):
+        TargetSpec("unsafe", "skill", "cafe\u0301", "whole-files", "keep")

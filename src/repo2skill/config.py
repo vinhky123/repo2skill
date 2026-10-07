@@ -58,13 +58,7 @@ def default_targets(root: Path) -> tuple[TargetSpec, ...]:
 
 def resolve_under(root: Path, candidate: Path) -> Path:
     """Resolve a relative candidate for I/O without crossing unsafe components."""
-    try:
-        root_path = root.absolute()
-        root_stat = root_path.lstat()
-    except OSError as error:
-        raise PathBoundaryError(f"root is not accessible: {root}") from error
-    if not stat.S_ISDIR(root_stat.st_mode) or _is_link_or_reparse(root_path, root_stat):
-        raise PathBoundaryError(f"root must be a real directory: {root}")
+    root_path = _validated_root(root)
 
     candidate_text = str(candidate)
     windows = PureWindowsPath(candidate_text)
@@ -107,8 +101,44 @@ def _is_link_or_reparse(path: Path, path_stat: os.stat_result) -> bool:
     return path.is_symlink() or bool(attributes & reparse_flag)
 
 
+def _validated_root(root: Path) -> Path:
+    if root.is_absolute():
+        raw_root = root
+        current = Path(root.anchor)
+        parts = root.parts[1:]
+    else:
+        current = Path.cwd()
+        raw_root = current / root
+        parts = root.parts
+        _validate_root_component(current)
+
+    for part in parts:
+        if part == ".":
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        _validate_root_component(current)
+
+    return Path(os.path.normpath(raw_root))
+
+
+def _validate_root_component(path: Path) -> None:
+    try:
+        path_stat = path.lstat()
+    except OSError as error:
+        raise PathBoundaryError(f"root component is not accessible: {path}") from error
+    if _is_link_or_reparse(path, path_stat):
+        raise PathBoundaryError(f"symlink or reparse root component is not allowed: {path}")
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise PathBoundaryError(f"root component is not a directory: {path}")
+
+
 def _project_slug(root: Path) -> str:
-    normalized = unicodedata.normalize("NFKD", root.absolute().name)
+    absolute_root = root if root.is_absolute() else Path.cwd() / root
+    root_name = Path(os.path.normpath(absolute_root)).name
+    normalized = unicodedata.normalize("NFKD", root_name)
     ascii_name = normalized.encode("ascii", "ignore").decode("ascii").casefold()
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_name).strip("-") or "repository"
     reserved = {
