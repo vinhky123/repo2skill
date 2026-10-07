@@ -1,6 +1,6 @@
 # repo2skill
 
-> **Trạng thái hiện tại:** nền tảng package/policy của P0-01 đã được triển khai và đang chờ independent review. Package cài được ở chế độ development, nhưng CLI hiện chỉ chạy `--help` và `--version`; P0-02 đến P0-12 chưa được triển khai.
+> **Trạng thái hiện tại:** nền tảng package/policy của P0-01 đã hoàn tất review và kiểm chứng trên Windows/Python 3.13. Package cài được ở chế độ development, nhưng CLI hiện chỉ chạy `--help` và `--version`; P0-02 đến P0-12 chưa được triển khai.
 
 repo2skill được thiết kế như một generator tri thức repository có truy vết, chạy local-first. Nó sẽ đọc repository, tạo evidence và fact có kiểu, dựng claim có thể review, rồi sinh managed content cho `AGENTS.md`, một Agent Skill portable và báo cáo provenance. Người dùng đầu tiên được giả định là maintainer hoặc senior developer của repository đa ngôn ngữ đã dùng coding agent, nhưng cần biết mỗi command, path hay convention được lấy từ đâu và còn đúng với snapshot hiện tại hay không.
 

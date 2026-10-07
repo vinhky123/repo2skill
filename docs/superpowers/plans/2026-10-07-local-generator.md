@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Status:** Task P0-01 is implemented at `9bb120b` and pending independent review. Tasks P0-02 through P0-12 have not been executed. Commands belonging to those later tasks remain FUTURE; the current CLI exposes only global `--help` and `--version`.
+> **Status:** Task P0-01 is implemented at `9bb120b`, corrected at `466645e`, and independently reviewed. Final Windows/Python 3.13 verification: 13 passed, 1 platform-specific skip; wheel/sdist build and fresh wheel smoke passed. Tasks P0-02 through P0-12 have not been executed. Commands belonging to those later tasks remain FUTURE; the current CLI exposes only global `--help` and `--version`.
 
 **Goal:** Ship a useful local-only alpha that scans a repository, creates traceable claims, stages `AGENTS.md` and a portable Skill, reviews/exports owned content safely, and detects/explains drift without AI or network access.
 
@@ -46,16 +46,16 @@
 - Consumes: canonical `ScanPolicy`, `ClaimPolicy`, `TargetSpec` field sets from the spec.
 - Produces: `ScanPolicy`, `ClaimPolicy`, `TargetSpec`; package entry point; `resolve_under(root: Path, candidate: Path) -> Path`; `default_scan_policy() -> ScanPolicy`; `default_targets(root: Path) -> tuple[TargetSpec, ...]`; versioned defaults and dependency records.
 
-- [ ] **Red:** Test that defaults create both logical targets under root, reject `../outside`, and built wheel contains `THIRD_PARTY_NOTICES`.
+- [x] **Red:** Test that defaults create both logical targets under root, reject `../outside`, and built wheel contains `THIRD_PARTY_NOTICES`.
   ```python
   with pytest.raises(PathBoundaryError):
       resolve_under(root, Path("../outside"))
-  assert "agents-md" in default_targets(root)
+  assert "agents-md" in {target.targetId for target in default_targets(root)}
   ```
-- [ ] Run `python -m pytest tests/test_config.py tests/test_distribution.py -v`; expect FAIL because the package/config do not exist.
-- [ ] **Green:** Add the minimal package, dependency bounds, config defaults, notice, and file/rule reuse map; do not port code without an entry in the map.
-- [ ] Run the same command plus `python -m build`; expect PASS and wheel/sdist containing the notice.
-- [ ] Review F001/F002, then commit `build: establish package and reuse boundary`.
+- [x] Run `python -m pytest tests/test_config.py tests/test_distribution.py -v`; expect FAIL because the package/config do not exist.
+- [x] **Green:** Add the minimal package, dependency bounds, config defaults, notice, and file/rule reuse map; do not port code without an entry in the map.
+- [x] Run the same command plus `python -m build`; expect PASS and wheel/sdist containing the notice.
+- [x] Review F001/F002, then commit `build: establish package and reuse boundary`.
 
 ### Task P0-02: Canonical records, IDs, and versioned ledger
 
@@ -290,4 +290,4 @@
 - [ ] Run `python -m pytest -q`, `python -m build`, and wheel install smoke test; expect all PASS and `repo2skill --help` exit 0.
 - [ ] Self-review every P0 Must feature has an owning task and evidence, then commit `chore: verify no-ai alpha release`.
 
-Task P0-01 is implemented and pending independent review. Tasks P0-02 through P0-12 have not been executed; their checkboxes and commands remain future work.
+Task P0-01 is implemented and independently reviewed. Tasks P0-02 through P0-12 have not been executed; their checkboxes and commands remain future work.
