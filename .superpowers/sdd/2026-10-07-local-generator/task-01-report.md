@@ -134,3 +134,14 @@ can inspect the spelling. The persisted `TargetSpec.livePath` string rejects
 backslashes on every platform, and the same `resolve_under` parameter runs on
 POSIX where a backslash remains observable. The Windows run did exercise
 drive escapes and a real symlink/reparse ancestor, including a missing leaf.
+
+## Documentation handoff
+
+After the implementation commit, `README.md` was updated to describe the
+actual P0-01 milestone and give a Windows local-development quickstart. It
+states that only global `--help` and `--version` are runnable and keeps every
+generation/lifecycle command marked as future work. The P0 plan's top and
+bottom status lines now record Task P0-01 as implemented at `9bb120b` pending
+independent review, with P0-02 through P0-12 unexecuted. No task checkbox was
+changed, and no package or test file was edited for this documentation-only
+handoff.

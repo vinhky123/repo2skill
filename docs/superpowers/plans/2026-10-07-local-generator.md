@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Status:** Ready for review; not executed. Every command below is FUTURE and is not runnable in the current documentation-only repository.
+> **Status:** Task P0-01 is implemented at `9bb120b` and pending independent review. Tasks P0-02 through P0-12 have not been executed. Commands belonging to those later tasks remain FUTURE; the current CLI exposes only global `--help` and `--version`.
 
 **Goal:** Ship a useful local-only alpha that scans a repository, creates traceable claims, stages `AGENTS.md` and a portable Skill, reviews/exports owned content safely, and detects/explains drift without AI or network access.
 
@@ -290,4 +290,4 @@
 - [ ] Run `python -m pytest -q`, `python -m build`, and wheel install smoke test; expect all PASS and `repo2skill --help` exit 0.
 - [ ] Self-review every P0 Must feature has an owning task and evidence, then commit `chore: verify no-ai alpha release`.
 
-Plan is ready for review and has not been executed.
+Task P0-01 is implemented and pending independent review. Tasks P0-02 through P0-12 have not been executed; their checkboxes and commands remain future work.

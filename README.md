@@ -1,6 +1,6 @@
 # repo2skill
 
-> **Trạng thái hiện tại:** repository mới chỉ có nghiên cứu, đặc tả và kế hoạch. CLI chưa được triển khai, chưa có package để cài và chưa có lệnh sản phẩm nào chạy được.
+> **Trạng thái hiện tại:** nền tảng package/policy của P0-01 đã được triển khai và đang chờ independent review. Package cài được ở chế độ development, nhưng CLI hiện chỉ chạy `--help` và `--version`; P0-02 đến P0-12 chưa được triển khai.
 
 repo2skill được thiết kế như một generator tri thức repository có truy vết, chạy local-first. Nó sẽ đọc repository, tạo evidence và fact có kiểu, dựng claim có thể review, rồi sinh managed content cho `AGENTS.md`, một Agent Skill portable và báo cáo provenance. Người dùng đầu tiên được giả định là maintainer hoặc senior developer của repository đa ngôn ngữ đã dùng coding agent, nhưng cần biết mỗi command, path hay convention được lấy từ đâu và còn đúng với snapshot hiện tại hay không.
 
@@ -37,6 +37,18 @@ Nếu tài liệu cũ mâu thuẫn về interface hoặc lifecycle, MVP design v
 
 ## Bắt đầu công việc
 
-Công việc đầu tiên sẽ là các task P0 đầu tiên trong local-generator plan: khóa schema/CLI boundary, attribution và fixture, sau đó dựng inventory/snapshot trước khi nối extractor, claims, renderer, staging/export và drift/ownership. Chưa có phiên execution nào được khởi chạy từ các kế hoạch này.
+Cần Python 3.11 trở lên. Quickstart local trên Windows PowerShell:
 
-Mọi command sản phẩm xuất hiện trong tài liệu hiện nay đều là **FUTURE** hoặc ví dụ contract. Không dùng chúng như hướng dẫn cài đặt/chạy, và không quảng bá package đã publish. Mỗi thay đổi tương lai cần trỏ tới feature ID, acceptance/fixture tương ứng và giữ thứ tự P0 hoàn chỉnh trước P1 Codex/pilot.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m build
+.\.venv\Scripts\repo2skill.exe --help
+```
+
+Các lệnh này cài package local, chạy test, build wheel/sdist và hiển thị help. CLI hiện chưa có `init`, `scan`, `generate`, `review`, `export`, `check`, `explain`, `report` hoặc `doctor`; chỉ `repo2skill --help` và `repo2skill --version` là runnable.
+
+P0-01 đã khóa package bootstrap, ba policy/target record nền tảng, default versioned, confinement cho output path, attribution và reuse map. Công việc tiếp theo bắt đầu từ P0-02 trong local-generator plan; P0-02 đến P0-12 vẫn pending.
+
+Ngoài hai global option hiện có, mọi command sản phẩm xuất hiện trong tài liệu hiện nay đều là **FUTURE** hoặc ví dụ contract. Không dùng chúng như hướng dẫn chạy generation, và không quảng bá package đã publish. Mỗi thay đổi tương lai cần trỏ tới feature ID, acceptance/fixture tương ứng và giữ thứ tự P0 hoàn chỉnh trước P1 Codex/pilot.
