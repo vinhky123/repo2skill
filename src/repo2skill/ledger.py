@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from contextlib import contextmanager
+import dataclasses
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import types
+from typing import Any, Iterator, Literal, TypeVar, get_args, get_origin, get_type_hints
+
+from .config import PathBoundaryError, resolve_under
+from .ids import CanonicalIdContext, canonical_json_bytes
+from .models import (
+    ExportJournal,
+    JsonValue,
+    LedgerStoreSnapshot,
+    ManifestSet,
+    ProjectDocument,
+    ProjectState,
+    RunLedger,
+    TargetManifest,
+    validate_json_value,
+)
+
+
+T = TypeVar("T")
+
+
+class LockBusyError(RuntimeError):
+    """Another process owns the project mutation lock."""
+
+
+def _is_redirect(path: Path) -> bool:
+    path_stat = path.lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return path.is_symlink() or bool(getattr(path_stat, "st_file_attributes", 0) & reparse_flag)
+
+
+def _reject_redirected_ancestors(path: Path) -> None:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if not current.exists() and not current.is_symlink():
+            break
+        if _is_redirect(current):
+            raise ValueError(f"symlink or reparse path component is not allowed: {current}")
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_parent(path: Path) -> None:
+    _reject_redirected_ancestors(path.parent)
+    if not path.parent.is_dir() or _is_redirect(path.parent):
+        raise ValueError(f"document parent must be a real directory: {path.parent}")
+    if path.exists() or path.is_symlink():
+        if _is_redirect(path):
+            raise ValueError(f"document path must not be a symlink or reparse point: {path}")
+
+
+def write_immutable_document(path: Path, document: JsonValue) -> None:
+    """Durably publish a JSON document without replacing an existing path."""
+    validate_json_value(document)
+    _validate_parent(path)
+    if path.exists():
+        raise FileExistsError(path)
+    payload = canonical_json_bytes(document) + b"\n"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _replace_json(path: Path, document: JsonValue) -> None:
+    validate_json_value(document)
+    _validate_parent(path)
+    payload = canonical_json_bytes(document) + b"\n"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _encode(value: object) -> JsonValue:
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _encode(getattr(value, field.name)) for field in dataclasses.fields(value)}
+    if isinstance(value, tuple):
+        return [_encode(item) for item in value]
+    if isinstance(value, list):
+        return [_encode(item) for item in value]
+    if isinstance(value, Mapping):
+        result: dict[str, JsonValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("persisted mapping keys must be strings")
+            result[key] = _encode(item)
+        return result
+    validate_json_value(value)
+    return value  # type: ignore[return-value]
+
+
+def replace_state(path: Path, state: ProjectState) -> None:
+    """Atomically replace the state pointer; caller owns the project lock."""
+    _replace_json(path, _encode(state))
+
+
+@contextmanager
+def acquire_project_lock(state_dir: Path) -> Iterator[None]:
+    """Acquire the persistent lock file without waiting or unlinking it."""
+    _reject_redirected_ancestors(state_dir)
+    if not state_dir.is_dir() or _is_redirect(state_dir):
+        raise ValueError("state directory must be a real directory")
+    lock_path = state_dir / ".lock"
+    if lock_path.is_symlink() or (lock_path.exists() and _is_redirect(lock_path)):
+        raise ValueError("lock file must not be a symlink or reparse point")
+    stream = lock_path.open("a+b")
+    try:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+            os.fsync(stream.fileno())
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise LockBusyError("project state is busy") from error
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    finally:
+        stream.close()
+
+
+def _load_json(path: Path) -> dict[str, JsonValue]:
+    if path.is_symlink() or (path.exists() and _is_redirect(path)):
+        raise ValueError(f"persisted document must not be redirected: {path}")
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        value = json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"non-finite JSON number: {value}")))
+    validate_json_value(value)
+    if not isinstance(value, dict):
+        raise ValueError("persisted root document must be a JSON object")
+    return value
+
+
+def _decode_value(value: object, annotation: object, field: str) -> object:
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is Literal:
+        if value not in args:
+            raise ValueError(f"invalid {field}: {value!r}")
+        return value
+    if origin in {tuple}:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be an array")
+        item_type = args[0]
+        return tuple(_decode_value(item, item_type, field) for item in value)
+    if origin in {dict, Mapping} or (isinstance(origin, type) and issubclass(origin, Mapping)):
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        key_type, item_type = args
+        if key_type is not str:
+            return value
+        return {key: _decode_value(item, item_type, field) for key, item in value.items()}
+    if origin in {types.UnionType}:
+        if value is None and type(None) in args:
+            return None
+        for member in args:
+            if member is type(None):
+                continue
+            try:
+                return _decode_value(value, member, field)
+            except (TypeError, ValueError):
+                pass
+        # Recursive JsonValue aliases reach this path; the whole tree was validated already.
+        return value
+    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        return _decode_dataclass(value, annotation)
+    if annotation is bool:
+        if type(value) is not bool: raise ValueError(f"{field} must be a boolean")
+    elif annotation is int:
+        if type(value) is not int: raise ValueError(f"{field} must be an integer")
+    elif annotation is str:
+        if not isinstance(value, str): raise ValueError(f"{field} must be a string")
+    return value
+
+
+def _decode_dataclass(raw: dict[str, JsonValue], record_type: type[T]) -> T:
+    hints = get_type_hints(record_type)
+    values: dict[str, object] = {}
+    for field in dataclasses.fields(record_type):
+        if field.name not in raw:
+            raise ValueError(f"missing required field: {record_type.__name__}.{field.name}")
+        values[field.name] = _decode_value(raw[field.name], hints[field.name], f"{record_type.__name__}.{field.name}")
+    return record_type(**values)
+
+
+def decode_project_state(raw: dict[str, JsonValue]) -> ProjectState:
+    schema = raw.get("schemaVersion")
+    if not isinstance(schema, str) or schema.split(".", 1)[0] != "1":
+        raise ValueError(f"unknown schema major: {schema!r}")
+    return _decode_dataclass(raw, ProjectState)
+
+
+def decode_root_document(raw: dict[str, JsonValue], record_type: type[T]) -> T:
+    schema = raw.get("schemaVersion")
+    if not isinstance(schema, str) or schema.split(".", 1)[0] != "1":
+        raise ValueError(f"unknown schema major: {schema!r}")
+    return _decode_dataclass(raw, record_type)
+
+
+def _merge_additive(old: JsonValue, new: JsonValue) -> JsonValue:
+    if isinstance(old, dict) and isinstance(new, dict):
+        merged = dict(old)
+        for key, value in new.items():
+            merged[key] = _merge_additive(old[key], value) if key in old else value
+        return merged
+    if isinstance(old, list) and isinstance(new, list):
+        old_by_id = {
+            item[identity]: item
+            for item in old if isinstance(item, dict)
+            for identity in ("eventId", "operationId", "manifestId", "claimId", "factId", "evidenceId", "readId", "decisionId")
+            if identity in item and isinstance(item[identity], str)
+        }
+        result: list[JsonValue] = []
+        for item in new:
+            previous = None
+            if isinstance(item, dict):
+                previous = next((old_by_id[item[key]] for key in ("eventId", "operationId", "manifestId", "claimId", "factId", "evidenceId", "readId", "decisionId") if key in item and item[key] in old_by_id), None)
+            result.append(_merge_additive(previous, item) if previous is not None else item)
+        return result
+    return new
+
+
+class LedgerStore:
+    """Explicit project-local persistence and mutation-lock context."""
+
+    def __init__(self, root: Path, state_dir: Path) -> None:
+        self.root = Path(os.path.abspath(root))
+        if not self.root.is_dir() or _is_redirect(self.root):
+            raise ValueError("root must be an existing real directory")
+        candidate = state_dir if state_dir.is_absolute() else self.root / state_dir
+        self.state_dir = Path(os.path.abspath(candidate))
+        try:
+            relative = self.state_dir.relative_to(self.root)
+        except ValueError as error:
+            raise ValueError("state_dir must be confined under root") from error
+        if not relative.parts:
+            raise ValueError("state_dir must be below root")
+        try:
+            resolve_under(self.root, relative)
+        except PathBoundaryError as error:
+            raise ValueError(str(error)) from error
+        self._mutation_active = False
+        self._state_loaded = False
+        self._raw_state: dict[str, JsonValue] | None = None
+        self.id_context = CanonicalIdContext()
+
+    def _ensure_state_dir(self) -> None:
+        relative = self.state_dir.relative_to(self.root)
+        current = self.root
+        for part in relative.parts:
+            self._reject_case_collision(current, part)
+            current = current / part
+            if current.exists() or current.is_symlink():
+                if not current.is_dir() or _is_redirect(current):
+                    raise ValueError(f"state path is not a real directory: {current}")
+            else:
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    if not current.is_dir() or _is_redirect(current):
+                        raise ValueError(f"state path is not a real directory: {current}")
+        _fsync_directory(self.state_dir.parent)
+
+    @contextmanager
+    def mutation(self) -> Iterator[None]:
+        if self._mutation_active:
+            raise RuntimeError("nested mutation scopes are not allowed")
+        self._ensure_state_dir()
+        with acquire_project_lock(self.state_dir):
+            self._mutation_active = True
+            self._state_loaded = False
+            self._raw_state = None
+            try:
+                yield
+            finally:
+                self._mutation_active = False
+                self._state_loaded = False
+                self._raw_state = None
+
+    def read_state(self) -> ProjectState | None:
+        path = self.state_dir / "state.json"
+        if not path.exists():
+            if self._mutation_active:
+                self._state_loaded = True
+                self._raw_state = None
+            return None
+        raw = _load_json(path)
+        state = decode_project_state(raw)
+        if self._mutation_active:
+            self._state_loaded = True
+            self._raw_state = raw
+        return state
+
+    def read_project(self) -> ProjectDocument | None:
+        path = self.state_dir / "project.json"
+        if not path.exists():
+            return None
+        return decode_root_document(_load_json(path), ProjectDocument)
+
+    def read_run(self, run_id: str) -> RunLedger | None:
+        path = self._store_path(f"runs/{run_id}.json", create_parents=False)
+        if not path.exists():
+            return None
+        run = decode_root_document(_load_json(path), RunLedger)
+        if run.runId != run_id:
+            raise ValueError("run document ID does not match its path")
+        return run
+
+    def read_manifest_set(self, relative_path: str) -> ManifestSet | None:
+        path = self._store_path(relative_path, create_parents=False)
+        if not path.exists():
+            return None
+        return decode_root_document(_load_json(path), ManifestSet)
+
+    def read_target_manifest(self, relative_path: str) -> TargetManifest | None:
+        path = self._store_path(relative_path, create_parents=False)
+        if not path.exists():
+            return None
+        return decode_root_document(_load_json(path), TargetManifest)
+
+    def read_export_journal(self, relative_path: str) -> ExportJournal | None:
+        path = self._store_path(relative_path, create_parents=False)
+        if not path.exists():
+            return None
+        return decode_root_document(_load_json(path), ExportJournal)
+
+    def snapshot(self) -> LedgerStoreSnapshot:
+        """Read a coherent active view without creating or rewriting state."""
+        for _attempt in range(3):
+            first = self.read_state()
+            project = self.read_project()
+            if first is None or project is None:
+                raise FileNotFoundError("project and state documents are required")
+            if project.projectId != first.projectId:
+                raise ValueError("project and state project IDs do not match")
+            runs: dict[str, RunLedger] = {}
+            if first.currentRunId is not None:
+                run = self.read_run(first.currentRunId)
+                if run is None:
+                    raise ValueError("active run document is missing")
+                runs[first.currentRunId] = run
+            manifest_sets: dict[str, ManifestSet] = {}
+            if first.activeExportId is not None and first.activeManifestSetId is not None:
+                manifest = self.read_manifest_set(
+                    f"manifests/{first.activeExportId}/{first.activeManifestSetId}.json"
+                )
+                if manifest is None:
+                    raise ValueError("active manifest set document is missing")
+                if (
+                    manifest.exportId != first.activeExportId
+                    or manifest.manifestSetId != first.activeManifestSetId
+                ):
+                    raise ValueError("active manifest set IDs do not match the state pointer")
+                manifest_sets[first.activeExportId] = manifest
+            stage_locations: dict[tuple[str, int], str] = {}
+            if first.currentRunId is not None and first.activeStageRevision is not None:
+                prefix = self.state_dir.relative_to(self.root).as_posix()
+                location = f"{prefix}/staging/{first.currentRunId}/{first.activeStageRevision}"
+                stage_locations[(first.currentRunId, first.activeStageRevision)] = location
+            second = self.read_state()
+            if second is not None and canonical_json_bytes(_encode(first)) == canonical_json_bytes(_encode(second)):
+                return LedgerStoreSnapshot(project, second, runs, manifest_sets, stage_locations)
+        raise RuntimeError("state changed repeatedly while reading snapshot")
+
+    def replace_state(self, state: ProjectState) -> None:
+        self._require_mutation()
+        if not self._state_loaded:
+            raise RuntimeError("authoritative state must be read inside the mutation before commit")
+        encoded = _encode(state)
+        if self._raw_state is not None:
+            encoded = _merge_additive(self._raw_state, encoded)
+        _replace_json(self.state_dir / "state.json", encoded)
+        self._raw_state = encoded if isinstance(encoded, dict) else None
+
+    def write_immutable(self, relative_path: str, document: JsonValue) -> None:
+        self._require_mutation()
+        path = self._store_path(relative_path, create_parents=True)
+        write_immutable_document(path, document)
+
+    def _store_path(self, relative_path: str, *, create_parents: bool) -> Path:
+        candidate = Path(relative_path)
+        if candidate.is_absolute() or "\\" in relative_path or any(part in {"", ".", ".."} for part in candidate.parts):
+            raise ValueError("store path must be normalized and relative")
+        if not self.state_dir.exists():
+            if create_parents:
+                raise RuntimeError("state directory must be created by mutation scope")
+            return self.state_dir / candidate
+        destination = resolve_under(self.state_dir, candidate)
+        if create_parents:
+            current = self.state_dir
+            for part in candidate.parts[:-1]:
+                self._reject_case_collision(current, part)
+                current = current / part
+                if current.exists() or current.is_symlink():
+                    if not current.is_dir() or _is_redirect(current):
+                        raise ValueError(f"store path is redirected: {current}")
+                else:
+                    current.mkdir()
+        return destination
+
+    @staticmethod
+    def _reject_case_collision(parent: Path, name: str) -> None:
+        if not parent.is_dir():
+            return
+        folded = name.casefold()
+        for entry in os.listdir(parent):
+            if entry.casefold() == folded and entry != name:
+                raise ValueError(f"case-colliding store path component: {name}")
+
+    def _require_mutation(self) -> None:
+        if not self._mutation_active:
+            raise RuntimeError("stateful write requires an active mutation scope")
