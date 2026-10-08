@@ -106,6 +106,10 @@ def test_glob_addition_and_deletion_change_only_recorded_glob(tmp_path: Path):
     (tmp_path / "two.json").unlink()
     deleted = recheck_dependencies(run, identity, revision, {"sample": "1"}, root=tmp_path, current_root_label="repo", excluded_paths=())
     assert deleted.status == "fresh"
+    (tmp_path / "one.json").unlink()
+    original_match_deleted = recheck_dependencies(run, identity, revision, {"sample": "1"}, root=tmp_path, current_root_label="repo", excluded_paths=())
+    assert original_match_deleted.status == "stale"
+    assert any(item.code == "dependency.changed" for item in original_match_deleted.findings)
 
 
 def test_negative_predicate_change_is_stale(tmp_path: Path):
