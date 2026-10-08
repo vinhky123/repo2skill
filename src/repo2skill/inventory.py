@@ -444,7 +444,14 @@ def _capture_ignore_control(
             budget.incomplete = budget.incomplete or "io-error"
             return IgnoreControlObservation(selector, "io-error", None, (), None, 0, 0), None
         guarded_file = directory.open_file(name)
-    except (OSError, UnsafePathError):
+    except UnsafePathError as error:
+        opened_count = 1 if error.handle_opened else 0
+        budget.opened += opened_count
+        budget.incomplete = budget.incomplete or "io-error"
+        return IgnoreControlObservation(
+            selector, "io-error", None, (), None, opened_count, 0
+        ), None
+    except OSError:
         budget.incomplete = budget.incomplete or "io-error"
         return IgnoreControlObservation(selector, "io-error", None, (), None, 0, 0), None
     budget.opened += 1

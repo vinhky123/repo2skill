@@ -278,6 +278,62 @@ def test_inventory_does_not_read_replaced_ignore_control(
     assert observations[0].contentHash is None
 
 
+def test_control_open_identity_race_charges_a_successfully_opened_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = tmp_path / ".gitignore"
+    replacement = tmp_path / "replacement"
+    _write(control, "original.txt\n")
+    _write(replacement, "replacement.txt\n")
+    original_lstat = GuardedDirectory.lstat
+    control_checks = 0
+
+    def lstat_then_replace(directory: GuardedDirectory, name: str) -> os.stat_result:
+        nonlocal control_checks
+        result = original_lstat(directory, name)
+        if directory.path == tmp_path and name == ".gitignore":
+            control_checks += 1
+            if control_checks == 2:
+                replacement.replace(control)
+        return result
+
+    monkeypatch.setattr(GuardedDirectory, "lstat", lstat_then_replace)
+    observations: list[IgnoreControlObservation] = []
+
+    collect_inventory(tmp_path, default_scan_policy(), control_sink=observations.append)
+
+    assert observations[0].outcome == "io-error"
+    assert observations[0].openedFileCount == 1
+    assert observations[0].decodedByteCount == 0
+
+
+def test_control_open_failure_before_handle_does_not_charge_opened_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = tmp_path / ".gitignore"
+    _write(control, "rule.txt\n")
+    original_lstat = GuardedDirectory.lstat
+    control_checks = 0
+
+    def lstat_then_remove(directory: GuardedDirectory, name: str) -> os.stat_result:
+        nonlocal control_checks
+        result = original_lstat(directory, name)
+        if directory.path == tmp_path and name == ".gitignore":
+            control_checks += 1
+            if control_checks == 2:
+                control.unlink()
+        return result
+
+    monkeypatch.setattr(GuardedDirectory, "lstat", lstat_then_remove)
+    observations: list[IgnoreControlObservation] = []
+
+    collect_inventory(tmp_path, default_scan_policy(), control_sink=observations.append)
+
+    assert observations[0].outcome == "io-error"
+    assert observations[0].openedFileCount == 0
+    assert observations[0].decodedByteCount == 0
+
+
 def test_inventory_caps_after_canonical_sort_and_reports_required_gap(tmp_path: Path) -> None:
     for name in ("z.txt", "a.txt", "m.txt"):
         _write(tmp_path / name)

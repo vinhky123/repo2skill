@@ -9,6 +9,10 @@ import unicodedata
 class UnsafePathError(OSError):
     """A filesystem object changed identity or is a redirect/boundary."""
 
+    def __init__(self, message: str, *, handle_opened: bool = False):
+        self.handle_opened = handle_opened
+        super().__init__(message)
+
 
 def _validate_name(name: str) -> str:
     if (
@@ -170,10 +174,19 @@ class GuardedDirectory:
                 descriptor = os.open(child, flags, dir_fd=self._descriptor)
             except OSError as error:
                 raise UnsafePathError(f"file child could not be guarded: {child}") from error
-            after = os.fstat(descriptor)
+            try:
+                after = os.fstat(descriptor)
+            except OSError as error:
+                os.close(descriptor)
+                raise UnsafePathError(
+                    f"file child metadata unavailable after open: {child}",
+                    handle_opened=True,
+                ) from error
             if not stat.S_ISREG(after.st_mode) or not _same_identity(before, after):
                 os.close(descriptor)
-                raise UnsafePathError(f"file child changed before guard: {child}")
+                raise UnsafePathError(
+                    f"file child changed before guard: {child}", handle_opened=True
+                )
             return GuardedFile(descriptor, after)
         return _open_windows_file(
             self.path / child,
@@ -291,7 +304,7 @@ def _open_windows_directory(
     after = os.stat(path, follow_symlinks=False)
     if not _same_identity(before, after):
         _close_windows_handle(handle)
-        raise UnsafePathError("directory changed before guard")
+        raise UnsafePathError("directory changed before guard", handle_opened=True)
     return GuardedDirectory(
         path,
         after,
@@ -311,19 +324,30 @@ def _open_windows_file(
     )
     if attributes & _FILE_ATTRIBUTE_DIRECTORY:
         _close_windows_handle(handle)
-        raise UnsafePathError("guarded file has the wrong type")
-    after = os.stat(path, follow_symlinks=False)
+        raise UnsafePathError("guarded file has the wrong type", handle_opened=True)
+    try:
+        after = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        _close_windows_handle(handle)
+        raise UnsafePathError("file path changed after handle open", handle_opened=True) from error
     if not _same_identity(before, after):
         _close_windows_handle(handle)
-        raise UnsafePathError("file changed before guard")
+        raise UnsafePathError("file changed before guard", handle_opened=True)
     try:
         descriptor = msvcrt.open_osfhandle(
             handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
     except OSError:
         _close_windows_handle(handle)
-        raise
-    return GuardedFile(descriptor, os.fstat(descriptor))
+        raise UnsafePathError("file handle could not be wrapped", handle_opened=True)
+    try:
+        stat_before = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise UnsafePathError(
+            "file handle metadata is unavailable", handle_opened=True
+        ) from error
+    return GuardedFile(descriptor, stat_before)
 
 
 def _open_windows_guard(
@@ -358,8 +382,10 @@ def _open_windows_guard(
             if os.path.dirname(final_path) != parent:
                 raise UnsafePathError("guarded child resolves outside its parent")
         return numeric_handle, final_path, information.dwFileAttributes
-    except BaseException:
+    except BaseException as error:
         _close_windows_handle(numeric_handle)
+        if isinstance(error, UnsafePathError) and not error.handle_opened:
+            raise UnsafePathError(str(error), handle_opened=True) from error
         raise
 
 
