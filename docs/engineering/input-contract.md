@@ -66,6 +66,8 @@ def capture_repository(
 
 Identity applies `policy` and `excluded_paths` when constructing tracked/untracked/deleted input summaries. It does not read project configuration or attach hidden attributes to inventory.
 
+An include value prefixed with `literal:` is an explicit canonical path, including filenames containing glob metacharacters. For example, `literal:ignored/a[b].txt` can override an ordinary ignore for that exact file. Normalize Windows separators in the suffix before validating the original slash-separated components. Unprefixed include values without glob metacharacters retain their existing exact-path meaning; other unprefixed include values are patterns and do not bypass normal ignores. `literal:` applies only to include values, never to configured excluded paths or selectors. Fingerprints retain the explicit include value.
+
 ## 2. Extraction runtime without ambient state
 
 Sections 2–7 below are normative execution rulings for P0-04 and its P0-05 consumers.
