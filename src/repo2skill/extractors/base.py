@@ -2,18 +2,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
 import re
 import unicodedata
-import uuid
 from typing import Protocol
 
 from pathspec import GitIgnoreSpec
 
-from ..ids import canonical_json_bytes, canonical_record_id, revise_record
+from ..ids import CanonicalIdContext, canonical_json_bytes, revise_record
 from ..inventory import INVENTORY_VERSION, IgnoreControlObservation
 from ..models import (
     CoverageEntry, Diagnostic, Evidence, EvidenceLocator, ExtractionBatch,
@@ -45,12 +43,14 @@ class ExtractionSession:
     def __init__(self, *, root: Path, snapshot_id: str, inventory: InventoryResult,
                  policy: ScanPolicy, repository_id: str, prior_evidence: Sequence[Evidence],
                  prior_facts: Sequence[Fact], excluded_paths: Sequence[RepositoryPath],
-                 control_observations: Sequence[IgnoreControlObservation]):
+                 control_observations: Sequence[IgnoreControlObservation],
+                 id_context: CanonicalIdContext | None = None):
         self.root = Path(os.path.abspath(root))
         if Path(os.path.abspath(inventory.root)) != self.root:
             raise ValueError("inventory root does not match extraction root")
         self.snapshot_id, self.inventory, self.policy = snapshot_id, inventory, policy
         self.repository_id = repository_id
+        self.id_context = id_context or CanonicalIdContext()
         self.prior_evidence = {item.evidenceId: item for item in prior_evidence}
         self.prior_facts = {item.factId: item for item in prior_facts}
         self.excluded_paths = tuple(excluded_paths)
@@ -66,6 +66,9 @@ class ExtractionSession:
         self._opened = sum(item.openedFileCount for item in control_observations)
         self._decoded = sum(item.decodedByteCount for item in control_observations)
         self._snippet = 0
+        self._literal_reservations: set[bytes] = set()
+        self._reserved_previews: dict[bytes, int] = {}
+        self._evidence_by_id: dict[str, Evidence] = {}
         self._diagnostics: list[Diagnostic] = []
         self._coverage: list[CoverageEntry] = []
         self._evidence: list[Evidence] = []
@@ -87,16 +90,59 @@ class ExtractionSession:
             raise ValueError("control handoff contains duplicate selectors")
         aggregate = aggregates[0]
         files = [item for item in self.control_observations if item.selector.type == "file"]
-        if any(item.selector.value != item.selector.value.replace("\\", "/") or item.selector.scope != "." for item in self.control_observations):
+        if len(files) + 1 != len(self.control_observations):
+            raise ValueError("control handoff contains an unsupported selector")
+        if aggregate.selector != InputSelector("glob", "**/.gitignore", ".", True):
+            raise ValueError("control aggregate selector must be required root **/.gitignore")
+        if aggregate.contentHash is not None or aggregate.openedFileCount != 0 or aggregate.decodedByteCount != 0:
+            raise ValueError("control aggregate cannot contain file bytes or budget charges")
+        if aggregate.outcome not in {"matched", "no-match", "capped", "io-error"}:
+            raise ValueError("control aggregate has an invalid outcome")
+        if any(item.selector.value != unicodedata.normalize("NFC", item.selector.value) or "\\" in item.selector.value or item.selector.scope != "." for item in self.control_observations):
             raise ValueError("control handoff selectors must be canonical root paths")
+        if any(item.selector.required is not True for item in files):
+            raise ValueError("per-file control selectors must be required")
+        if any(item.selector.value.rsplit("/", 1)[-1] != ".gitignore" for item in files):
+            raise ValueError("per-file control selector must name a .gitignore file")
+        if any(item.selector.value.startswith("/") or any(part in {"", ".", ".."} for part in item.selector.value.split("/")) for item in files):
+            raise ValueError("per-file control selector must be a canonical repository path")
         if tuple(sorted(item.selector.value for item in files)) != aggregate.matchPaths:
             raise ValueError("control aggregate paths differ from file observations")
+        if any(item.matchPaths or item.matchSetHash is not None for item in files):
+            raise ValueError("per-file control observations cannot contain match sets")
+        for item in files:
+            if item.outcome not in {"present", "capped", "decode-error", "io-error"}:
+                raise ValueError("per-file control observation has an invalid outcome")
+            if item.contentHash is not None and item.outcome not in {"present"}:
+                raise ValueError("only a present control observation can carry a source hash")
+            if item.outcome == "present" and item.contentHash is None:
+                raise ValueError("present control observation requires its source hash")
+            if item.outcome == "present" and item.openedFileCount != 1:
+                raise ValueError("present control observation must account for one opened file")
+            if item.outcome == "decode-error" and (item.openedFileCount != 1 or item.decodedByteCount != 0):
+                raise ValueError("decode-error control observation has inconsistent budgets")
+            if item.outcome == "io-error" and (item.openedFileCount not in {0, 1} or item.decodedByteCount != 0):
+                raise ValueError("io-error control observation has inconsistent budgets")
+            if item.outcome == "capped" and (item.openedFileCount not in {0, 1} or item.decodedByteCount != 0):
+                raise ValueError("capped control observation has inconsistent budgets")
+            if item.outcome == "present" and item.decodedByteCount > self.policy.maxFileBytes:
+                raise ValueError("control observation decoded bytes exceed the per-file cap")
+            if item.outcome == "present" and not re.fullmatch(r"sha256:[0-9a-f]{64}", item.contentHash or ""):
+                raise ValueError("present control observation has an invalid source hash")
+        if aggregate.outcome in {"matched", "no-match"} and any(item.outcome != "present" for item in files):
+            raise ValueError("complete control aggregate contains an incomplete file observation")
         if aggregate.outcome in {"matched", "no-match"}:
+            if (aggregate.outcome == "matched") != bool(aggregate.matchPaths):
+                raise ValueError("complete control aggregate outcome disagrees with its match paths")
+            if (aggregate.outcome == "matched") != bool(files):
+                raise ValueError("complete control aggregate outcome disagrees with file observations")
             expected = "sha256:" + hashlib.sha256(canonical_json_bytes(list(aggregate.matchPaths))).hexdigest()
             if aggregate.matchSetHash != expected:
                 raise ValueError("control aggregate match hash is inconsistent")
         elif aggregate.matchSetHash is not None:
             raise ValueError("incomplete control aggregate cannot have a match hash")
+        if tuple(sorted(set(aggregate.matchPaths))) != aggregate.matchPaths:
+            raise ValueError("control aggregate match paths must be sorted and unique")
         for item in files:
             if item.outcome == "present" and item.contentHash is None:
                 raise ValueError("present control observation requires its source hash")
@@ -124,7 +170,7 @@ class ExtractionSession:
         reads = []
         for observation in self.control_observations:
             selector = observation.selector
-            read_id = canonical_record_id("read", {"snapshot": self.snapshot_id, "extractor": "inventory", "rule": "inventory.ignore-control", "selector": selector})
+            read_id = self.id_context.record_id("read", {"snapshot": self.snapshot_id, "extractor": "inventory", "rule": "inventory.ignore-control", "selector": selector})
             reads.append(ExtractionRead(1, read_id, self.snapshot_id, "inventory", INVENTORY_VERSION,
                 "inventory.ignore-control", INVENTORY_VERSION, selector.type, selector, selector.required,
                 observation.outcome, observation.contentHash, observation.matchPaths,
@@ -141,7 +187,7 @@ class ExtractionSession:
         return ExtractionContext(self.root, self.snapshot_id, self.inventory, self.policy, read)
 
     def _diagnose(self, code: str, path: str | None, extractor_id: str) -> str:
-        diagnostic_id = canonical_record_id("diagnostic", {"snapshot": self.snapshot_id, "code": code, "path": path, "extractor": extractor_id})
+        diagnostic_id = self.id_context.record_id("diagnostic", {"snapshot": self.snapshot_id, "code": code, "path": path, "extractor": extractor_id})
         self._diagnostics.append(Diagnostic(1, code, "warning", code.replace("-", " "), path, extractor_id, {}))
         return diagnostic_id
 
@@ -211,7 +257,7 @@ class ExtractionSession:
         except Exception:
             outcome, error = "io-error", "io-error"
             diagnostics = (self._diagnose("read-io-error", selector.value if selector.type == "file" else None, extractor_id),)
-        read_id = canonical_record_id("read", {"snapshot": self.snapshot_id, "extractor": extractor_id, "rule": rule_id, "selector": selector})
+        read_id = self.id_context.record_id("read", {"snapshot": self.snapshot_id, "extractor": extractor_id, "rule": rule_id, "selector": selector})
         dependency = ExtractionRead(1, read_id, self.snapshot_id, extractor_id, version, rule_id, rule_version, selector.type, selector, selector.required, outcome, content_hash, match_paths, match_hash, diagnostics)  # type: ignore[arg-type]
         result = ReadResult(selector, dependency, payload, encoding, error)
         self._logical[key] = result
@@ -288,50 +334,70 @@ class ExtractionSession:
     def add_evidence(self, *, extractor_id: str, path: str, content_hash: str, semantic_key: str,
                      media_type: str, encoding: str | None, locator: EvidenceLocator,
                      preview: str | None) -> Evidence:
+        identity = {"repository": self.repository_id, "path": path, "locator": locator, "semanticKey": semantic_key}
+        evidence_id = self.id_context.record_id("evidence", identity)
+        existing = self._evidence_by_id.get(evidence_id)
+        if existing is not None:
+            return existing
         if preview is not None:
             preview = redact_text(preview)
-            remaining = self.policy.maxSnippetBytes - self._snippet
             encoded = preview.encode("utf-8")
-            if len(encoded) > remaining:
-                encoded = encoded[:max(0, remaining)]
-                while True:
-                    try:
-                        preview = encoded.decode("utf-8")
-                        break
-                    except UnicodeDecodeError:
-                        encoded = encoded[:-1]
-                self._coverage.append(CoverageEntry(1, InputSelector("file", path, ".", False), extractor_id, "capped", "snippet-budget", ()))
-            self._snippet += len(preview.encode("utf-8"))
-        identity = {"repository": self.repository_id, "path": path, "locator": locator, "semanticKey": semantic_key}
-        evidence_id = canonical_record_id("evidence", identity)
+            preview_key = canonical_json_bytes(identity)
+            reserved = self._reserved_previews.pop(preview_key, None)
+            if reserved is not None:
+                if reserved != len(encoded):
+                    raise ValueError("reserved preview differs from emitted preview")
+            else:
+                remaining = self.policy.maxSnippetBytes - self._snippet
+                if len(encoded) > remaining:
+                    encoded = encoded[:max(0, remaining)]
+                    while True:
+                        try:
+                            preview = encoded.decode("utf-8")
+                            break
+                        except UnicodeDecodeError:
+                            encoded = encoded[:-1]
+                    self._coverage.append(CoverageEntry(1, InputSelector("file", path, ".", False), extractor_id, "capped", "snippet-budget", ()))
+                self._snippet += len(preview.encode("utf-8"))
         item = Evidence(1, evidence_id, 1, self.snapshot_id, path, content_hash, semantic_key, media_type, encoding, locator, preview, "available")
         item = revise_record(self.prior_evidence.get(evidence_id), item, semantic_payload=lambda e: {"contentHash": e.contentHash, "locator": e.locator, "preview": e.redactedPreview}, revision_field="revision")
         self._evidence.append(item)
+        self._evidence_by_id[evidence_id] = item
         return item
 
     def add_fact(self, *, extractor_id: str, rule_id: str, rule_version: str, fact_type: str,
                  scope: str, semantic_key: str, value: object, derivation: str,
-                 evidence_ids: Sequence[str]) -> Fact:
+                 evidence_ids: Sequence[str]) -> Fact | None:
         safe_value = redact_value(None, value)
-        identity = {"repository": self.repository_id, "scope": scope, "factType": fact_type, "semanticKey": semantic_key}
-        fact_id = canonical_record_id("fact", identity)
+        identity = self._fact_identity(scope, fact_type, semantic_key)
+        fact_id = self.id_context.record_id("fact", identity)
         item = Fact(1, fact_id, 1, self.snapshot_id, fact_type, semantic_key, scope, safe_value, derivation, rule_id, rule_version, tuple(evidence_ids))  # type: ignore[arg-type]
         item = revise_record(self.prior_facts.get(fact_id), item, semantic_payload=lambda f: f.value, revision_field="factRevision")
         self._facts.append(item)
         return item
 
     def _bounded_text(self, text: str) -> str:
-        safe = redact_text(text)
-        remaining = max(0, self.policy.maxSnippetBytes - self._snippet)
-        encoded = safe.encode("utf-8")[:remaining]
-        while True:
-            try:
-                safe = encoded.decode("utf-8")
-                break
-            except UnicodeDecodeError:
-                encoded = encoded[:-1]
-        self._snippet += len(encoded)
-        return safe
+        return redact_text(text)
+
+    def _fact_identity(self, scope: str, fact_type: str, semantic_key: str) -> dict[str, object]:
+        return {"repository": self.repository_id, "scope": scope, "factType": fact_type, "semanticKey": semantic_key}
+
+    def reserve_fact_text(self, text: str, *, rule_id: str, fact_type: str, scope: str,
+                          semantic_key: str, additional_preview_bytes: int = 0,
+                          preview_identity: object | None = None) -> bool:
+        key = canonical_json_bytes(self._fact_identity(scope, fact_type, semantic_key))
+        text_cost = 0 if key in self._literal_reservations else len(text.encode("utf-8"))
+        preview_key = canonical_json_bytes(preview_identity) if preview_identity is not None else None
+        preview_cost = 0 if preview_key is None or preview_key in self._reserved_previews else additional_preview_bytes
+        if self._snippet + text_cost + preview_cost > self.policy.maxSnippetBytes:
+            return False
+        if text_cost:
+            self._snippet += text_cost
+            self._literal_reservations.add(key)
+        if preview_key is not None and preview_cost:
+            self._snippet += preview_cost
+            self._reserved_previews[preview_key] = preview_cost
+        return True
 
     def make_batch(self, reads: Sequence[ExtractionRead] = ()) -> ExtractionBatch:
         return ExtractionBatch(tuple(reads), tuple(self._evidence), tuple(self._facts), tuple(self._diagnostics), tuple(self._coverage))

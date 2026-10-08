@@ -120,10 +120,13 @@ def _affected(run: RunLedger, changed_rules: set[str], changed_paths: set[str], 
 
 def recheck_dependencies(run: RunLedger, current_identity: RepositoryIdentity,
                          current_policy_revision: str, current_extractor_versions: Mapping[str, str],
-                         *, root: Path, excluded_paths: Sequence[str]) -> DependencyRecheckResult:
+                         *, root: Path, current_root_label: str,
+                         excluded_paths: Sequence[str]) -> DependencyRecheckResult:
     root = Path(os.path.abspath(root))
     if Path(os.path.abspath(current_identity.root)) != root:
         raise ValueError("current identity root differs from recheck root")
+    if not current_root_label:
+        raise ValueError("current_root_label is required")
     policy_changed = current_policy_revision != run.snapshot.policyRevision
     identity_changed = _identity_projection(current_identity) != {
         "repositoryId": run.snapshot.repositoryId, "gitMode": run.snapshot.gitMode,
@@ -138,6 +141,10 @@ def recheck_dependencies(run: RunLedger, current_identity: RepositoryIdentity,
         findings.append(Finding(1, "dependency.policy-changed", "stale", "effective policy changed", None, None, (), {}))
     if identity_changed:
         findings.append(Finding(1, "dependency.identity-changed", "stale", "repository identity changed", None, None, (), {}))
+    root_label_changed = current_root_label != run.snapshot.rootLabel
+    stale = stale or root_label_changed
+    if root_label_changed:
+        findings.append(Finding(1, "dependency.root-label-changed", "stale", "repository root label changed", None, None, (), {}))
     versions = dict(current_extractor_versions)
     if versions != dict(run.snapshot.extractorVersions):
         changed_ids = {key for key in set(versions) | set(run.snapshot.extractorVersions) if versions.get(key) != run.snapshot.extractorVersions.get(key)}
@@ -168,6 +175,6 @@ def recheck_dependencies(run: RunLedger, current_identity: RepositoryIdentity,
                     changed_paths.add(path)
                 changed_paths.update(set(prior.matchPaths) ^ set(current.matchPaths))
                 findings.append(Finding(1, "dependency.changed", "stale", "recorded dependency changed", path, None, (), {"ruleId": prior.ruleId, "selectorType": prior.dependencyType}))
-    affected = _affected(run, changed_rules, changed_paths, global_change=policy_changed or identity_changed)
+    affected = _affected(run, changed_rules, changed_paths, global_change=policy_changed or identity_changed or root_label_changed)
     status = "stale" if stale else "unknown" if unknown else "fresh"
     return DependencyRecheckResult(status, affected, tuple(findings))

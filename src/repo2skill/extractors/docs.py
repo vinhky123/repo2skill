@@ -19,7 +19,7 @@ class DocumentationExtractor:
         self.session = session
 
     def discover(self, ctx: ExtractionContext) -> tuple[InputSelector, ...]:
-        files = [item.path for item in ctx.inventory.entries if item.kind == "file" and item.path.lower().endswith(".md") and (("/" not in item.path and item.path.rsplit("/", 1)[-1].lower().startswith("readme")) or item.path.startswith("docs/"))]
+        files = [item.path for item in ctx.inventory.entries if item.kind == "file" and item.path.endswith(".md") and (("/" not in item.path and item.path.rsplit("/", 1)[-1].lower().startswith("readme")) or item.path.startswith("docs/"))]
         selectors = [InputSelector("glob", "[Rr][Ee][Aa][Dd][Mm][Ee]*.md", ".", False), InputSelector("glob", "docs/**/*.md", ".", False)]
         selectors.extend(InputSelector("file", path, ".", False) for path in files)
         return tuple(sorted(set(selectors), key=lambda item: (item.scope, item.type, item.value, item.required)))
@@ -44,10 +44,16 @@ class DocumentationExtractor:
                 if safe != complete_redacted:
                     self.session._coverage.append(CoverageEntry(1, selector, self.extractor_id, "capped", "documentation-text-budget", ()))
                     continue
+                semantic_key = f"documentation:{safe}"
+                locator = EvidenceLocator("line-range", [line_number, line_number], line_number)
+                evidence_key = {"repository": self.session.repository_id, "path": selector.value, "locator": locator, "semanticKey": f"documentation-line:{safe}"}
+                if not self.session.reserve_fact_text(safe, rule_id=self.rule_id, fact_type="documentation.line", scope=".", semantic_key=semantic_key, additional_preview_bytes=len(safe.encode("utf-8")), preview_identity=evidence_key):
+                    self.session._coverage.append(CoverageEntry(1, selector, self.extractor_id, "capped", "documentation-text-budget", ()))
+                    continue
                 evidence = self.session.add_evidence(extractor_id=self.extractor_id, path=selector.value,
                     content_hash=result.dependency.contentHash or "", semantic_key=f"documentation-line:{safe}",
                     media_type="text/markdown", encoding=result.encoding,
-                    locator=EvidenceLocator("line-range", [line_number, line_number], line_number), preview=safe)
+                    locator=locator, preview=safe)
                 if evidence.redactedPreview != safe:
                     continue
                 evidence_by_text[safe].append(evidence.evidenceId)

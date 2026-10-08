@@ -110,10 +110,14 @@ class GenericExtractor:
                         cmds = task.get("cmds") if isinstance(task, dict) else None
                         body = "\n".join(str(command) for command in cmds) if isinstance(cmds, list) else None
                         safe_body = self.session._bounded_text(body) if body is not None else None
-                        if body is not None and safe_body != redact_text(body):
+                        task_key = f"task:{name}"
+                        locator = EvidenceLocator("key-path", ["tasks", name], None)
+                        evidence_key = {"repository": self.session.repository_id, "path": path, "locator": locator, "semanticKey": f"task:{name}"}
+                        if safe_body is not None and not self.session.reserve_fact_text(safe_body, rule_id=self.rule_id, fact_type="task.definition", scope=".", semantic_key=task_key, additional_preview_bytes=len(safe_body.encode("utf-8")), preview_identity=evidence_key):
+                            safe_body = None
                             self.session._coverage.append(CoverageEntry(1, selector, self.extractor_id, "capped", "task-body-budget", ()))
                         item = self.session.add_evidence(extractor_id=self.extractor_id, path=path, content_hash=result.dependency.contentHash or "", semantic_key=f"task:{name}", media_type="application/yaml", encoding=result.encoding, locator=EvidenceLocator("key-path", ["tasks", name], None), preview=safe_body)
-                        self.session.add_fact(extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version, fact_type="task.definition", scope=".", semantic_key=f"task:{name}", value={"category": "task", "runner": "task", "name": name, "body": safe_body}, derivation="observed", evidence_ids=(item.evidenceId,))
+                        self.session.add_fact(extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version, fact_type="task.definition", scope=".", semantic_key=task_key, value={"category": "task", "runner": "task", "name": name, "body": safe_body}, derivation="observed", evidence_ids=(item.evidenceId,))
                         self.session.add_fact(extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version, fact_type="command.invocation", scope=".", semantic_key=f"task-invoke:{name}", value={"category": "task", "argv": ["task", name]}, derivation="deterministic-derived", evidence_ids=(item.evidenceId,))
             if path in {"Makefile", "Justfile"}:
                 runner = "make" if path == "Makefile" else "just"

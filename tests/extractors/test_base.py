@@ -5,7 +5,7 @@ import hashlib
 from repo2skill.config import default_scan_policy
 from repo2skill.identity import capture_repository
 from repo2skill.inventory import collect_inventory
-from repo2skill.models import InputSelector
+from repo2skill.models import EvidenceLocator, InputSelector
 from repo2skill.extractors.base import ExtractionSession
 
 
@@ -65,6 +65,81 @@ def test_inventory_control_observations_become_reads_without_reopening(tmp_path:
         assert control_file.contentHash == result.dependency.contentHash
         assert result.bytes is None
         assert session.opened_file_count == observations[0].openedFileCount
+
+
+def test_control_handoff_rejects_nonrequired_aggregate(tmp_path: Path):
+    from dataclasses import replace
+    import pytest
+
+    policy = default_scan_policy()
+    observations = []
+    inventory = collect_inventory(tmp_path, policy, control_sink=observations.append)
+    observations[-1] = replace(observations[-1], selector=replace(observations[-1].selector, required=False))
+    with pytest.raises(ValueError, match="aggregate"):
+        ExtractionSession(root=tmp_path, snapshot_id="snapshot_000000000000000000000000", inventory=inventory,
+            policy=policy, repository_id="repository_000000000000000000000000", prior_evidence=(), prior_facts=(),
+            excluded_paths=(), control_observations=observations)
+
+
+def test_control_handoff_rejects_unsupported_selector_and_outcome(tmp_path: Path):
+    from dataclasses import replace
+    import pytest
+
+    policy = default_scan_policy()
+    observations = []
+    inventory = collect_inventory(tmp_path, policy, control_sink=observations.append)
+    unsupported = observations + [replace(observations[0], selector=InputSelector("negative", "filename-absent:x", ".", False))]
+    with pytest.raises(ValueError, match="unsupported selector"):
+        ExtractionSession(root=tmp_path, snapshot_id="snapshot_000000000000000000000000", inventory=inventory,
+            policy=policy, repository_id="repository_000000000000000000000000", prior_evidence=(), prior_facts=(),
+            excluded_paths=(), control_observations=unsupported)
+    invalid_outcome = [replace(observations[0], outcome="missing")]
+    with pytest.raises(ValueError, match="invalid outcome"):
+        ExtractionSession(root=tmp_path, snapshot_id="snapshot_000000000000000000000000", inventory=inventory,
+            policy=policy, repository_id="repository_000000000000000000000000", prior_evidence=(), prior_facts=(),
+            excluded_paths=(), control_observations=invalid_outcome)
+
+
+def test_session_record_builders_fail_closed_on_truncated_id_collision(tmp_path: Path, monkeypatch):
+    import repo2skill.ids as ids
+    import pytest
+
+    policy = default_scan_policy()
+    controls = []
+    inventory = collect_inventory(tmp_path, policy, control_sink=controls.append)
+    monkeypatch.setattr(ids, "_digest_suffix", lambda _canonical: "0" * 24)
+    with ExtractionSession(root=tmp_path, snapshot_id="snapshot_000000000000000000000000", inventory=inventory,
+            policy=policy, repository_id="repository_000000000000000000000000", prior_evidence=(), prior_facts=(),
+            excluded_paths=(), control_observations=controls) as session:
+        session.add_evidence(extractor_id="sample", path="a.txt", content_hash="sha256:" + "0" * 64,
+            semantic_key="a", media_type="text/plain", encoding="utf-8", locator=EvidenceLocator("file-presence", "a.txt", None), preview=None)
+        with pytest.raises(ids.IdCollisionError):
+            session.add_evidence(extractor_id="sample", path="b.txt", content_hash="sha256:" + "0" * 64,
+                semantic_key="b", media_type="text/plain", encoding="utf-8", locator=EvidenceLocator("file-presence", "b.txt", None), preview=None)
+
+
+def test_unique_document_text_and_each_preview_charge_once(tmp_path: Path):
+    policy = replace(default_scan_policy(), maxSnippetBytes=9)
+    controls = []
+    inventory = collect_inventory(tmp_path, policy, control_sink=controls.append)
+    with ExtractionSession(root=tmp_path, snapshot_id="snapshot_000000000000000000000000", inventory=inventory,
+            policy=policy, repository_id="repository_000000000000000000000000", prior_evidence=(), prior_facts=(),
+            excluded_paths=(), control_observations=controls) as session:
+        for path, line in (("README.md", 1), ("docs/guide.md", 4)):
+            locator = EvidenceLocator("line-range", [line, line], line)
+            evidence_key = {"repository": session.repository_id, "path": path, "locator": locator, "semanticKey": "documentation-line:abc"}
+            assert session.reserve_fact_text("abc", rule_id="docs.normalized-line", fact_type="documentation.line",
+                scope=".", semantic_key="documentation:abc", additional_preview_bytes=3, preview_identity=evidence_key)
+            session.add_evidence(extractor_id="docs", path=path, content_hash="sha256:" + "0" * 64,
+                semantic_key="documentation-line:abc", media_type="text/markdown", encoding="utf-8",
+                locator=locator, preview="abc")
+        fact = session.add_fact(extractor_id="docs", rule_id="docs.normalized-line", rule_version="1",
+            fact_type="documentation.line", scope=".", semantic_key="documentation:abc",
+            value={"category": "documentation", "text": "abc"}, derivation="observed",
+            evidence_ids=tuple(item.evidenceId for item in session._evidence))
+        assert fact is not None
+        assert session._snippet == 9
+        assert not any(item.reasonCode == "snippet-budget" for item in session._coverage)
 
 
 def test_incomplete_inventory_never_proves_missing_file_or_empty_glob(tmp_path: Path):
