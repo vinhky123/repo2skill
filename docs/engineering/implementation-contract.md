@@ -522,6 +522,14 @@ Result paths follow R6. Secret values, unredacted previews, raw bytes, exception
 
 The existing safety rules remain mandatory: one fail-fast OS-owned lock spans authoritative read through commit; raw source blobs are not persisted; PyYAML `BaseLoader` is used with recursive aliases rejected before selected-key conversion; source hashes cover raw bytes; staging is UTF-8/LF; export adopts only a consistent LF or CRLF target and rejects mixed EOL; exact exported bytes are hashed after conversion; symlinks/reparse points are never followed; root escape and case collision are fatal; live target creation is export-only and confined through non-redirected ancestors; recovery never overwrites a third hash.
 
-## Cross-reference ownership
+## Concrete persistence conventions
+
+Canonical record IDs use the prefix, an underscore, and 24 lowercase hexadecimal characters from SHA-256 (96 bits). An explicit `CanonicalIdContext` also compares the full canonical identity when an ID is reused; truncation never substitutes for collision checking. Builders use a per-run context or the store's per-instance context, with no module-global collision index.
+
+An immutable manifest set is stored at `manifests/<exportId>/<manifestSetId>.json` beneath the configured state directory. An individual target manifest is stored at `manifests/<exportId>/<targetId>.json`. Resolving active manifests uses both `ProjectState.activeExportId` and `activeManifestSetId`, and verifies those IDs against the decoded documents.
+
+Explicit record field lists govern which records carry `recordRevision`. General revision prose does not add fields to the unchanged P0-01 policy/target records or to another exact field list that omits it.
+
+## Cross-reference maintenance
 
 After publication, the root plan owner should update `docs/superpowers/specs/2026-10-07-repo2skill-mvp-design.md` to point its ambiguous record/signature/path clauses to this normative correction, and update `docs/superpowers/plans/2026-10-07-local-generator.md` plus affected task briefs to consume the corrected signatures and file ownership above. Those cross-reference edits are outside this document-only task.
