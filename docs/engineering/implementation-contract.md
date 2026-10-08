@@ -211,6 +211,8 @@ ProjectState(
 
 ## R2 — deterministic digest projections
 
+The [repository input contract](input-contract.md) supplements this section with the runtime ignore-control handoff, the bounded P0 ignore-source scope, and `capture_repository`'s required effective `policy` argument. Its corrected signatures supersede the sketches below.
+
 Canonical JSON means UTF-8, sorted object keys, no insignificant whitespace, arrays sorted as specified, and no platform path separators. `inventoryHash` is SHA-256 over the canonical array of inventory entries sorted by `path`, projecting exactly `path`, `kind`, `sizeBytes`, `contentHash`, `ignored`, `generated`, and `symlinkTarget`. It excludes `InventoryResult.root`, diagnostics, coverage, and incidental traversal order.
 
 `inputDigest` is SHA-256 over one canonical object containing:
