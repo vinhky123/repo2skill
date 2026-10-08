@@ -158,7 +158,9 @@ def derive_claims(
 ) -> ClaimSet: ...
 ```
 
-`prior_claims` comes from the prior active run for the same repository. Equal canonical semantic payload retains ID and `claimRevision`; a changed payload under the same stable identity increments `claimRevision`; a new identity starts at 1. Evidence and fact builders apply the same prior-run comparison for their domain revisions. Full canonical identities are retained in the in-memory collision index and a truncated-ID collision fails closed.
+`prior_claims` contains the claim history for this repository across all prior valid immutable runs, including valid inactive orphan runs. Evidence and fact builders use the corresponding history for their stable IDs and domain revisions. Each builder groups supplied prior records by stable ID and compares semantic payloads only at the maximum domain revision; equal-maximum records with conflicting canonical semantic payloads fail closed. Equal canonical semantic payload retains ID and revision; changed payload under the same stable identity increments the domain revision; a new identity starts at 1. For claims, the semantic projection is `payload`, `kind`, and `origin`; rendering format, status, snapshot, support, and lineage references do not affect revision. Full canonical identities are retained in the in-memory collision index and a truncated-ID collision fails closed.
+
+Task 11 reconstructs these high-water inputs by enumerating prior immutable run ledgers for the same repository while holding the existing mutation lock; exact history-read API is deferred to Task 11 and does not change builder signatures or persisted schemas. Include valid inactive orphans conservatively because their IDs/revisions have already been issued. Fail closed if an enumerated history record is unreadable or invalid. Without a persisted history index, a manually missing run file cannot be detected; this contract does not claim tamper detection for that case. No high-water index or schema field is added.
 
 P0-02 provides one small pure revision helper, used by evidence/fact builders and by P0-06 claim derivation rather than by constructing placeholder claims:
 
