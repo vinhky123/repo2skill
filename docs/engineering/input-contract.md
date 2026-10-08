@@ -88,6 +88,7 @@ class ExtractionSession:
         prior_facts: Sequence[Fact],
         excluded_paths: Sequence[RepositoryPath],
         control_observations: Sequence[IgnoreControlObservation],
+        id_context: CanonicalIdContext | None = None,
     ) -> None: ...
 
     def bind(
@@ -99,9 +100,9 @@ class ExtractionSession:
     ) -> ExtractionContext: ...
 ```
 
-The session owns the canonical-path capture cache, finalized logical-read cache, diagnostics/coverage sinks, evidence/fact revision indexes, and shared opened/decoded/snippet budget counters. Its initial counters include `control_observations`. `bind` returns a context whose `read` closure contains the four provenance values. There is one bound context per rule. Rule IDs are globally namespaced, such as `generic.ci-job` or `docs.normalized-line`.
+The session owns the canonical-path capture cache, finalized logical-read cache, diagnostics/coverage sinks, evidence/fact revision indexes, and shared opened/decoded/snippet budget counters. Its initial counters include `control_observations`. `id_context` is the optional per-run `CanonicalIdContext`; create a new one for the session when omitted. Allocate every `readId`, `evidenceId`, and `factId` through this context so truncated-ID collisions fail closed. The CLI passes the active store's `id_context` when constructing the session. `bind` returns a context whose `read` closure contains the four provenance values. There is one bound context per rule. Rule IDs are globally namespaced, such as `generic.ci-job` or `docs.normalized-line`.
 
-An extractor may expose an optional explicit `rules` sequence. Each rule object provides `rule_id`, `rule_version`, `discover(ctx)`, and `extract(ctx, selectors)`. The registry sorts rules by `rule_id` and binds each separately under the parent's `extractor_id` and `version`; those parent provenance values remain the `ExtractionRead.extractorId`/`extractorVersion`. If `rules` is absent, adapt the legacy extractor's own `discover`/`extract` pair as one rule whose rule ID and version are the extractor ID and extractor version. Reject duplicate extractor IDs (including conflicting versions) and duplicate rule IDs before executing any rule. This is runtime dispatch metadata only: it adds no persisted record and no dependency field.
+An extractor may expose an optional explicit `rules` sequence. Each rule object provides `rule_id`, `rule_version`, `discover(ctx)`, and `extract(ctx, selectors)`. The registry sorts rules by `rule_id` and binds each separately under the parent's `extractor_id` and `version`; those parent provenance values remain the `ExtractionRead.extractorId`/`extractorVersion`. If `rules` is absent, adapt the legacy extractor's own `discover`/`extract` pair as one rule. Preserve `extractor.rule_id` and `extractor.rule_version` when supplied; if missing, use `<extractor_id>.extract` for the rule ID and the extractor `version` for the rule version. Reject duplicate extractor IDs (including conflicting versions) and duplicate rule IDs before executing any rule. This is runtime dispatch metadata only: it adds no persisted record and no dependency field.
 
 The registry entry point accepts an `ExtractionSession`, sorts extractors by `(extractor_id, version)`, sorts explicit rules by `rule_id`, binds rule contexts, and returns one canonically sorted `ExtractionBatch`. Extractor constructors may explicitly retain their session; builders may be session methods or functions receiving the session/bound context explicitly. Module globals, thread locals, cwd, and “current extractor/rule” variables are forbidden.
 
