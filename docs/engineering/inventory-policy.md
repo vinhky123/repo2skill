@@ -15,6 +15,8 @@ Eligibility is decided in this order:
 
 P0 does not read `.git/info/exclude`, `core.excludesFile`, or global ignore sources. Git may report a path as ignored because of one of those external inputs; if the P0 inventory still considers that path eligible, repository identity classifies it as an ordinary untracked input.
 
+An include value beginning with `literal:` names an exact repository path even when the suffix contains glob metacharacters, for example `literal:ignored/a[b].txt`. Windows separators in that suffix are normalized before path validation. Unprefixed values without glob metacharacters are also exact paths; unprefixed glob values are patterns and never override ordinary ignore rules.
+
 Generated directory names are `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, `dist`, `build`, `target`, `vendor`, `.next`, `.nuxt`, and `coverage`. Generated file suffixes are `.pyc`, `.pyo`, `.min.js`, `.min.css`, and `.map`. Lockfiles remain eligible.
 
 Security exclusions are `.env` and `.env.*` except `.env.example`, `.env.sample`, and `.env.template`; directories `.ssh`, `.aws`, and `.gnupg`; files `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`, `id_rsa`, and `id_ed25519`; and suffixes `.pem`, `.key`, `.p12`, and `.pfx`.
@@ -24,6 +26,8 @@ Security exclusions are `.env` and `.env.*` except `.env.example`, `.env.sample`
 The default caps are 100,000 inventory entries, 5,000 opened files, 2 MiB per opened file, 64 MiB of decoded input, and 200 KiB of snippets per run. Inventory only spends opened-file and decoded-byte budgets on ignore controls. A control file is charged once: opening its handle charges one opened file, while only a complete successful decode charges its full raw-byte length. A cap or read/decode failure emits a required diagnostic and coverage gap, retains the detected control path, and fails closed for paths whose eligibility depends on that control.
 
 With a control sink, each visited directory contributes at most one `.gitignore` file observation. File observations precede the final required `**/.gitignore` aggregate observation. The aggregate records a stable hash of the sorted complete match set, including the empty set. Any control or traversal failure changes it to `capped` or `io-error` with no match-set hash.
+
+`repo2skill.safe_fs.open_directory(path)` returns a context-managed directory guard. `GuardedDirectory.names()`, `lstat(name)`, `open_directory(name)`, `open_file(name)`, and `readlink(name)` are the supported operations for safe traversal. Child names are single path components. `GuardedFile.read_bounded(limit)` and `stable_after_read()` support bounded same-handle reads. On POSIX these operations are descriptor-relative with no-follow flags; on Windows the guards retain handles without delete sharing and validate reparse attributes and final paths before returning. Keep ancestor guards open while traversing descendants.
 
 Inventory diagnostic and coverage reason codes use the `inventory.*` namespace. `inventory.entry-cap` and `inventory.gitignore-control-*` represent required incomplete scans; `inventory.path-collision` is fatal. Boundary, generated, security, explicit-exclude, ordinary-ignore, special-file, and redirect skips use `inventory.boundary-excluded`, `inventory.generated-excluded`, `inventory.security-excluded`, `inventory.explicit-excluded`, `inventory.gitignored`, `inventory.special-file`, and `inventory.redirect-not-followed`.
 

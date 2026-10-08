@@ -6,14 +6,15 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
-import subprocess
 from typing import Literal
 import unicodedata
 
 from pathspec import GitIgnoreSpec
 
-from .config import _is_link_or_reparse, _validated_root
+from .config import _validated_root
+from .git_read import GitReadError, run_git_bounded
 from .ids import canonical_json_bytes
+from .safe_fs import GuardedDirectory, UnsafePathError, open_directory
 from .models import (
     CoverageEntry,
     Diagnostic,
@@ -27,8 +28,6 @@ from .models import (
 
 
 INVENTORY_VERSION = "1.0"
-_GIT_TIMEOUT_SECONDS = 10.0
-_GIT_OUTPUT_LIMIT = 16 * 1024 * 1024
 _GENERATED_DIRECTORIES = frozenset(
     {
         "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
@@ -103,6 +102,17 @@ class _ControlBudget:
     incomplete: Literal["capped", "io-error"] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _GitIndexResult:
+    outcome: Literal["present", "not-git", "capped", "io-error", "malformed"]
+    tracked: frozenset[str] = frozenset()
+    gitlinks: frozenset[str] = frozenset()
+
+    @property
+    def complete(self) -> bool:
+        return self.outcome in {"present", "not-git"}
+
+
 def collect_inventory(
     root: Path,
     policy: ScanPolicy,
@@ -112,13 +122,15 @@ def collect_inventory(
 ) -> InventoryResult:
     """Discover repository metadata without following redirects or reading source bytes."""
     root_path = _validated_root(root)
-    root_stat = root_path.lstat()
     normalized_excluded = tuple(_normalize_configured_path(value, allow_pattern=False) for value in excluded_paths)
-    includes = tuple(_normalize_configured_path(value, allow_pattern=True) for value in policy.include)
-    exact_includes = frozenset(value for value in includes if not _has_glob_magic(value))
+    includes = tuple(_normalize_include(value) for value in policy.include)
+    exact_includes = frozenset(
+        normalized
+        for normalized, is_literal in includes
+        if is_literal
+    )
     exclude_lines = tuple(_normalize_exclude(value) for value in policy.exclude)
     exclude_spec = GitIgnoreSpec.from_lines(exclude_lines, backend="simple")
-    tracked, gitlinks = _git_index_paths(root_path)
 
     entries: list[InventoryEntry] = []
     diagnostics: list[Diagnostic] = []
@@ -132,14 +144,40 @@ def collect_inventory(
         key = (status, reason)
         coverage_counts[key] = coverage_counts.get(key, 0) + 1
 
-    def visit(directory: Path, relative_directory: str, sources: tuple[_IgnoreSource, ...], forced: bool) -> None:
+    git_index = _git_index_paths(root_path)
+    tracked = git_index.tracked
+    gitlinks = git_index.gitlinks
+    if not git_index.complete:
+        reason = {
+            "capped": "inventory.git-index-output-cap",
+            "malformed": "inventory.git-index-malformed",
+            "io-error": "inventory.git-index-read-failed",
+        }[git_index.outcome]
+        diagnostics.append(
+            _diagnostic(
+                reason,
+                "error",
+                "Git tracked-path and Gitlink metadata could not be captured completely",
+                None,
+                {"outcome": git_index.outcome},
+            )
+        )
+        record_skip("capped" if git_index.outcome == "capped" else "failed", reason)
+        control_budget.incomplete = "capped" if git_index.outcome == "capped" else "io-error"
+        traversal_incomplete = True
+
+    def visit(
+        directory: GuardedDirectory,
+        relative_directory: str,
+        sources: tuple[_IgnoreSource, ...],
+        forced: bool,
+    ) -> None:
         nonlocal traversal_incomplete
         try:
-            with os.scandir(directory) as iterator:
-                children = sorted(
-                    list(iterator),
-                    key=lambda item: unicodedata.normalize("NFC", item.name).casefold(),
-                )
+            children = sorted(
+                directory.names(),
+                key=lambda name: unicodedata.normalize("NFC", name).casefold(),
+            )
         except OSError as error:
             traversal_incomplete = True
             control_budget.incomplete = control_budget.incomplete or "io-error"
@@ -156,14 +194,15 @@ def collect_inventory(
             return
 
         local_sources = sources
-        control_entry = next((child for child in children if child.name == ".gitignore"), None)
+        control_name = ".gitignore" if ".gitignore" in children else None
         control_ok = True
         control_hash: str | None = None
-        if control_entry is not None:
+        if control_name is not None:
             control_path = _join(relative_directory, ".gitignore")
             controls.append(control_path)
             observation, decoded = _capture_ignore_control(
-                control_entry,
+                directory,
+                control_name,
                 control_path,
                 policy,
                 control_budget,
@@ -193,15 +232,11 @@ def collect_inventory(
                 )
                 record_skip("capped" if observation.outcome == "capped" else "failed", reason)
 
-        for child in children:
-            original_name = child.name
+        for original_name in children:
             name = unicodedata.normalize("NFC", original_name)
             relative = _join(relative_directory, name)
             try:
-                # DirEntry.stat() reports zero device/inode fields on some
-                # supported Windows Python builds. os.stat() supplies the
-                # stable metadata needed for boundary checks.
-                child_stat = os.stat(child.path, follow_symlinks=False)
+                child_stat = directory.lstat(original_name)
             except OSError as error:
                 diagnostics.append(
                     _diagnostic(
@@ -216,12 +251,12 @@ def collect_inventory(
                 continue
 
             collision_index.add(relative, original=_join(relative_directory, original_name))
-            if not control_ok and child is not control_entry:
+            if not control_ok and original_name != control_name:
                 traversal_incomplete = True
                 record_skip("failed", "inventory.gitignore-control-unavailable")
                 continue
 
-            if _is_link_or_reparse(Path(child.path), child_stat):
+            if _is_redirect_stat(child_stat):
                 reason = _final_exclusion(relative, False, normalized_excluded, exclude_spec)
                 if reason is not None:
                     record_skip(*reason)
@@ -230,7 +265,7 @@ def collect_inventory(
                 if generated_reason is not None:
                     record_skip(*generated_reason)
                     continue
-                target = _safe_link_target(root_path, Path(child.path))
+                target = _safe_link_target(root_path, directory, original_name)
                 entries.append(
                     InventoryEntry(relative, "symlink", child_stat.st_size, None, False, False, target)
                 )
@@ -249,7 +284,28 @@ def collect_inventory(
                 continue
 
             if is_directory:
-                if relative in gitlinks or _nested_repository(Path(child.path)):
+                if not git_index.complete:
+                    # Any directory may be a Gitlink when the index is
+                    # unavailable. Do not cross a boundary we cannot classify.
+                    traversal_incomplete = True
+                    continue
+                try:
+                    child_guard = directory.open_directory(original_name)
+                except UnsafePathError:
+                    traversal_incomplete = True
+                    record_skip("skipped", "inventory.redirect-not-followed")
+                    diagnostics.append(
+                        _diagnostic(
+                            "inventory.redirect-not-followed",
+                            "warning",
+                            "directory changed before it could be guarded",
+                            relative,
+                            {},
+                        )
+                    )
+                    continue
+                if relative in gitlinks or _nested_repository(child_guard):
+                    child_guard.close()
                     diagnostics.append(
                         _diagnostic(
                             "inventory.repository-boundary",
@@ -261,7 +317,8 @@ def collect_inventory(
                     )
                     record_skip("skipped", "inventory.boundary-excluded")
                     continue
-                if child_stat.st_dev != root_stat.st_dev or _is_mount(Path(child.path)):
+                if child_guard.stat.st_dev != root_stat.st_dev or _is_mount(child_guard.path):
+                    child_guard.close()
                     diagnostics.append(
                         _diagnostic(
                             "inventory.mount-boundary",
@@ -280,8 +337,10 @@ def collect_inventory(
                     record_skip("skipped", "inventory.gitignored")
                     continue
                 if control_ok:
-                    visit(Path(child.path), relative, local_sources, forced or ignored)
+                    with child_guard:
+                        visit(child_guard, relative, local_sources, forced or ignored)
                 else:
+                    child_guard.close()
                     traversal_incomplete = True
                 continue
 
@@ -292,7 +351,7 @@ def collect_inventory(
             ignored = forced or _is_ignored(relative, False, local_sources)
             tracked_path = relative in tracked
             exact = relative in exact_includes
-            is_control = child is control_entry
+            is_control = original_name == control_name
             if ignored and not tracked_path and not exact and not is_control:
                 record_skip("skipped", "inventory.gitignored")
                 continue
@@ -304,14 +363,16 @@ def collect_inventory(
                     relative,
                     "file",
                     child_stat.st_size,
-                    control_hash if control_entry is child and control_ok else None,
+                    control_hash if is_control and control_ok else None,
                     bool(ignored and (exact or is_control) and not tracked_path),
                     False,
                     None,
                 )
             )
 
-    visit(root_path, "", (), False)
+    with open_directory(root_path) as root_guard:
+        root_stat = root_guard.stat
+        visit(root_guard, "", (), False)
     entries.sort(key=lambda entry: entry.path)
     if len(entries) > policy.maxInventoryEntries:
         omitted = len(entries) - policy.maxInventoryEntries
@@ -367,7 +428,8 @@ def collect_inventory(
 
 
 def _capture_ignore_control(
-    entry: os.DirEntry[str],
+    directory: GuardedDirectory,
+    name: str,
     relative: str,
     policy: ScanPolicy,
     budget: _ControlBudget,
@@ -377,29 +439,29 @@ def _capture_ignore_control(
         budget.incomplete = "capped"
         return IgnoreControlObservation(selector, "capped", None, (), None, 0, 0), None
     try:
-        before = os.stat(entry.path, follow_symlinks=False)
-        if _is_link_or_reparse(Path(entry.path), before) or not stat.S_ISREG(before.st_mode):
+        before = directory.lstat(name)
+        if _is_redirect_stat(before) or not stat.S_ISREG(before.st_mode):
             budget.incomplete = budget.incomplete or "io-error"
             return IgnoreControlObservation(selector, "io-error", None, (), None, 0, 0), None
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(entry.path, flags)
-    except OSError:
+        guarded_file = directory.open_file(name)
+    except (OSError, UnsafePathError):
         budget.incomplete = budget.incomplete or "io-error"
         return IgnoreControlObservation(selector, "io-error", None, (), None, 0, 0), None
     budget.opened += 1
-    try:
-        opened = os.fstat(descriptor)
-        raw = _read_bounded(descriptor, policy.maxFileBytes)
-        after = os.stat(entry.path, follow_symlinks=False)
-    except OSError:
-        budget.incomplete = budget.incomplete or "io-error"
-        return IgnoreControlObservation(selector, "io-error", None, (), None, 1, 0), None
-    finally:
-        os.close(descriptor)
+    with guarded_file:
+        if not _same_file(before, guarded_file.stat_before):
+            budget.incomplete = budget.incomplete or "io-error"
+            return IgnoreControlObservation(selector, "io-error", None, (), None, 1, 0), None
+        try:
+            raw = guarded_file.read_bounded(policy.maxFileBytes)
+            stable = guarded_file.stable_after_read()
+        except OSError:
+            budget.incomplete = budget.incomplete or "io-error"
+            return IgnoreControlObservation(selector, "io-error", None, (), None, 1, 0), None
     if len(raw) > policy.maxFileBytes:
         budget.incomplete = "capped"
         return IgnoreControlObservation(selector, "capped", None, (), None, 1, 0), None
-    if not _same_file(before, opened) or not _same_file(before, after) or len(raw) != before.st_size:
+    if not stable or len(raw) != before.st_size:
         budget.incomplete = budget.incomplete or "io-error"
         return IgnoreControlObservation(selector, "io-error", None, (), None, 1, 0), None
     decoded: str | None = None
@@ -420,63 +482,48 @@ def _capture_ignore_control(
     return IgnoreControlObservation(selector, "present", content_hash, (), None, 1, len(raw)), decoded
 
 
-def _read_bounded(descriptor: int, limit: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = limit + 1
-    while remaining:
-        chunk = os.read(descriptor, min(64 * 1024, remaining))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
 def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
     keys = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
     return all(getattr(first, key, None) == getattr(second, key, None) for key in keys)
 
 
-def _git_index_paths(root: Path) -> tuple[frozenset[str], frozenset[str]]:
-    prefix = ["git", "-c", "core.fsmonitor=false", "--no-pager", "-C", str(root)]
-    environment = os.environ.copy()
-    environment.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+def _is_redirect_stat(value: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _git_index_paths(root: Path) -> _GitIndexResult:
     try:
-        inside = subprocess.run(
-            [*prefix, "rev-parse", "--is-inside-work-tree"],
-            shell=False,
-            check=False,
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            env=environment,
+        inside = run_git_bounded(
+            root,
+            ("rev-parse", "--is-inside-work-tree"),
+            allowed_returncodes=(0, 128),
         )
-        if inside.returncode or inside.stdout.strip() != b"true":
-            return frozenset(), frozenset()
-        top = subprocess.run(
-            [*prefix, "rev-parse", "--path-format=absolute", "--show-toplevel"],
-            shell=False,
-            check=True,
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            env=environment,
-        ).stdout
-        staged = subprocess.run(
-            [*prefix, "ls-files", "--stage", "-z"],
-            shell=False,
-            check=True,
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            env=environment,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return frozenset(), frozenset()
-    if len(top) > _GIT_OUTPUT_LIMIT or len(staged) > _GIT_OUTPUT_LIMIT:
-        return frozenset(), frozenset()
+        if inside.returncode:
+            return _GitIndexResult("io-error" if _has_git_ancestor(root) else "not-git")
+        if inside.stdout.strip() != b"true":
+            return _GitIndexResult("not-git")
+        top_result = run_git_bounded(
+            root,
+            ("rev-parse", "--path-format=absolute", "--show-toplevel"),
+        )
+        staged_result = run_git_bounded(
+            root,
+            ("ls-files", "--full-name", "--stage", "-z"),
+        )
+        top = top_result.stdout
+        staged = staged_result.stdout
+    except GitReadError as error:
+        return _GitIndexResult("capped" if error.reason == "output-cap" else "io-error")
     try:
         top_path = Path(os.fsdecode(top.strip()))
         scan_prefix = root.relative_to(top_path).as_posix()
     except (ValueError, UnicodeError):
-        return frozenset(), frozenset()
+        return _GitIndexResult("malformed")
+    if not top_path.is_absolute() or not top.strip():
+        return _GitIndexResult("malformed")
     tracked: set[str] = set()
     gitlinks: set[str] = set()
     for record in staged.split(b"\0"):
@@ -485,15 +532,29 @@ def _git_index_paths(root: Path) -> tuple[frozenset[str], frozenset[str]]:
         try:
             metadata, raw_path = record.split(b"\t", 1)
             mode = metadata.split(b" ", 1)[0]
+            if len(metadata.split(b" ")) != 3 or not mode.isdigit() or not raw_path:
+                return _GitIndexResult("malformed")
             path = _from_git_path(os.fsdecode(raw_path), scan_prefix)
         except (ValueError, UnicodeError):
-            continue
+            return _GitIndexResult("malformed")
         if path is None:
             continue
         tracked.add(path)
         if mode == b"160000":
             gitlinks.add(path)
-    return frozenset(tracked), frozenset(gitlinks)
+    return _GitIndexResult("present", frozenset(tracked), frozenset(gitlinks))
+
+
+def _has_git_ancestor(root: Path) -> bool:
+    for directory in (root, *root.parents):
+        try:
+            (directory / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        return True
+    return False
 
 
 def _from_git_path(path: str, scan_prefix: str) -> str | None:
@@ -508,15 +569,24 @@ def _normalize_configured_path(value: str, *, allow_pattern: bool) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError("configured path must be nonempty")
     normalized = unicodedata.normalize("NFC", value.replace("\\", "/"))
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
     windows = PureWindowsPath(normalized)
-    parts = PurePosixPath(normalized).parts
-    if windows.drive or normalized.startswith("/") or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(f"configured path must be repository-relative: {value}")
+    raw_parts = normalized.split("/")
+    if (
+        windows.drive
+        or normalized.startswith("/")
+        or any(part in {"", ".", ".."} for part in raw_parts)
+    ):
+        raise ValueError(f"configured path must be normalized and repository-relative: {value}")
     if not allow_pattern and _has_glob_magic(normalized):
         raise ValueError(f"excluded path must be literal: {value}")
     return normalized.rstrip("/")
+
+
+def _normalize_include(value: str) -> tuple[str, bool]:
+    if value.startswith("literal:"):
+        return _normalize_configured_path(value.removeprefix("literal:"), allow_pattern=True), True
+    normalized = _normalize_configured_path(value, allow_pattern=True)
+    return normalized, not _has_glob_magic(normalized)
 
 
 def _normalize_exclude(value: str) -> str:
@@ -587,10 +657,9 @@ def _is_ancestor_of_any(directory: str, paths: frozenset[str]) -> bool:
     return any(path.startswith(prefix) for path in paths)
 
 
-def _nested_repository(directory: Path) -> bool:
-    marker = directory / ".git"
+def _nested_repository(directory: GuardedDirectory) -> bool:
     try:
-        marker.lstat()
+        directory.lstat(".git")
     except FileNotFoundError:
         return False
     except OSError:
@@ -605,15 +674,15 @@ def _is_mount(path: Path) -> bool:
         return True
 
 
-def _safe_link_target(root: Path, link: Path) -> str | None:
+def _safe_link_target(root: Path, directory: GuardedDirectory, name: str) -> str | None:
     try:
-        target = os.readlink(link)
+        target = directory.readlink(name)
     except OSError:
         return None
     target_path = Path(target)
     if target_path.is_absolute():
         return "<external-target>"
-    lexical = Path(os.path.abspath(link.parent / target_path))
+    lexical = Path(os.path.abspath(directory.path / target_path))
     if not lexical.is_relative_to(root):
         return "<external-target>"
     return unicodedata.normalize("NFC", target.replace("\\", "/"))

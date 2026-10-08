@@ -7,7 +7,9 @@ import subprocess
 
 import pytest
 
+import repo2skill.identity as identity_module
 from repo2skill.config import default_scan_policy
+from repo2skill.git_read import GitReadError, run_git_bounded
 from repo2skill.identity import RepositoryIdentityError, capture_repository
 from repo2skill.inventory import collect_inventory
 
@@ -57,6 +59,11 @@ def test_no_git_identity_is_stable_and_explicit_no_git_does_not_probe(
 ) -> None:
     _write(tmp_path / "file.txt")
     first = _capture(tmp_path)
+
+    def fail_git_probe(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise AssertionError("explicit no-git identity must not probe Git")
+
+    monkeypatch.setattr(identity_module._GitRunner, "call", fail_git_probe)
     second = _capture(tmp_path, "no-git")
 
     assert first == second
@@ -188,3 +195,93 @@ def test_identity_expands_ignored_directory_status_to_eligible_inputs(tmp_path: 
     identity = _capture(tmp_path, policy=policy)
 
     assert identity.dirtySummary["ignoredIncluded"] == ["private/keep.txt"]
+
+
+def test_capture_fails_when_head_anchor_changes_during_status_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    original_call = identity_module._GitRunner.call
+    commit_reads = 0
+
+    def changing_anchor(
+        runner: identity_module._GitRunner,
+        *arguments: str,
+        allowed: tuple[int, ...] = (0,),
+    ) -> subprocess.CompletedProcess[bytes]:
+        nonlocal commit_reads
+        completed = original_call(runner, *arguments, allowed=allowed)
+        if arguments[:4] == (
+            "rev-parse",
+            "--quiet",
+            "--verify",
+            "--end-of-options",
+        ):
+            commit_reads += 1
+            if commit_reads == 2:
+                return subprocess.CompletedProcess(
+                    completed.args, completed.returncode, b"f" * 40 + b"\n", completed.stderr
+                )
+        return completed
+
+    monkeypatch.setattr(identity_module._GitRunner, "call", changing_anchor)
+
+    with pytest.raises(RepositoryIdentityError, match="changed") as error:
+        _capture(tmp_path)
+
+    assert error.value.code == "identity.repository-changed"
+
+
+@pytest.mark.parametrize("mode", ("worktree", "head"))
+def test_capture_refuses_an_incomplete_inventory(tmp_path: Path, mode: str) -> None:
+    _init_repo(tmp_path)
+    _write(tmp_path / "second.txt")
+    policy = dataclasses.replace(default_scan_policy(), maxInventoryEntries=1)
+    inventory = collect_inventory(tmp_path, policy)
+
+    with pytest.raises(RepositoryIdentityError, match="incomplete") as error:
+        capture_repository(
+            tmp_path,
+            inventory,
+            mode,  # type: ignore[arg-type]
+            project_id="123e4567-e89b-12d3-a456-426614174000",
+            policy=policy,
+        )
+
+    assert error.value.code == "identity.inventory-incomplete"
+
+
+def test_capture_does_not_treat_unexpected_head_failure_as_unborn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    original_call = identity_module._GitRunner.call
+
+    def failed_head_read(
+        runner: identity_module._GitRunner,
+        *arguments: str,
+        allowed: tuple[int, ...] = (0,),
+    ) -> subprocess.CompletedProcess[bytes]:
+        if arguments[:3] == ("rev-parse", "--quiet", "--verify"):
+            return subprocess.CompletedProcess(arguments, 128, b"", b"corrupt repository")
+        return original_call(runner, *arguments, allowed=allowed)
+
+    monkeypatch.setattr(identity_module._GitRunner, "call", failed_head_read)
+
+    with pytest.raises(RepositoryIdentityError, match="HEAD") as error:
+        _capture(tmp_path, "worktree")
+
+    assert error.value.code == "identity.head-read-failed"
+
+
+def test_git_reader_enforces_a_real_combined_output_bound(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+
+    with pytest.raises(GitReadError) as error:
+        run_git_bounded(
+            tmp_path,
+            ("ls-files", "-z"),
+            max_output_bytes=4,
+        )
+
+    assert error.value.reason == "output-cap"

@@ -10,6 +10,7 @@ import unicodedata
 from pathspec import GitIgnoreSpec
 
 from .config import _validated_root
+from .git_read import GitReadError, run_git_bounded
 from .ids import canonical_record_id
 from .inventory import (
     _final_exclusion,
@@ -18,10 +19,6 @@ from .inventory import (
     _normalize_exclude,
 )
 from .models import InventoryResult, RepositoryIdentity, RepositoryPath, ScanPolicy
-
-
-_GIT_TIMEOUT_SECONDS = 10.0
-_GIT_OUTPUT_LIMIT = 16 * 1024 * 1024
 
 
 class RepositoryIdentityError(ValueError):
@@ -47,6 +44,15 @@ def capture_repository(
         raise RepositoryIdentityError(
             "identity.root-mismatch",
             "inventory root does not match the repository identity root",
+        )
+    if any(
+        item.selector.required
+        and item.status in {"unsupported", "capped", "invalid", "failed"}
+        for item in inventory.coverage
+    ):
+        raise RepositoryIdentityError(
+            "identity.inventory-incomplete",
+            "repository identity cannot classify dirtiness from an incomplete inventory",
         )
     if git_mode == "no-git":
         return _no_git_identity(root_path, project_id)
@@ -84,12 +90,7 @@ def capture_repository(
             "scan root is outside the detected Git worktree",
         ) from error
 
-    commit_result = runner.call(
-        "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}", allowed=(0, 1, 128)
-    )
-    commit_id = os.fsdecode(commit_result.stdout.strip()) if commit_result.returncode == 0 else None
-    branch_result = runner.call("symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1, 128))
-    branch = os.fsdecode(branch_result.stdout.strip()) if branch_result.returncode == 0 else None
+    commit_id, branch = _read_head_anchor(runner)
 
     status = runner.call(
         "status",
@@ -103,6 +104,11 @@ def capture_repository(
         "--",
         ".",
     ).stdout
+    if _read_head_anchor(runner) != (commit_id, branch):
+        raise RepositoryIdentityError(
+            "identity.repository-changed",
+            "Git commit or branch changed while repository identity was captured",
+        )
     changed = _classify_status(
         status,
         top=top,
@@ -145,44 +151,56 @@ def capture_repository(
 
 class _GitRunner:
     def __init__(self, root: Path):
-        self._prefix = (
-            "git", "-c", "core.fsmonitor=false", "--no-pager", "-C", str(root)
-        )
-        self._environment = os.environ.copy()
-        self._environment.update(
-            {"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
-        )
+        self._root = root
 
     def call(self, *arguments: str, allowed: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
         try:
-            completed = subprocess.run(
-                [*self._prefix, *arguments],
-                shell=False,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=_GIT_TIMEOUT_SECONDS,
-                env=self._environment,
+            return run_git_bounded(
+                self._root,
+                arguments,
+                allowed_returncodes=allowed,
             )
-        except subprocess.TimeoutExpired as error:
+        except GitReadError as error:
+            code = {
+                "timeout": "identity.git-timeout",
+                "output-cap": "identity.git-output-cap",
+                "unavailable": "identity.git-unavailable",
+                "return-code": "identity.git-read-failed",
+            }[error.reason]
             raise RepositoryIdentityError(
-                "identity.git-timeout", "bounded Git metadata read timed out"
+                code, f"bounded Git metadata read failed for built-in {arguments[0]}"
             ) from error
-        except OSError as error:
-            raise RepositoryIdentityError(
-                "identity.git-unavailable", "Git metadata reader is unavailable"
-            ) from error
-        if len(completed.stdout) > _GIT_OUTPUT_LIMIT or len(completed.stderr) > _GIT_OUTPUT_LIMIT:
-            raise RepositoryIdentityError(
-                "identity.git-output-cap", "Git metadata output exceeded its bound"
-            )
-        if completed.returncode not in allowed:
-            raise RepositoryIdentityError(
-                "identity.git-read-failed",
-                f"Git metadata reader failed for built-in {arguments[0]}",
-            )
-        return completed
+
+
+def _read_head_anchor(runner: _GitRunner) -> tuple[str | None, str | None]:
+    commit_result = runner.call(
+        "rev-parse",
+        "--quiet",
+        "--verify",
+        "--end-of-options",
+        "HEAD^{commit}",
+        allowed=(0, 1, 128),
+    )
+    if commit_result.returncode == 0:
+        commit_id = os.fsdecode(commit_result.stdout.strip())
+    elif commit_result.returncode == 1:
+        commit_id = None
+    else:
+        raise RepositoryIdentityError(
+            "identity.head-read-failed", "Git HEAD could not be read reliably"
+        )
+    branch_result = runner.call(
+        "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1, 128)
+    )
+    if branch_result.returncode == 0:
+        branch = os.fsdecode(branch_result.stdout.strip())
+    elif branch_result.returncode == 1:
+        branch = None
+    else:
+        raise RepositoryIdentityError(
+            "identity.branch-read-failed", "Git branch could not be read reliably"
+        )
+    return commit_id, branch
 
 
 def _classify_status(
