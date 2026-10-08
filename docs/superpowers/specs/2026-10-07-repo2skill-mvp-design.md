@@ -1,5 +1,7 @@
 # repo2skill MVP design
 
+Implementation uses the exact record types and corrected stateful signatures in the [implementation contract](../../engineering/implementation-contract.md). It resolves the schema/context gaps in this design; its explicit corrections take precedence during P0 execution.
+
 ## Status and design brief
 
 Status: planned contract for review; no implementation is asserted by this document.

@@ -1,5 +1,7 @@
 # repo2skill CLI contract
 
+The [implementation contract](implementation-contract.md) supplies the exact JSON envelope, record types and corrected internal signatures used to implement this command contract.
+
 ## Scope and status
 
 Status: planned contract for review; no command described here is implemented yet.

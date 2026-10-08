@@ -1,5 +1,7 @@
 # Local No-AI Generator Implementation Plan
 
+During execution, read the [implementation contract](../../engineering/implementation-contract.md) alongside the spec. Its exact record types, explicit store context, policy snapshot fields and corrected signatures supersede the original task-interface sketches below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **Status:** Task P0-01 is implemented at `9bb120b`, corrected at `466645e`, and independently reviewed. Final Windows/Python 3.13 verification: 13 passed, 1 platform-specific skip; wheel/sdist build and fresh wheel smoke passed. Tasks P0-02 through P0-12 have not been executed. Commands belonging to those later tasks remain FUTURE; the current CLI exposes only global `--help` and `--version`.
