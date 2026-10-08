@@ -240,6 +240,8 @@ def effective_policy_revision(
 
 `configured_targets` is always the complete configured collection and is canonicalized by `targetId`. `generation_options` contains only options that alter discovery, claim semantics, or rendered bytes; invocation target selection and other execution-only choices are excluded.
 
+In P0, `generation_options` is empty: every supported input-affecting option is represented by the effective policy or configured target records. Unknown option keys are refused. This keeps every fingerprint input reconstructable from the immutable run without adding an untyped configuration payload.
+
 The immutable `RunLedger` persists those same inputs as `effectiveScanPolicy`, `effectiveClaimPolicy`, and `configuredTargets`. Command-line scan overrides are applied before hashing and the resulting effective records are stored, so recheck uses the exact recorded scan semantics rather than current defaults. `configuredTargets` is the full configured tuple, not the invocation subset.
 
 The extraction signatures are corrected without hidden project/config reads:
