@@ -101,7 +101,9 @@ class ExtractionSession:
 
 The session owns the canonical-path capture cache, finalized logical-read cache, diagnostics/coverage sinks, evidence/fact revision indexes, and shared opened/decoded/snippet budget counters. Its initial counters include `control_observations`. `bind` returns a context whose `read` closure contains the four provenance values. There is one bound context per rule. Rule IDs are globally namespaced, such as `generic.ci-job` or `docs.normalized-line`.
 
-The registry entry point accepts an `ExtractionSession`, sorts extractors by `(extractor_id, version)`, binds rule contexts, and returns one canonically sorted `ExtractionBatch`. Extractor constructors may explicitly retain their session; builders may be session methods or functions receiving the session/bound context explicitly. Module globals, thread locals, cwd, and “current extractor/rule” variables are forbidden.
+An extractor may expose an optional explicit `rules` sequence. Each rule object provides `rule_id`, `rule_version`, `discover(ctx)`, and `extract(ctx, selectors)`. The registry sorts rules by `rule_id` and binds each separately under the parent's `extractor_id` and `version`; those parent provenance values remain the `ExtractionRead.extractorId`/`extractorVersion`. If `rules` is absent, adapt the legacy extractor's own `discover`/`extract` pair as one rule whose rule ID and version are the extractor ID and extractor version. Reject duplicate extractor IDs (including conflicting versions) and duplicate rule IDs before executing any rule. This is runtime dispatch metadata only: it adds no persisted record and no dependency field.
+
+The registry entry point accepts an `ExtractionSession`, sorts extractors by `(extractor_id, version)`, sorts explicit rules by `rule_id`, binds rule contexts, and returns one canonically sorted `ExtractionBatch`. Extractor constructors may explicitly retain their session; builders may be session methods or functions receiving the session/bound context explicitly. Module globals, thread locals, cwd, and “current extractor/rule” variables are forbidden.
 
 The extractor protocol remains unchanged. An extractor never opens a path outside `ctx.read`. Every logical key `(extractorId, ruleId, canonical selector)` has one finalized dependency; repeated calls return that dependency and captured result.
 
@@ -136,7 +138,7 @@ Outcome fields are exact:
 - `maxOpenedFiles` counts each unique canonical path whose OS open succeeds once, even if its later bounded read, stability check, or decode fails. An OS open failure does not charge it. Cache hits and repeated rule reads do not charge it. Ignore-control opens are already charged.
 - `maxDecodedBytes` counts captured raw bytes once for each unique path after decoding succeeds. It does not count Python characters or failed decoding. Ignore-control decoded bytes are already charged.
 - `maxFileBytes` uses a bounded `limit + 1` read; capped content is neither fully read nor hashed.
-- `maxSnippetBytes` counts post-redaction UTF-8 bytes retained across the run. Redact first, then truncate at a valid Unicode boundary.
+- `maxSnippetBytes` counts the UTF-8 bytes of each separately retained post-redaction text value: each textual Fact body/value and each `Evidence.redactedPreview` is charged once. A `documentation.line` Fact text is charged once per unique normalized text, independent of how many paths support it; each distinct supporting Evidence preview is charged once. Redact before bounding and truncate only at a valid Unicode boundary. Discarded text is not charged again, and a common truncated prefix is never proof of text identity.
 - Registry entries are sorted by `(extractorId, version)`, known rule work is sorted by `ruleId`, and each rule sorts its known selectors by `(scope, type, value, required)`. Conditional reads discovered only after parsing execute in deterministic discovery order within that rule. Shared caps are allocated in this published execution order, never registry insertion/input order; the contract does not claim that conditional reads can be globally preplanned. A cap hit remains a read and visible coverage; required cap/failure makes the run incomplete.
 
 The session cache stores immutable buffers only for the running process. Raw buffers never enter `RunLedger`.
@@ -160,9 +162,11 @@ changed documentation read
   -> DedupDecision.candidateClaimIds
 ```
 
-Repository identity and effective policy changes affect all claims. An extractor-version change affects facts/claims from that extractor's rules. All selectors are re-evaluated even after a stale/unknown result so findings are complete; precedence remains `stale > unknown > fresh`.
+Repository identity, current root-label mismatch against `SourceSnapshot.rootLabel`, and effective policy changes affect all claims. A root-label mismatch is stale and reports every claim ID even though the root label is supplied separately from `RepositoryIdentity`; the recheck caller passes it explicitly rather than reading project metadata implicitly. An extractor-version change affects facts/claims from that extractor's rules. All selectors are re-evaluated even after a stale/unknown result so findings are complete; precedence remains `stale > unknown > fresh`.
 
 ## 6. Generic and documentation collection boundary
+
+The approved Task 5 versioned categories and runner/command values are defined below. `package-script.v1` denotes a directly observed literal package-manifest script; executable manager choice stays in a separate invocation.
 
 Task 4 is root-scoped and shallow:
 
@@ -179,15 +183,15 @@ The minimal Fact vocabulary shared with Task 5 is:
 
 ```text
 factType="artifact.presence"
-value={"category": "ci-workflow"|"ci-job"|"container"|"ecosystem",
+value={"category": "ci-workflow"|"ci-job"|"container"|"ecosystem"|"package.v1"|"package-manager.v1"|"runtime.v1"|"dependency.v1"|"convention.v1",
        "name": str, "path": RepositoryPath}
 
 factType="task.definition"
-value={"category": "task", "runner": "task"|"make"|"just"|"npm",
+value={"category": "task", "runner": "task"|"make"|"just"|"package-script.v1",
        "name": str, "body": str|null}
 
 factType="command.invocation"
-value={"category": "test"|"build"|"run"|"task",
+value={"category": "test"|"build"|"run"|"task"|"install"|"single-test.v1",
        "argv": list[str]}
 
 factType="config.structure"
@@ -198,7 +202,7 @@ factType="documentation.line"
 value={"category": "documentation", "text": str}
 ```
 
-All object keys are exact; omitted information is not represented by extra keys. `argv` is data, never shell text. Literal bodies/text are redacted and bounded. Rule version changes when selected keys, normalization, or derivation changes. Task 5 may add versioned category/runner values but uses these shapes rather than prose facts.
+All object keys are exact; omitted information is not represented by extra keys. `argv` is data, never shell text. Literal bodies/text are redacted and bounded. Rule version changes when selected keys, normalization, or derivation changes. Task 5 uses these exact envelopes and the versioned values below. The allowed `artifact.presence.category` additions are `package.v1`, `package-manager.v1`, `runtime.v1`, `dependency.v1`, and `convention.v1`; continue to use `name` for the concise typed identity/version and `path` for the source. `task.definition.runner="package-script.v1"` means a directly observed literal entry from a package manifest, not an executable package manager. Keep literal script body in `body`; manager selection belongs to a separate `command.invocation` and must not alter the script-definition identity. Support manager values such as `npm`, `pnpm`, `yarn`, and `bun` in invocation argv. Observed lockfile presence uses `artifact.presence` category `package-manager.v1` with the lock filename/path. A manager inferred from a recognized lockfile name is deterministic-derived, separate from observed lock presence. Use `command.invocation.category="install"` for installation commands and versioned `"single-test.v1"` for a one-test command/target. Template fallback commands for unsupported or insufficiently evidenced ecosystems are `template`, never observed.
 
 `config.structure.keys` is the sorted intersection of present known key paths; values are never included. The exact source/key allowlist is:
 
@@ -242,4 +246,3 @@ Non-string values under secret-like keys are replaced too. Diagnostics contain c
 Task 3 tests `control_sink=None`, traversal-order file observations followed by the aggregate glob, consumer canonical sorting, complete-empty `.gitignore` glob, same-buffer file hash, cap/failure visibility, opened/decoded accounting, tracked-name override, ancestor pruning, and the explicit absence of info/global excludes.
 
 Task 4 tests dependency-before-parser ordering; mutation after capture; every outcome row; excluded-present behavior; one physical open with two rule reads; control-budget deduction; published cap allocation including conditional reads; empty glob/negative hashes; unknown negative rejection; digest stability; selector-only freshness; docs-to-dedup affected claims; cyclic YAML rejection; scalar preservation; every redaction category; duplicate documentation evidence consolidation; sorted present-key intersections with no values; and exact secret-key fixtures `api_token`, `numeric_secret`, `boolean_secret`, and `empty_secret` including non-string/empty values.
-

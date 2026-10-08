@@ -1,6 +1,6 @@
 # P0 local generator implementation contract
 
-**Status:** normative correction to `docs/superpowers/specs/2026-10-07-repo2skill-mvp-design.md` and `docs/engineering/cli-contract.md` for P0 implementation. This contract narrows ambiguous implementation details; it adds no feature or framework. Where this document supplies a type or corrected signature, it governs implementation. All names and fields already stated by the design remain unchanged.
+**Status:** normative correction to `docs/superpowers/specs/2026-10-07-repo2skill-mvp-design.md` and `docs/engineering/cli-contract.md` for P0 implementation. This contract narrows ambiguous implementation details; it adds no feature or framework. The normative P0-06–P0-09 claim/output supplement is `docs/engineering/output-contract.md`; it governs those lifecycle details and signatures. All names and fields already stated by the design remain unchanged.
 
 ## Common notation and persistence rule
 
@@ -285,6 +285,11 @@ The corrected signatures are additive and explicit:
 ```python
 def stage_run(
     bundle: RenderBundle, run: RunLedger, *, store: LedgerStore,
+    current_identity: RepositoryIdentity, current_root_label: str,
+    current_policy_revision: str,
+    current_extractor_versions: Mapping[str, str],
+    excluded_paths: Sequence[RepositoryPath],
+    selected_specs: Sequence[TargetSpec],
 ) -> StagedRun: ...
 
 def review_claims(
@@ -303,7 +308,7 @@ def resume_export(
 ) -> ExportResult: ...
 ```
 
-Each operation obtains both absolute paths only from `store.root` and `store.state_dir` and compares every supplied `state`, `run`, stage, ownership, and journal record for canonical equality with the authoritative record read inside the active lock. A stale passed record is rejected even when its ID matches. `stage_run` publishes immutable artifacts, performs the R5 recheck, then commits one state pointer. `review_claims` validates the whole batch, rerenders and publishes a new immutable stage revision, validates it, then commits the returned state once. Export journals before the first live mutation and commits manifests before the state pointer. Any mismatch or exception before the defined commit point fails closed and leaves the prior pointer unchanged.
+Each operation obtains both absolute paths only from `store.root` and `store.state_dir`. Supplied existing `state`, `run`, stage, ownership, and journal records are compared for canonical equality with authoritative records read inside the active lock; matching IDs do not excuse stale content. Initial `stage_run` instead requires the new run ID/path to be absent, publishes immutable artifacts, performs the R5 recheck, then commits one state pointer. `review_claims` compares the supplied run/state with authoritative records, validates the whole batch, rerenders and publishes a new immutable stage revision without changing the run, validates it, then commits returned state once. Export journals before the first live mutation and commits manifests before the state pointer. Any mismatch or exception before the defined commit point fails closed and leaves the prior pointer unchanged. See `output-contract.md` for the stage descriptor and per-revision rules.
 
 ## R4 — render, stage, ownership, manifest, and journal shapes
 
@@ -332,7 +337,7 @@ StagedRun(
 )
 ```
 
-`relativeFiles` and `exactHashes` contain canonical UTF-8/LF accepted-only export bytes. Preview mappings may additionally contain visibly labelled pending material. Keys must match within each bytes/hash/span triplet. `stageRoot` is runtime-only; every persisted stage location is a normalized repository-relative path, including its configured state-directory prefix. A stage revision is a positive integer unique within a run.
+`relativeFiles` and `exactHashes` contain canonical UTF-8/LF accepted-only export bytes. Preview mappings may additionally contain visibly labelled pending material. Keys must match within each bytes/hash/span triplet. All output path keys are full normalized repository-relative paths, including target subdirectories (for example `.agents/skills/foo/SKILL.md`), not target-relative names. `stageRoot` is runtime-only; every persisted stage location is a normalized repository-relative path, including its configured state-directory prefix. A stage revision is a positive integer unique within a run. `output-contract.md` specifies initial revision 1, immutable `stage.json` metadata, and review-revision handling.
 
 Manifest records are:
 
@@ -438,11 +443,12 @@ def recheck_dependencies(
     current_extractor_versions: Mapping[str, str],
     *,
     root: Path,
+    current_root_label: str,
     excluded_paths: Sequence[RepositoryPath],
 ) -> DependencyRecheckResult: ...
 ```
 
-It re-evaluates only the recorded file, glob, and negative selectors through the extraction read seam under `run.effectiveScanPolicy`. `excluded_paths` is the union of the configured state directory, `run.configuredTargets` live paths, and current configured live paths; it remains intrinsically excluded during selector matching. Recheck never falls back to a default policy or reads an arbitrary ignored/live path. It compares existence/raw-byte hashes, canonical match sets, negative predicates, repository identity, `current_policy_revision` against `run.snapshot.policyRevision`, and extractor versions, and maps changed reads through facts to all affected claims. A definite mismatch is `stale`; an unreadable/capped/I/O outcome is `unknown` with the applicable required or informational coverage finding and is never fresh. `stale` wins over `unknown` when both occur, while all findings remain present.
+It re-evaluates only the recorded file, glob, and negative selectors through the extraction read seam under `run.effectiveScanPolicy`. `excluded_paths` is the caller-provided union of the configured state directory, `run.configuredTargets` live paths, and current configured live paths; it remains intrinsically excluded during selector matching. Recheck never falls back to a default policy or reads an arbitrary ignored/live path. It compares existence/raw-byte hashes, canonical match sets, negative predicates, repository identity, `current_root_label` against `run.snapshot.rootLabel`, `current_policy_revision` against `run.snapshot.policyRevision`, and extractor versions, and maps changed reads through facts to all affected claims. A root-label mismatch is `stale` and affects all claims, just like repository identity or policy mismatch. The root label is explicit operation context; recheck does not read `project.json` or consult hidden project state. A definite mismatch is `stale`; an unreadable/capped/I/O outcome is `unknown` with the applicable required or informational coverage finding and is never fresh. `stale` wins over `unknown` when both occur, while all findings remain present.
 
 P0-09 calls this function immediately before the first export replacement. Generation orchestration calls it immediately before activation. P0-10 calls it for `check`; it does not implement a second comparison. Ownership inspection remains a separate P0-09 operation over selected live targets and active manifests. The CLI aggregates the source result, ownership findings, review state, and coverage using the published exit priority. Source status never absorbs an ownership conflict.
 
@@ -453,11 +459,11 @@ def check_freshness(
     run: RunLedger, current_identity: RepositoryIdentity,
     current_policy_revision: str,
     current_extractor_versions: Mapping[str, str], *, root: Path,
-    excluded_paths: Sequence[RepositoryPath],
+    current_root_label: str, excluded_paths: Sequence[RepositoryPath],
 ) -> CheckResult: ...
 ```
 
-`check_freshness` delegates source comparison to `recheck_dependencies`; the CLI separately requests ownership findings.
+`check_freshness` delegates source comparison to `recheck_dependencies`, passing the explicit root label; the CLI separately requests ownership findings.
 
 ## R6 — path representation
 
@@ -516,7 +522,7 @@ Result paths follow R6. Secret values, unredacted previews, raw bytes, exception
 
 - P0-01 fixes its assertion to inspect `{target.targetId for target in default_targets(root)}` and implements root-relative `TargetSpec.livePath`.
 - P0-02 owns the R1 records, `revise_record`, one `LedgerStore`, collision-safe IDs, versioned readers, recursive additive-field preservation, locking, immutable writes, and atomic pointer replacement.
-- P0-03 accepts explicit `project_id` and configured `excluded_paths`; P0-04 accepts explicit snapshot policy/root labels and owns `recheck_dependencies` with its file/glob/negative/identity/policy/extractor tests. Extraction persists hashes, locators, normalized facts, and redacted previews, never arbitrary raw blobs.
+- P0-03 accepts explicit `project_id` and configured `excluded_paths`; P0-04 accepts explicit snapshot policy/root labels and owns `recheck_dependencies` with its file/glob/negative/identity/policy/extractor/root-label tests. Extraction persists hashes, locators, normalized facts, and redacted previews, never arbitrary raw blobs.
 - P0-05 also modifies `src/repo2skill/extractors/registry.py`; all five test paths are under `tests/extractors/`.
 - P0-06 uses repository/prior context for IDs and revisions and keeps all candidates in `RunLedger.claims`.
 - P0-07 implements the corrected stage types/signature; P0-08 implements the corrected review signature and returns both state and stage; P0-09 owns manifest sets, ownership inspection, journal/recovery, directory ownership, and corrected export signatures.
@@ -534,4 +540,4 @@ Explicit record field lists govern which records carry `recordRevision`. General
 
 ## Cross-reference maintenance
 
-After publication, the root plan owner should update `docs/superpowers/specs/2026-10-07-repo2skill-mvp-design.md` to point its ambiguous record/signature/path clauses to this normative correction, and update `docs/superpowers/plans/2026-10-07-local-generator.md` plus affected task briefs to consume the corrected signatures and file ownership above. Those cross-reference edits are outside this document-only task.
+The MVP design and task briefs defer to this contract and `docs/engineering/output-contract.md` for corrected records, signatures, lifecycle, and paths. `docs/engineering/input-contract.md` governs extraction and recheck inputs.
