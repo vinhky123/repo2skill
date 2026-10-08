@@ -1,0 +1,11 @@
+[project]
+name = "fixture-python-app"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+fixture-python-app = "fixture_python_app:main"
+
+[tool.pytest.ini_options]
+addopts = "-q"

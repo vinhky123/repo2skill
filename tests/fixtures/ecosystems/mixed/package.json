@@ -1,0 +1,9 @@
+{
+  "name": "fixture-mixed-app",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "npm@10.9.0",
+  "scripts": {
+    "test": "node --test"
+  }
+}

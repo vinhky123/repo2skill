@@ -7,6 +7,16 @@ from ..models import ExtractionBatch
 from .base import ExtractionSession, Extractor
 
 
+def ecosystem_extractors(session: ExtractionSession) -> tuple[Extractor, ...]:
+    """Construct the four P0 shallow language collectors for one scan."""
+    from .go import GoExtractor
+    from .javascript import JavaScriptExtractor
+    from .python import PythonExtractor
+    from .rust import RustExtractor
+
+    return (JavaScriptExtractor(session), PythonExtractor(session), GoExtractor(session), RustExtractor(session))
+
+
 def discover_extractors(extractors: Iterable[Extractor]) -> tuple[Extractor, ...]:
     return tuple(sorted(extractors, key=lambda item: (item.extractor_id, item.version)))
 
