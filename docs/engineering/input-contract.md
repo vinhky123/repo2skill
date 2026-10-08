@@ -66,3 +66,178 @@ def capture_repository(
 
 Identity applies `policy` and `excluded_paths` when constructing tracked/untracked/deleted input summaries. It does not read project configuration or attach hidden attributes to inventory.
 
+## 2. Extraction runtime without ambient state
+
+Sections 2–7 below are normative execution rulings for P0-04 and its P0-05 consumers.
+
+The exact frozen `ExtractionContext(root, snapshotId, inventory, policy, read)` remains unchanged. `extractors/base.py` owns one mutable runtime service per scan:
+
+```python
+class ExtractionSession:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        snapshot_id: SnapshotId,
+        inventory: InventoryResult,
+        policy: ScanPolicy,
+        repository_id: str,
+        prior_evidence: Sequence[Evidence],
+        prior_facts: Sequence[Fact],
+        excluded_paths: Sequence[RepositoryPath],
+        control_observations: Sequence[IgnoreControlObservation],
+    ) -> None: ...
+
+    def bind(
+        self,
+        extractor_id: str,
+        version: str,
+        rule_id: str,
+        rule_version: str,
+    ) -> ExtractionContext: ...
+```
+
+The session owns the canonical-path capture cache, finalized logical-read cache, diagnostics/coverage sinks, evidence/fact revision indexes, and shared opened/decoded/snippet budget counters. Its initial counters include `control_observations`. `bind` returns a context whose `read` closure contains the four provenance values. There is one bound context per rule. Rule IDs are globally namespaced, such as `generic.ci-job` or `docs.normalized-line`.
+
+The registry entry point accepts an `ExtractionSession`, sorts extractors by `(extractor_id, version)`, binds rule contexts, and returns one canonically sorted `ExtractionBatch`. Extractor constructors may explicitly retain their session; builders may be session methods or functions receiving the session/bound context explicitly. Module globals, thread locals, cwd, and “current extractor/rule” variables are forbidden.
+
+The extractor protocol remains unchanged. An extractor never opens a path outside `ctx.read`. Every logical key `(extractorId, ruleId, canonical selector)` has one finalized dependency; repeated calls return that dependency and captured result.
+
+## 3. Selector grammar and read outcomes
+
+All P0 selectors have `scope="."`. File values are NFC normalized repository paths. Glob values use positive gitignore-style/pathspec grammar over canonical `/` paths; leading `!` negation is rejected. Absolute paths, backslashes, dot segments, and root escape are rejected.
+
+Negative values use this closed grammar:
+
+```text
+filename-absent:<NFC literal basename>
+```
+
+The parameter is one nonempty basename with no `/`, `\`, `.`/`..`, glob metacharacters, or control characters. It tests eligible inventory paths by exact final component. Unknown predicate names or malformed parameters fail closed before reading. The registry may grow only by a versioned code change.
+
+Outcome fields are exact:
+
+| selector | complete result | outcome/hash fields |
+|---|---|---|
+| file | captured and decoded | `present`, raw `contentHash`, `matchPaths=()`, `matchSetHash=None` |
+| file | eligible candidate absent | `missing`, hashes null, `matchPaths=()` |
+| file | present but intrinsic/excluded/ineligible | `io-error`, hashes null, stable `read-forbidden` diagnostic |
+| file | cap, decode, unstable/I/O failure | respective `capped`, `decode-error`, or `io-error`; raw hash only for a complete stable buffer |
+| glob/negative | nonempty complete match | `matched`, `contentHash=None`, sorted unique paths and canonical-array set hash |
+| glob/negative | complete empty match | `no-match`, `contentHash=None`, `matchPaths=()`, canonical-empty-array set hash |
+| glob/negative | incomplete enumeration | `capped`, known sorted prefix allowed, `matchSetHash=None` |
+
+`dependencyType == selector.type` and `required == selector.required`; mismatch is an invariant failure. The dependency is registered and finalized before parser entry. Evidence is created only from a successful stable capture that supports a fact: ordinarily a `present` file read with its exact raw hash. Failed, capped, missing, forbidden, or decode-failed reads produce only the read plus diagnostics/coverage. Inventory-control observations produce dependencies but no evidence.
+
+## 4. Shared budgets and deterministic allocation
+
+- `maxOpenedFiles` counts each unique canonical path whose OS open succeeds once, even if its later bounded read, stability check, or decode fails. An OS open failure does not charge it. Cache hits and repeated rule reads do not charge it. Ignore-control opens are already charged.
+- `maxDecodedBytes` counts captured raw bytes once for each unique path after decoding succeeds. It does not count Python characters or failed decoding. Ignore-control decoded bytes are already charged.
+- `maxFileBytes` uses a bounded `limit + 1` read; capped content is neither fully read nor hashed.
+- `maxSnippetBytes` counts post-redaction UTF-8 bytes retained across the run. Redact first, then truncate at a valid Unicode boundary.
+- Registry entries are sorted by `(extractorId, version)`, known rule work is sorted by `ruleId`, and each rule sorts its known selectors by `(scope, type, value, required)`. Conditional reads discovered only after parsing execute in deterministic discovery order within that rule. Shared caps are allocated in this published execution order, never registry insertion/input order; the contract does not claim that conditional reads can be globally preplanned. A cap hit remains a read and visible coverage; required cap/failure makes the run incomplete.
+
+The session cache stores immutable buffers only for the running process. Raw buffers never enter `RunLedger`.
+
+## 5. Snapshot, freshness, and affected claims
+
+`build_snapshot` retains the normative signature. It validates identical absolute inventory/identity roots, snapshot IDs, selector/dependency agreement, globally namespaced rule IDs, extractor versions, sorted unique match paths, and one logical read per `(extractorId, ruleId, canonical selector)` before hashing.
+
+`inventoryHash` proves the composition of the original capture and remains in `SourceSnapshot`/`inputDigest`. Recheck does not compare a newly computed whole-inventory hash as an independent stale condition. Recorded file/glob/negative/control selectors define freshness relevance; unrelated eligible additions do not stale the run unless a selector observes them.
+
+Affected claims are resolved conservatively:
+
+```text
+changed read.ruleId
+  -> every Fact with the same globally namespaced ruleId
+  -> every Claim whose factIds include those facts
+
+changed documentation read
+  -> documentation Evidence produced by that rule/path
+  -> DedupDecision.documentationEvidenceIds
+  -> DedupDecision.candidateClaimIds
+```
+
+Repository identity and effective policy changes affect all claims. An extractor-version change affects facts/claims from that extractor's rules. All selectors are re-evaluated even after a stale/unknown result so findings are complete; precedence remains `stale > unknown > fresh`.
+
+## 6. Generic and documentation collection boundary
+
+Task 4 is root-scoped and shallow:
+
+- CI: selected workflow files may yield observed workflow/job presence from structural keys only.
+- Taskfile: selected task name and bounded redacted literal body are observed in `task.definition`; `task <name>` is a deterministic-derived invocation.
+- Root Make/Just: target names are observed; `make <name>` / `just <name>` are deterministic-derived invocations. Recipe bodies are not policy.
+- Container: selected Dockerfile/Compose presence only.
+- JSON/TOML/YAML: only versioned selected-key summaries from the exact allowlist below. Task 4 does not discover `**/*.json`, `**/*.toml`, or `**/*.{yml,yaml}`. Source-file names and extensions are case-sensitive exactly as written. Ecosystem-specific interpretation remains Task 5. Arbitrary files, keys, and prose never become policy or commands.
+- JVM-native build files yield explicit unsupported coverage, not inferred commands or absence.
+
+Documentation reads include every selected root README-like file and `docs/**/*.md`. A normalized matched line produces one `documentation.line` fact whose `evidenceIds` contains every distinct path/locator evidence record for identical normalized text; every file read remains in `reads`.
+
+The minimal Fact vocabulary shared with Task 5 is:
+
+```text
+factType="artifact.presence"
+value={"category": "ci-workflow"|"ci-job"|"container"|"ecosystem",
+       "name": str, "path": RepositoryPath}
+
+factType="task.definition"
+value={"category": "task", "runner": "task"|"make"|"just"|"npm",
+       "name": str, "body": str|null}
+
+factType="command.invocation"
+value={"category": "test"|"build"|"run"|"task",
+       "argv": list[str]}
+
+factType="config.structure"
+value={"category": "structural-summary", "format": "json"|"toml"|"yaml",
+       "keys": list[str]}
+
+factType="documentation.line"
+value={"category": "documentation", "text": str}
+```
+
+All object keys are exact; omitted information is not represented by extra keys. `argv` is data, never shell text. Literal bodies/text are redacted and bounded. Rule version changes when selected keys, normalization, or derivation changes. Task 5 may add versioned category/runner values but uses these shapes rather than prose facts.
+
+`config.structure.keys` is the sorted intersection of present known key paths; values are never included. The exact source/key allowlist is:
+
+| source | permitted key paths |
+|---|---|
+| root `package.json` | `name`, `scripts`, `dependencies`, `devDependencies`, `packageManager`, `engines`, `workspaces`, `type` |
+| root `pyproject.toml` | `project`, `build-system`, `tool.pytest.ini_options`, `tool.ruff`, `tool.poetry` |
+| root `Cargo.toml` | `package`, `workspace`, `dependencies`, `dev-dependencies`, `features` |
+| root `Taskfile.yml`, `Taskfile.yaml` | `version`, `tasks` |
+| root `compose.yml`, `compose.yaml`, `docker-compose.yml`, `docker-compose.yaml` | `services`, `networks`, `volumes`, `secrets`, `configs` |
+| `.github/workflows/*.yml`, `.github/workflows/*.yaml` | `on`, `jobs` |
+
+Nested key paths above mean structural path presence, not traversal of arbitrary descendants for output. A file with none of its permitted paths yields no `config.structure` fact.
+
+## 7. YAML and redaction defaults
+
+YAML is composed with `yaml.BaseLoader`; an identity-based active-node set rejects recursive aliases before construction. Only selected known keys receive explicit conversion. YAML 1.1 spellings such as `on`, `off`, `yes`, and `no` remain strings unless that exact selected field defines another conversion.
+
+Persisted labels are category-only and contain no secret-derived hash:
+
+```text
+[REDACTED:secret-key]
+[REDACTED:private-key]
+[REDACTED:authorization]
+[REDACTED:credential-url]
+[REDACTED:high-entropy]
+```
+
+Defaults are frozen as follows:
+
+- Secret-key matching casefolds a key and removes `-`, `_`, `.`, and spaces. It matches the exact set `password`, `passwd`, `secret`, `token`, `apikey`, `accesstoken`, `accesskey`, `clientsecret`, `privatekey`, or any normalized key ending in `password`, `passwd`, `secret`, `token`, `apikey`, `accesskey`, or `privatekey`.
+- Private-key material matches a line beginning `-----BEGIN ` and ending ` PRIVATE KEY-----`.
+- Authorization matches case-insensitive `Authorization:` or `Proxy-Authorization:` headers with a nonempty value.
+- Credential URL matches an absolute URI with nonempty userinfo before `@`; the complete userinfo is replaced.
+- High entropy applies only to ASCII token candidates of 24–256 characters from `[A-Za-z0-9_+/=-]`, requires at least three of lowercase/uppercase/digit/symbol, and Shannon entropy at least 3.5 bits per character.
+
+Non-string values under secret-like keys are replaced too. Diagnostics contain category/path/locator and stable error codes, never raw values, source lines, parser exception representations, or credential URLs. Custom secret paths are outside P0 because `ScanPolicy` has no such field.
+
+## Required focused tests
+
+Task 3 tests `control_sink=None`, traversal-order file observations followed by the aggregate glob, consumer canonical sorting, complete-empty `.gitignore` glob, same-buffer file hash, cap/failure visibility, opened/decoded accounting, tracked-name override, ancestor pruning, and the explicit absence of info/global excludes.
+
+Task 4 tests dependency-before-parser ordering; mutation after capture; every outcome row; excluded-present behavior; one physical open with two rule reads; control-budget deduction; published cap allocation including conditional reads; empty glob/negative hashes; unknown negative rejection; digest stability; selector-only freshness; docs-to-dedup affected claims; cyclic YAML rejection; scalar preservation; every redaction category; duplicate documentation evidence consolidation; sorted present-key intersections with no values; and exact secret-key fixtures `api_token`, `numeric_secret`, `boolean_secret`, and `empty_secret` including non-string/empty values.
+
