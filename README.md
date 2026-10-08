@@ -1,6 +1,6 @@
 # repo2skill
 
-> **Trạng thái hiện tại:** P0-01, P0-02 và P0-03 đã được review độc lập. P0-03 gồm inventory `800b349` và hai lượt sửa review `9dd2ea5`, `fd6f973`. Full suite ở lượt đầu có 88 pass, 1 skip; sau sửa lượt hai, focused inventory/identity có 40 pass và 3 test bị ảnh hưởng chạy lại đều pass; chưa chạy full suite trên `fd6f973`. CLI hiện chỉ chạy `--help` và `--version`.
+> **Trạng thái hiện tại:** P0-01 đến P0-04 đã được review độc lập. P0-03 hoàn tất ở `fd6f973`. P0-04 extraction seam được hoàn tất tại `322568e` (review fixes `6c2b16d`, `322568e`); scoped review clean. Các review-fix gate gần nhất có 13 test bị ảnh hưởng pass; fix round 1 có 30 focused tests pass. Full suite của baseline P0-04 trước các sửa review có 107 pass, 1 skip; chưa chạy full suite trên chuỗi fix review cuối. P0-05 đang triển khai. CLI hiện chỉ chạy `--help` và `--version`.
 
 repo2skill được thiết kế như một generator tri thức repository có truy vết, chạy local-first. Nó sẽ đọc repository, tạo evidence và fact có kiểu, dựng claim có thể review, rồi sinh managed content cho `AGENTS.md`, một Agent Skill portable và báo cáo provenance. Người dùng đầu tiên được giả định là maintainer hoặc senior developer của repository đa ngôn ngữ đã dùng coding agent, nhưng cần biết mỗi command, path hay convention được lấy từ đâu và còn đúng với snapshot hiện tại hay không.
 
@@ -49,6 +49,6 @@ python -m venv .venv
 
 Các lệnh này cài package local, chạy test, build wheel/sdist và hiển thị help. CLI hiện chưa có `init`, `scan`, `generate`, `review`, `export`, `check`, `explain`, `report` hoặc `doctor`; chỉ `repo2skill --help` và `repo2skill --version` là runnable.
 
-P0-01 đã khóa package bootstrap, policy/target, default versioned, confinement cho output path và attribution. P0-02 bổ sung typed provenance records, ID/revision, immutable ledger, atomic state pointer và OS lock. P0-03 hoàn tất inventory và repository identity; P0-04 đang được triển khai, còn P0-05 đến P0-12 đang chờ.
+P0-01 đã khóa package bootstrap, policy/target, default versioned, confinement cho output path và attribution. P0-02 bổ sung typed provenance records, ID/revision, immutable ledger, atomic state pointer và OS lock. P0-03 hoàn tất inventory và repository identity. P0-04 hoàn tất extraction/read/recheck seams, generic/docs evidence, parser safeguards và redaction; P0-05 đang được triển khai, còn P0-06 đến P0-12 chờ.
 
 Ngoài hai global option hiện có, mọi command sản phẩm xuất hiện trong tài liệu hiện nay đều là **FUTURE** hoặc ví dụ contract. Không dùng chúng như hướng dẫn chạy generation, và không quảng bá package đã publish. Mỗi thay đổi tương lai cần trỏ tới feature ID, acceptance/fixture tương ứng và giữ thứ tự P0 hoàn chỉnh trước P1 Codex/pilot.
