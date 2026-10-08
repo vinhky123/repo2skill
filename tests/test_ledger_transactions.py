@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
-from repo2skill.ledger import LedgerStore, LockBusyError
+from repo2skill.ledger import LedgerStore, LockBusyError, decode_root_document
 from repo2skill.models import ProjectDocument, ProjectState, ReviewEvent
 
 
@@ -29,6 +29,18 @@ def _hold_lock(root: str, state_dir: str, ready: multiprocessing.Queue[str], rel
         ready.put("locked")
         release.wait(15)
         store.replace_state(dataclasses.replace(current, activeStageRevision=2))
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True, check=False,
+        )
+        if completed.returncode:
+            pytest.skip(f"directory link unavailable: {error}")
 
 
 def test_construction_and_read_only_access_do_not_create_state_directory(tmp_path: Path) -> None:
@@ -68,6 +80,23 @@ def test_unknown_major_and_malformed_nested_state_fail_closed(tmp_path: Path) ->
         LedgerStore(root, state_dir).read_state()
 
 
+def test_state_reader_rejects_impossible_nested_timestamp(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    state_dir = root / ".repo2skill"
+    state_dir.mkdir(parents=True)
+    event = ReviewEvent(
+        1, "event_0123456789abcdef01234567",
+        "claim_0123456789abcdef01234567", 1, "accept", None,
+        "2026-10-07T12:00:00Z",
+    )
+    raw = dataclass_json(_state(events=(event,)))
+    raw["reviewEvents"][0]["createdAt"] = "2026-02-31T12:00:00Z"  # type: ignore[index]
+    (state_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="RFC 3339"):
+        LedgerStore(root, state_dir).read_state()
+
+
 def test_state_rewrite_preserves_root_and_existing_nested_additive_fields(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -96,6 +125,40 @@ def test_state_rewrite_preserves_root_and_existing_nested_additive_fields(tmp_pa
     rewritten = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert rewritten["futureRoot"] == {"kept": True}
     assert rewritten["reviewEvents"][0]["futureNested"] == ["kept"]
+
+
+def test_new_review_event_with_same_claim_does_not_inherit_unknown_fields(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    state_dir = root / ".repo2skill"
+    first = ReviewEvent(
+        1, "event_0123456789abcdef01234567",
+        "claim_0123456789abcdef01234567", 1, "accept", None,
+        "2026-10-07T12:00:00Z",
+    )
+    second = dataclasses.replace(
+        first,
+        eventId="event_aaaaaaaaaaaaaaaaaaaaaaaa",
+        action="contest",
+        reason="support changed",
+        createdAt="2026-10-07T13:00:00Z",
+    )
+    store = LedgerStore(root, state_dir)
+    with store.mutation():
+        assert store.read_state() is None
+        store.replace_state(_state(events=(first,)))
+    raw = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    raw["reviewEvents"][0]["futureNested"] = "first-only"
+    (state_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with store.mutation():
+        current = store.read_state()
+        assert current is not None
+        store.replace_state(dataclasses.replace(current, reviewEvents=(first, second)))
+
+    rewritten = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert rewritten["reviewEvents"][0]["futureNested"] == "first-only"
+    assert "futureNested" not in rewritten["reviewEvents"][1]
 
 
 def test_immutable_orphan_does_not_advance_state_pointer(tmp_path: Path) -> None:
@@ -175,17 +238,57 @@ def test_writes_require_lock_and_reject_redirected_state_paths(tmp_path: Path) -
     outside = tmp_path / "outside"
     outside.mkdir()
     linked = root / "linked"
-    try:
-        linked.symlink_to(outside, target_is_directory=True)
-    except OSError as error:
-        completed = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(linked), str(outside)],
-            capture_output=True, text=True, check=False,
-        )
-        if completed.returncode:
-            pytest.skip(f"directory link unavailable: {error}")
+    _make_directory_link(linked, outside)
     with pytest.raises(ValueError, match="symlink|reparse"):
         LedgerStore(root, linked)
+
+
+def test_long_lived_store_rechecks_redirected_state_directory_before_read(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    state_dir = root / ".repo2skill"
+    store = LedgerStore(root, state_dir)
+    with store.mutation():
+        assert store.read_state() is None
+        store.replace_state(_state())
+    moved = root / "moved-state"
+    state_dir.rename(moved)
+    _make_directory_link(state_dir, moved)
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        store.read_state()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "runs//run_aaaaaaaaaaaaaaaaaaaaaaaa.json",
+        "runs/./run_aaaaaaaaaaaaaaaaaaaaaaaa.json",
+        "runs/run_aaaaaaaaaaaaaaaaaaaaaaaa.json/",
+    ],
+)
+def test_store_rejects_noncanonical_input_paths_before_access(
+    tmp_path: Path, relative_path: str
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    state_dir = root / ".repo2skill"
+    state_dir.mkdir()
+    store = LedgerStore(root, state_dir)
+
+    with pytest.raises(ValueError, match="normalized"):
+        store.read_manifest_set(relative_path)
+
+
+def test_store_rejects_final_component_case_collision(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    runs = root / ".repo2skill" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "RUN_aaaaaaaaaaaaaaaaaaaaaaaa.json").write_text("{}", encoding="utf-8")
+    store = LedgerStore(root, root / ".repo2skill")
+
+    with pytest.raises(ValueError, match="case-colliding"):
+        store.read_run("run_aaaaaaaaaaaaaaaaaaaaaaaa")
 
 
 def test_project_reader_validates_nested_records_and_nonfinite_unknowns(tmp_path: Path) -> None:
@@ -209,6 +312,40 @@ def test_project_reader_validates_nested_records_and_nonfinite_unknowns(tmp_path
     )
     with pytest.raises(ValueError, match="non-finite"):
         LedgerStore(root, state_dir).read_project()
+
+
+@pytest.mark.parametrize("policy_field", ["scanPolicy", "claimPolicy"])
+def test_project_reader_rejects_malformed_nested_policy_schema(
+    tmp_path: Path, policy_field: str
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    state_dir = root / ".repo2skill"
+    state_dir.mkdir()
+    project = ProjectDocument(
+        "1.0", "0.1.0", "project_0123456789abcdef01234567", "repo",
+        ".repo2skill", "worktree", default_scan_policy(), default_claim_policy(),
+        default_targets(root),
+    )
+    raw = dataclass_json(project)
+    raw[policy_field]["schemaVersion"] = "not-a-version"  # type: ignore[index]
+    (state_dir / "project.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schemaVersion"):
+        LedgerStore(root, state_dir).read_project()
+
+
+def test_decoder_rejects_value_after_every_optional_union_member_rejects() -> None:
+    @dataclasses.dataclass(frozen=True)
+    class OptionalRoot:
+        schemaVersion: str
+        optionalText: str | None
+
+    with pytest.raises(ValueError, match="OptionalRoot.optionalText"):
+        decode_root_document(
+            {"schemaVersion": "1.0", "optionalText": {"wrong": "type"}},
+            OptionalRoot,
+        )
 
 
 def test_immutable_documents_never_overwrite_existing_content(tmp_path: Path) -> None:

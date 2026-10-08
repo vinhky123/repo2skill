@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import math
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -84,8 +85,22 @@ def _repository_path(value: str, field: str = "path") -> None:
 
 
 def _timestamp(value: str) -> None:
-    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", value):
+    match = (
+        re.fullmatch(
+            r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z",
+            value,
+        )
+        if isinstance(value, str)
+        else None
+    )
+    if match is None:
         raise ValueError("createdAt/updatedAt/completedAt must be an RFC 3339 UTC timestamp")
+    try:
+        datetime(*(int(component) for component in match.groups()))
+    except ValueError as error:
+        raise ValueError(
+            "createdAt/updatedAt/completedAt must be an RFC 3339 UTC timestamp"
+        ) from error
 
 
 def _schema(value: str) -> None:
@@ -111,8 +126,9 @@ class ScanPolicy:
     encodings: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not self.schemaVersion or not self.revision:
-            raise ValueError("schemaVersion and revision are required")
+        _schema(self.schemaVersion)
+        if not self.revision:
+            raise ValueError("revision is required")
         if self.followSymlinks:
             raise ValueError("followSymlinks must be false in P0")
         if self.generatedMode != "exclude":
@@ -131,8 +147,9 @@ class ClaimPolicy:
     renderBudget: int
 
     def __post_init__(self) -> None:
-        if not self.schemaVersion or not self.revision:
-            raise ValueError("schemaVersion and revision are required")
+        _schema(self.schemaVersion)
+        if not self.revision:
+            raise ValueError("revision is required")
         _positive(self.renderBudget, "renderBudget")
 
 

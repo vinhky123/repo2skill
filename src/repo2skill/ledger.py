@@ -5,11 +5,11 @@ from contextlib import contextmanager
 import dataclasses
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
 import tempfile
 import types
-from typing import Any, Iterator, Literal, TypeVar, get_args, get_origin, get_type_hints
+from typing import Any, Iterator, Literal, TypeVar, Union, get_args, get_origin, get_type_hints
 
 from .config import PathBoundaryError, resolve_under
 from .ids import CanonicalIdContext, canonical_json_bytes
@@ -48,6 +48,15 @@ def _reject_redirected_ancestors(path: Path) -> None:
             break
         if _is_redirect(current):
             raise ValueError(f"symlink or reparse path component is not allowed: {current}")
+
+
+def _reject_case_collision(parent: Path, name: str) -> None:
+    if not parent.is_dir():
+        return
+    folded = name.casefold()
+    for entry in os.listdir(parent):
+        if entry.casefold() == folded and entry != name:
+            raise ValueError(f"case-colliding store path component: {name}")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -176,6 +185,7 @@ def acquire_project_lock(state_dir: Path) -> Iterator[None]:
 
 
 def _load_json(path: Path) -> dict[str, JsonValue]:
+    _reject_redirected_ancestors(path)
     if path.is_symlink() or (path.exists() and _is_redirect(path)):
         raise ValueError(f"persisted document must not be redirected: {path}")
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -187,6 +197,9 @@ def _load_json(path: Path) -> dict[str, JsonValue]:
 
 
 def _decode_value(value: object, annotation: object, field: str) -> object:
+    if annotation == JsonValue:
+        validate_json_value(value, field=field)
+        return value
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin is Literal:
@@ -205,7 +218,7 @@ def _decode_value(value: object, annotation: object, field: str) -> object:
         if key_type is not str:
             return value
         return {key: _decode_value(item, item_type, field) for key, item in value.items()}
-    if origin in {types.UnionType}:
+    if origin in {types.UnionType, Union}:
         if value is None and type(None) in args:
             return None
         for member in args:
@@ -215,8 +228,7 @@ def _decode_value(value: object, annotation: object, field: str) -> object:
                 return _decode_value(value, member, field)
             except (TypeError, ValueError):
                 pass
-        # Recursive JsonValue aliases reach this path; the whole tree was validated already.
-        return value
+        raise ValueError(f"{field} does not match any allowed union member")
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         if not isinstance(value, dict):
             raise ValueError(f"{field} must be an object")
@@ -225,6 +237,9 @@ def _decode_value(value: object, annotation: object, field: str) -> object:
         if type(value) is not bool: raise ValueError(f"{field} must be a boolean")
     elif annotation is int:
         if type(value) is not int: raise ValueError(f"{field} must be an integer")
+    elif annotation is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field} must be a number")
     elif annotation is str:
         if not isinstance(value, str): raise ValueError(f"{field} must be a string")
     return value
@@ -254,25 +269,30 @@ def decode_root_document(raw: dict[str, JsonValue], record_type: type[T]) -> T:
     return _decode_dataclass(raw, record_type)
 
 
-def _merge_additive(old: JsonValue, new: JsonValue) -> JsonValue:
+def _merge_additive(
+    old: JsonValue, new: JsonValue, *, field_name: str | None = None
+) -> JsonValue:
     if isinstance(old, dict) and isinstance(new, dict):
         merged = dict(old)
         for key, value in new.items():
-            merged[key] = _merge_additive(old[key], value) if key in old else value
+            merged[key] = (
+                _merge_additive(old[key], value, field_name=key)
+                if key in old else value
+            )
         return merged
-    if isinstance(old, list) and isinstance(new, list):
+    if isinstance(old, list) and isinstance(new, list) and field_name == "reviewEvents":
         old_by_id = {
-            item[identity]: item
-            for item in old if isinstance(item, dict)
-            for identity in ("eventId", "operationId", "manifestId", "claimId", "factId", "evidenceId", "readId", "decisionId")
-            if identity in item and isinstance(item[identity], str)
+            item["eventId"]: item
+            for item in old
+            if isinstance(item, dict) and isinstance(item.get("eventId"), str)
         }
         result: list[JsonValue] = []
         for item in new:
-            previous = None
-            if isinstance(item, dict):
-                previous = next((old_by_id[item[key]] for key in ("eventId", "operationId", "manifestId", "claimId", "factId", "evidenceId", "readId", "decisionId") if key in item and item[key] in old_by_id), None)
-            result.append(_merge_additive(previous, item) if previous is not None else item)
+            event_id = item.get("eventId") if isinstance(item, dict) else None
+            previous = old_by_id.get(event_id) if isinstance(event_id, str) else None
+            result.append(
+                _merge_additive(previous, item) if previous is not None else item
+            )
         return result
     return new
 
@@ -305,7 +325,7 @@ class LedgerStore:
         relative = self.state_dir.relative_to(self.root)
         current = self.root
         for part in relative.parts:
-            self._reject_case_collision(current, part)
+            _reject_case_collision(current, part)
             current = current / part
             if current.exists() or current.is_symlink():
                 if not current.is_dir() or _is_redirect(current):
@@ -335,7 +355,7 @@ class LedgerStore:
                 self._raw_state = None
 
     def read_state(self) -> ProjectState | None:
-        path = self.state_dir / "state.json"
+        path = self._store_path("state.json", create_parents=False)
         if not path.exists():
             if self._mutation_active:
                 self._state_loaded = True
@@ -349,7 +369,7 @@ class LedgerStore:
         return state
 
     def read_project(self) -> ProjectDocument | None:
-        path = self.state_dir / "project.json"
+        path = self._store_path("project.json", create_parents=False)
         if not path.exists():
             return None
         return decode_root_document(_load_json(path), ProjectDocument)
@@ -435,34 +455,37 @@ class LedgerStore:
         write_immutable_document(path, document)
 
     def _store_path(self, relative_path: str, *, create_parents: bool) -> Path:
-        candidate = Path(relative_path)
-        if candidate.is_absolute() or "\\" in relative_path or any(part in {"", ".", ".."} for part in candidate.parts):
+        if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:
             raise ValueError("store path must be normalized and relative")
+        posix = PurePosixPath(relative_path)
+        windows = PureWindowsPath(relative_path)
+        if (
+            posix.is_absolute()
+            or windows.is_absolute()
+            or bool(windows.drive)
+            or "\\" in relative_path
+            or posix.as_posix() != relative_path
+            or any(part in {"", ".", ".."} for part in posix.parts)
+        ):
+            raise ValueError("store path must be normalized and relative")
+        candidate = Path(*posix.parts)
+        _reject_redirected_ancestors(self.state_dir)
         if not self.state_dir.exists():
             if create_parents:
                 raise RuntimeError("state directory must be created by mutation scope")
             return self.state_dir / candidate
         destination = resolve_under(self.state_dir, candidate)
-        if create_parents:
-            current = self.state_dir
-            for part in candidate.parts[:-1]:
-                self._reject_case_collision(current, part)
-                current = current / part
+        current = self.state_dir
+        for index, part in enumerate(candidate.parts):
+            _reject_case_collision(current, part)
+            current = current / part
+            if index < len(candidate.parts) - 1:
                 if current.exists() or current.is_symlink():
                     if not current.is_dir() or _is_redirect(current):
                         raise ValueError(f"store path is redirected: {current}")
-                else:
+                elif create_parents:
                     current.mkdir()
         return destination
-
-    @staticmethod
-    def _reject_case_collision(parent: Path, name: str) -> None:
-        if not parent.is_dir():
-            return
-        folded = name.casefold()
-        for entry in os.listdir(parent):
-            if entry.casefold() == folded and entry != name:
-                raise ValueError(f"case-colliding store path component: {name}")
 
     def _require_mutation(self) -> None:
         if not self._mutation_active:

@@ -91,3 +91,16 @@ def test_locator_and_review_event_enforce_enums_and_reason_rules() -> None:
         ReviewEvent(action="reject", reason=" ", **base)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="reason"):
         ReviewEvent(action="accept", reason="not allowed", **base)  # type: ignore[arg-type]
+
+
+def test_review_event_rejects_impossible_rfc3339_utc_timestamp() -> None:
+    with pytest.raises(ValueError, match="RFC 3339"):
+        ReviewEvent(
+            1,
+            "event_0123456789abcdef01234567",
+            "claim_0123456789abcdef01234567",
+            1,
+            "accept",
+            None,
+            "2026-99-07T12:00:00Z",
+        )
