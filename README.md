@@ -1,6 +1,6 @@
 # repo2skill
 
-> **Trạng thái hiện tại:** nền tảng package/policy của P0-01 đã hoàn tất review và kiểm chứng trên Windows/Python 3.13. Package cài được ở chế độ development, nhưng CLI hiện chỉ chạy `--help` và `--version`; P0-02 đến P0-12 chưa được triển khai.
+> **Trạng thái hiện tại:** P0-01 (package/policy) và P0-02 (record/ID/ledger) đã hoàn tất review độc lập trên Windows/Python 3.13. Bộ test liên quan sau sửa ledger có 48 pass, 1 platform skip. CLI hiện chỉ chạy `--help` và `--version`; P0-03 đến P0-12 chưa hoàn tất.
 
 repo2skill được thiết kế như một generator tri thức repository có truy vết, chạy local-first. Nó sẽ đọc repository, tạo evidence và fact có kiểu, dựng claim có thể review, rồi sinh managed content cho `AGENTS.md`, một Agent Skill portable và báo cáo provenance. Người dùng đầu tiên được giả định là maintainer hoặc senior developer của repository đa ngôn ngữ đã dùng coding agent, nhưng cần biết mỗi command, path hay convention được lấy từ đâu và còn đúng với snapshot hiện tại hay không.
 
@@ -49,6 +49,6 @@ python -m venv .venv
 
 Các lệnh này cài package local, chạy test, build wheel/sdist và hiển thị help. CLI hiện chưa có `init`, `scan`, `generate`, `review`, `export`, `check`, `explain`, `report` hoặc `doctor`; chỉ `repo2skill --help` và `repo2skill --version` là runnable.
 
-P0-01 đã khóa package bootstrap, ba policy/target record nền tảng, default versioned, confinement cho output path, attribution và reuse map. Công việc tiếp theo bắt đầu từ P0-02 trong local-generator plan; P0-02 đến P0-12 vẫn pending.
+P0-01 đã khóa package bootstrap, policy/target, default versioned, confinement cho output path và attribution. P0-02 bổ sung typed provenance records, ID/revision, immutable ledger, atomic state pointer và OS lock. Công việc tiếp theo là P0-03 (inventory và repository identity); P0-03 đến P0-12 vẫn pending.
 
 Ngoài hai global option hiện có, mọi command sản phẩm xuất hiện trong tài liệu hiện nay đều là **FUTURE** hoặc ví dụ contract. Không dùng chúng như hướng dẫn chạy generation, và không quảng bá package đã publish. Mỗi thay đổi tương lai cần trỏ tới feature ID, acceptance/fixture tương ứng và giữ thứ tự P0 hoàn chỉnh trước P1 Codex/pilot.

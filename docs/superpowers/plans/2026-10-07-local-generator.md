@@ -4,7 +4,7 @@ During execution, read the [implementation contract](../../engineering/implement
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Status:** Task P0-01 is implemented at `9bb120b`, corrected at `466645e`, and independently reviewed. Final Windows/Python 3.13 verification: 13 passed, 1 platform-specific skip; wheel/sdist build and fresh wheel smoke passed. Tasks P0-02 through P0-12 have not been executed. Commands belonging to those later tasks remain FUTURE; the current CLI exposes only global `--help` and `--version`.
+> **Status:** P0-01 is implemented and independently reviewed (`9bb120b`, `466645e`). P0-02 is implemented and independently reviewed (`d308b04`, `c0244ca`); its latest focused Windows/Python 3.13 checks report 48 passed and 1 existing platform-specific skip. P0-03 through P0-12 are pending. Product commands remain FUTURE; the CLI exposes only global `--help` and `--version`. P0-01 wheel/sdist and fresh-wheel smoke checks passed before the ledger changes; release packaging is checked again in P0-12.
 
 **Goal:** Ship a useful local-only alpha that scans a repository, creates traceable claims, stages `AGENTS.md` and a portable Skill, reviews/exports owned content safely, and detects/explains drift without AI or network access.
 
