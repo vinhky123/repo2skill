@@ -1,5 +1,7 @@
 # Optional Codex and Pilot Implementation Plan
 
+> **Superseded for AI and automation:** This unexecuted P1 plan is superseded by the proposed commit-maintenance scope in [the 2026-10-09 design](../specs/2026-10-09-commit-skill-maintenance-design.md) and [implementation plan](2026-10-09-commit-skill-maintenance.md). Its EvidencePack-only/facts-only boundary does not govern that future maintenance path. Pilot measurement is deferred. P0 implementation exists; this plan's old docs-only status is stale.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **Status:** Ready for review; not executed. Commands are FUTURE and are not runnable in the current documentation-only repository.
