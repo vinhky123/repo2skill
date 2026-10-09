@@ -24,7 +24,7 @@ _CONFIG_KEYS = {
     "toml": frozenset({"project", "build-system", "tool.pytest.ini_options", "tool.ruff", "tool.poetry", "package", "workspace", "dependencies", "dev-dependencies", "features"}),
     "yaml": frozenset({"version", "tasks", "services", "networks", "volumes", "secrets", "configs", "on", "jobs"}),
 }
-_PLAIN_ARG = re.compile(r"[A-Za-z0-9_./:@%+=,<>-]+\Z")
+_PLAIN_ARG = re.compile(r"[A-Za-z0-9_./:@%+=,-]+\Z")
 
 
 def template_key_for(fact_type: str, payload: object) -> str:

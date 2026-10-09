@@ -8,6 +8,11 @@ from .ids import CanonicalIdContext, canonical_record_id, latest_by_id, revise_r
 from .models import Claim, ClaimPolicy, ClaimSet, Fact
 
 
+def _claim_identity(repository_id: str, scope: str, semantic_key: str) -> dict[str, str]:
+    return {"repository": repository_id, "scope": scope,
+            "recordType": "claim", "semanticKey": semantic_key}
+
+
 def derive_claims(
     facts: Sequence[Fact],
     policy: ClaimPolicy,
@@ -19,7 +24,13 @@ def derive_claims(
     """Build one deterministic, pending candidate for each supported non-documentation fact."""
     if not repository_id:
         raise ValueError("repository_id is required")
-    context = id_context or CanonicalIdContext()
+    context = id_context if id_context is not None else CanonicalIdContext()
+    for item in prior_claims:
+        expected_id = context.record_id(
+            "claim", _claim_identity(repository_id, item.scope, item.semanticKey),
+        )
+        if expected_id != item.claimId:
+            raise ValueError(f"prior claim ID does not match reconstructed canonical identity: {item.claimId}")
     prior = latest_by_id(
         prior_claims, id_field="claimId", revision_field="claimRevision",
         semantic_payload=lambda item: {"payload": item.payload, "kind": item.kind, "origin": item.origin},
@@ -36,8 +47,7 @@ def derive_claims(
         template_key = template_key_for(fact.factType, fact.value)
         rendered = format_claim_text(template_key, fact.value)
         kind = "observed" if fact.derivation == "observed" else "inferred"
-        identity = {"repository": repository_id, "scope": fact.scope,
-                    "recordType": "claim", "semanticKey": fact.semanticKey}
+        identity = _claim_identity(repository_id, fact.scope, fact.semanticKey)
         claim_id = context.record_id("claim", identity)
         if claim_id in claim_ids:
             raise ValueError(f"duplicate claim stable identity in facts: {claim_id}")

@@ -50,7 +50,19 @@ class ExtractionSession:
             raise ValueError("inventory root does not match extraction root")
         self.snapshot_id, self.inventory, self.policy = snapshot_id, inventory, policy
         self.repository_id = repository_id
-        self.id_context = id_context or CanonicalIdContext()
+        self.id_context = id_context if id_context is not None else CanonicalIdContext()
+        for item in prior_evidence:
+            identity = {"repository": self.repository_id, "path": item.path,
+                        "locator": item.locator, "semanticKey": item.semanticKey}
+            expected_id = self.id_context.record_id("evidence", identity)
+            if expected_id != item.evidenceId:
+                raise ValueError(f"prior evidence ID does not match reconstructed canonical identity: {item.evidenceId}")
+        for item in prior_facts:
+            expected_id = self.id_context.record_id(
+                "fact", self._fact_identity(item.scope, item.factType, item.semanticKey),
+            )
+            if expected_id != item.factId:
+                raise ValueError(f"prior fact ID does not match reconstructed canonical identity: {item.factId}")
         self.prior_evidence = latest_by_id(
             prior_evidence, id_field="evidenceId", revision_field="revision",
             semantic_payload=lambda item: {"contentHash": item.contentHash, "locator": item.locator,

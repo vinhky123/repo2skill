@@ -105,6 +105,35 @@ def test_unknown_fact_template_fails_closed() -> None:
         derive_claims((unknown,), default_claim_policy(), repository_id=REPO)
 
 
+def test_argv_formatter_quotes_placeholders_spaces_quotes_metacharacters_and_empty_args() -> None:
+    from repo2skill.claim_templates import format_claim_text
+
+    payload = {
+        "category": "single-test.v1",
+        "argv": ["runner", "<path>", "<TestName>", "two words", "it's", ";", ""],
+    }
+    assert format_claim_text("command-invocation.v1", payload) == (
+        "Single-test command: `runner '<path>' '<TestName>' 'two words' "
+        "'it'\"'\"'s' ';' ''`."
+    )
+
+
+def test_prior_claim_collision_identity_fails_closed(monkeypatch) -> None:
+    import pytest
+
+    import repo2skill.ids as ids
+
+    monkeypatch.setattr(ids, "_digest_suffix", lambda _canonical: "0" * 24)
+    old = _fact(fact_type="artifact.presence", key="artifact.presence:package.v1:old",
+                value={"category": "package.v1", "name": "old", "path": "old.json"})
+    current = _fact(fact_type="artifact.presence", key="artifact.presence:package.v1:new",
+                    value={"category": "package.v1", "name": "new", "path": "new.json"})
+    prior = derive_claims((old,), default_claim_policy(), repository_id=REPO).claims
+
+    with pytest.raises(ids.IdCollisionError, match="collision"):
+        derive_claims((current,), default_claim_policy(), repository_id=REPO, prior_claims=prior)
+
+
 def test_id_context_is_explicitly_reusable_for_claim_collisions(monkeypatch) -> None:
     context = CanonicalIdContext()
     facts = (

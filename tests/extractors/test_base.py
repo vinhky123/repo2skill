@@ -1,6 +1,7 @@
 from pathlib import Path
 from dataclasses import replace
 import hashlib
+import json
 
 import pytest
 
@@ -46,6 +47,102 @@ def test_prior_evidence_equal_maximum_conflict_fails_closed(run_ecosystem_fixtur
 
     with pytest.raises(ValueError, match="conflicting semantic history"):
         run_ecosystem_fixture("javascript", prior_evidence=(maximum, conflict))
+
+
+def test_prior_evidence_and_fact_reappearance_revises_above_semantic_high_water(
+    run_ecosystem_fixture, tmp_path: Path,
+):
+    initial = run_ecosystem_fixture("javascript")
+    manifest_path = tmp_path / "javascript" / "package.json"
+    original_bytes = manifest_path.read_bytes()
+    changed_manifest = json.loads(original_bytes)
+    changed_manifest["scripts"]["test"] = "vitest run --changed"
+    changed_bytes = json.dumps(changed_manifest, indent=2).encode("utf-8")
+
+    def write_changed(root: Path) -> None:
+        (root / "package.json").write_bytes(changed_bytes)
+
+    changed = run_ecosystem_fixture("javascript", mutate=write_changed)
+    newer_evidence = {item.evidenceId: item for item in changed.evidence}
+    newer_facts = {item.factId: item for item in changed.facts}
+    old_evidence = next(item for item in initial.evidence
+                        if newer_evidence[item.evidenceId].contentHash != item.contentHash)
+    old_fact = next(item for item in initial.facts
+                    if newer_facts[item.factId].value != item.value)
+    evidence_at_two = replace(newer_evidence[old_evidence.evidenceId], revision=2)
+    fact_at_two = replace(newer_facts[old_fact.factId], factRevision=2)
+    evidence_at_one = replace(old_evidence, revision=1)
+    fact_at_one = replace(old_fact, factRevision=1)
+
+    unchanged_new = run_ecosystem_fixture(
+        "javascript", mutate=write_changed,
+        prior_evidence=(evidence_at_one, evidence_at_two), prior_facts=(fact_at_one, fact_at_two),
+    )
+    assert next(item for item in unchanged_new.evidence if item.evidenceId == old_evidence.evidenceId).revision == 2
+    assert next(item for item in unchanged_new.facts if item.factId == old_fact.factId).factRevision == 2
+
+    def restore_original(root: Path) -> None:
+        (root / "package.json").write_bytes(original_bytes)
+
+    reverted = run_ecosystem_fixture(
+        "javascript", mutate=restore_original,
+        prior_evidence=(evidence_at_two, evidence_at_one), prior_facts=(fact_at_two, fact_at_one),
+    )
+    assert next(item for item in reverted.evidence if item.evidenceId == old_evidence.evidenceId).revision == 3
+    assert next(item for item in reverted.facts if item.factId == old_fact.factId).factRevision == 3
+
+
+def test_prior_evidence_identity_collision_fails_before_builder_history_selection(
+    run_ecosystem_fixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import repo2skill.ids as ids
+
+    initial = run_ecosystem_fixture("javascript")
+    source_root = tmp_path / "javascript"
+    policy = default_scan_policy()
+    inventory = collect_inventory(source_root, policy)
+    identity = capture_repository(source_root, inventory, "no-git",
+                                  project_id="project_000000000000000000000000", policy=policy)
+    current = initial.evidence[0]
+    rogue = replace(current, evidenceId="evidence_" + "0" * 24, path="other.json",
+                    locator=EvidenceLocator("file-presence", "other.json", None))
+    current_identity = {"repository": identity.repositoryId, "path": current.path,
+                        "locator": current.locator, "semanticKey": current.semanticKey}
+    rogue_identity = {"repository": identity.repositoryId, "path": rogue.path,
+                      "locator": rogue.locator, "semanticKey": rogue.semanticKey}
+    collision_identities = {ids.canonical_json_bytes(current_identity), ids.canonical_json_bytes(rogue_identity)}
+    original_digest = ids._digest_suffix
+    monkeypatch.setattr(ids, "_digest_suffix",
+                        lambda canonical: "0" * 24 if canonical in collision_identities else original_digest(canonical))
+
+    with pytest.raises(ids.IdCollisionError, match="collision"):
+        run_ecosystem_fixture("javascript", prior_evidence=(rogue,))
+
+
+def test_prior_fact_identity_collision_fails_before_builder_history_selection(
+    run_ecosystem_fixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import repo2skill.ids as ids
+
+    initial = run_ecosystem_fixture("javascript")
+    source_root = tmp_path / "javascript"
+    policy = default_scan_policy()
+    inventory = collect_inventory(source_root, policy)
+    identity = capture_repository(source_root, inventory, "no-git",
+                                  project_id="project_000000000000000000000000", policy=policy)
+    current = initial.facts[0]
+    rogue = replace(current, factId="fact_" + "0" * 24, semanticKey="different-semantic-key")
+    current_identity = {"repository": identity.repositoryId, "scope": current.scope,
+                        "factType": current.factType, "semanticKey": current.semanticKey}
+    rogue_identity = {"repository": identity.repositoryId, "scope": rogue.scope,
+                      "factType": rogue.factType, "semanticKey": rogue.semanticKey}
+    collision_identities = {ids.canonical_json_bytes(current_identity), ids.canonical_json_bytes(rogue_identity)}
+    original_digest = ids._digest_suffix
+    monkeypatch.setattr(ids, "_digest_suffix",
+                        lambda canonical: "0" * 24 if canonical in collision_identities else original_digest(canonical))
+
+    with pytest.raises(ids.IdCollisionError, match="collision"):
+        run_ecosystem_fixture("javascript", prior_facts=(rogue,))
 
 
 def test_read_finalizes_raw_hash_and_parses_captured_buffer_after_mutation(tmp_path: Path):
