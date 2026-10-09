@@ -160,9 +160,19 @@ def _lineage_records(
             raise ValueError(f"broken dedup fact lineage for {claim.claimId}")
         if any(item not in evidence_by_id for item in decision.documentationEvidenceIds):
             raise ValueError(f"broken dedup evidence lineage for {claim.claimId}")
-        claim_ids = {item.claimId for item in run.claims}
-        if any(item not in claim_ids for item in decision.candidateClaimIds):
-            raise ValueError(f"broken dedup claim lineage for {claim.claimId}")
+        claims_by_id: dict[str, list[Claim]] = {}
+        for candidate in run.claims:
+            claims_by_id.setdefault(candidate.claimId, []).append(candidate)
+        candidate_claims: list[Claim] = []
+        for candidate_id in decision.candidateClaimIds:
+            matches = claims_by_id.get(candidate_id, [])
+            if len(matches) != 1:
+                raise ValueError(f"broken dedup claim lineage for {claim.claimId}")
+            candidate_claims.append(matches[0])
+        expected_fact_ids = tuple(sorted({fact_id for candidate in candidate_claims
+                                          for fact_id in candidate.factIds}))
+        if decision.candidateFactIds != expected_fact_ids:
+            raise ValueError(f"broken dedup fact lineage for {claim.claimId}")
         related_fact_ids.update(decision.candidateFactIds)
         related_evidence_ids.update(decision.documentationEvidenceIds)
         for fact_id in decision.candidateFactIds:

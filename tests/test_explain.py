@@ -194,3 +194,28 @@ def test_explain_includes_documentation_evidence_for_recorded_suppression() -> N
     assert result.dedupDecision == decision
     assert result.facts == (fact,)
     assert result.evidence == (source_evidence, documentation)
+
+
+@pytest.mark.parametrize("candidate_fact_mode", ["omitted", "unrelated"])
+def test_explain_rejects_dedup_fact_claim_mismatch(candidate_fact_mode: str) -> None:
+    run, fact, _ = _validation_run()
+    claim = derive_claims((fact,), run.effectiveClaimPolicy,
+                          repository_id=run.snapshot.repositoryId).claims[0]
+    unrelated = replace(
+        fact, factId="fact_1123456789abcdef01234567", semanticKey="unrelated-fact",
+        value={"category": "package.v1", "name": "unrelated@1.0", "path": "other/package.json"},
+    )
+    candidate_fact_ids = () if candidate_fact_mode == "omitted" else (unrelated.factId,)
+    if candidate_fact_mode == "unrelated":
+        run = replace(run, facts=(fact, unrelated))
+    decision = DedupDecision(1, "decision_0123456789abcdef01234567", run.snapshot.snapshotId,
+                             (claim.claimId,), candidate_fact_ids, (), "dedup.docs", "1",
+                             "suppress", "documented")
+    run = replace(run, claims=(claim,), dedupDecisions=(decision,))
+    project = ProjectDocument("1.0", "0.1.0", "project_0123456789abcdef01234567", "repo", ".repo2skill",
+                              "no-git", run.effectiveScanPolicy, run.effectiveClaimPolicy, ())
+    state = ProjectState("1.0", "0.1.0", project.projectId, run.runId, None, (), {}, None, None)
+    snapshot = LedgerStoreSnapshot(project, state, {run.runId: run}, {}, {})
+    with pytest.raises(ValueError, match="dedup fact lineage"):
+        explain_claim(claim.claimId, snapshot, run_id=run.runId,
+                      staged_descriptors={}, target_manifests=())
