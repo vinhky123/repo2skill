@@ -199,5 +199,5 @@ class PythonExtractor:
                 self.session.add_fact(extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version,
                     fact_type="command.invocation", scope=".", semantic_key="command.invocation:single-test.v1:python:one-test",
                     value={"category": "single-test.v1", "argv": ["python", "-m", "pytest", f"{target_result.selector.value}::{target}"]},
-                    derivation="heuristic", evidence_ids=(test_evidence.evidenceId, pytest_evidence.evidenceId))
+                    derivation="heuristic", evidence_ids=tuple(sorted({test_evidence.evidenceId, pytest_evidence.evidenceId})))
         return finish(reads)

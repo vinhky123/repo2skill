@@ -8,7 +8,7 @@ from repo2skill.ledger import LedgerStore
 from repo2skill.cli import _exit_code, _finding
 from repo2skill.claims import apply_review_dispositions
 from repo2skill.validation import validate_claims
-from repo2skill.ids import canonical_record_id
+from repo2skill.ids import canonical_record_id, canonical_json_bytes
 from repo2skill.models import ExportJournal, ExportResult
 from repo2skill.models import Finding
 from datetime import datetime, timezone
@@ -223,6 +223,107 @@ def test_read_only_commands_and_selected_resume_guard(tmp_path: Path, capsys, mo
     assert resume_code == 0
     assert observed["id"] == export_id
     assert resumed["command"] == "export-resume"
+
+
+def test_check_lists_invalid_pending_candidates_and_review_cannot_accept_them(tmp_path: Path, capsys, monkeypatch) -> None:
+    from dataclasses import replace
+    import repo2skill.cli as cli
+
+    (tmp_path / "package.json").write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    _code, generated = _invoke_json(tmp_path, "generate", capsys=capsys)
+    run_id = generated["result"]["runId"]
+    store = LedgerStore(tmp_path, tmp_path / ".repo2skill")
+    run = store.read_run(run_id)
+    invalid = replace(run.claims[0], factIds=("fact_000000000000000000000000",), evidenceIds=(), proposalStatus="accepted")
+    bad_run = replace(run, claims=(invalid, *run.claims[1:]))
+    monkeypatch.setattr(cli, "_selected_run", lambda *_args, **_kwargs: bad_run)
+
+    review_code, listed = _invoke_json(tmp_path, "review", "list", "--status", "pending", capsys=capsys)
+    check_code, checked = _invoke_json(tmp_path, "check", capsys=capsys)
+    assert review_code == 0 and check_code == 3
+    review_ids = {item["claimId"] for item in listed["result"]["claims"]}
+    check_finding = next(item for item in checked["findings"] if item["code"] == "check.review-pending")
+    assert invalid.claimId in review_ids
+    assert invalid.claimId in check_finding["claimIds"]
+
+    accept_code, accepted = _invoke_json(tmp_path, "review", "accept", "--claim", invalid.claimId, capsys=capsys)
+    assert accept_code == 1
+    assert accepted["status"] == "error"
+
+
+def test_explicit_explain_run_id_is_preserved_when_current_run_shares_claim_pair(tmp_path: Path, capsys) -> None:
+    from dataclasses import replace
+
+    (tmp_path / "package.json").write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    _code, generated = _invoke_json(tmp_path, "generate", capsys=capsys)
+    run_a_id = generated["result"]["runId"]
+    store = LedgerStore(tmp_path, tmp_path / ".repo2skill")
+    run_a = store.read_run(run_a_id)
+    run_b_id = "run_1123456789abcdef01234567"
+    run_b = replace(run_a, runId=run_b_id)
+    with store.mutation():
+        store.write_immutable_bytes(f"runs/{run_b_id}.json", canonical_json_bytes(run_b) + b"\n")
+        state = store.read_state()
+        store.replace_state(replace(state, currentRunId=run_b_id, activeStageRevision=None))
+
+    claim_id = run_a.claims[0].claimId
+    code, explained = _invoke_json(tmp_path, "explain", claim_id, "--run", run_a_id, capsys=capsys)
+    assert code == 0
+    assert explained["result"]["runId"] == run_a_id
+
+
+def test_explain_keeps_historical_live_spans_after_active_manifest_changes(tmp_path: Path, capsys) -> None:
+    from dataclasses import replace
+    from repo2skill.models import ManifestReference, ManifestSet
+
+    (tmp_path / "package.json").write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    _code, generated = _invoke_json(tmp_path, "generate", capsys=capsys)
+    run_id = generated["result"]["runId"]
+    _invoke_json(tmp_path, "export", "--run", run_id, capsys=capsys)
+    store = LedgerStore(tmp_path, tmp_path / ".repo2skill")
+    state = store.read_state()
+    original_set_path = tmp_path / ".repo2skill" / "manifests" / state.activeExportId / f"{state.activeManifestSetId}.json"
+    original_set = store.read_manifest_set(f"manifests/{state.activeExportId}/{state.activeManifestSetId}.json")
+    original_manifests = [store.read_target_manifest(reference.path) for reference in original_set.targets.values()]
+    claim = store.read_run(run_id).claims[0]
+    claim_ref = f"{claim.claimId}@{claim.claimRevision}"
+    assert any(claim_ref in file.claimSpans for manifest in original_manifests for file in manifest.files)
+
+    export_b = canonical_record_id("export", {"later": run_id})
+    manifest_set_b_id = canonical_record_id("manifestset", {"later": export_b})
+    manifest_refs = {}
+    target_records = []
+    for original in original_manifests:
+        new_manifest_id = canonical_record_id("manifest", {"later": export_b, "target": original.targetId})
+        files = tuple(replace(item, claimSpans={}, blocks=tuple(replace(block, claimIds=()) for block in item.blocks))
+                      for item in original.files)
+        cloned = replace(original, manifestId=new_manifest_id, exportId=export_b, files=files)
+        relative = f"manifests/{export_b}/{cloned.targetId}.json"
+        target_records.append((relative, cloned))
+        manifest_refs[cloned.targetId] = ManifestReference(1, cloned.targetId, cloned.manifestId, export_b, relative)
+    manifest_set_b = ManifestSet("1.0", original_set.toolVersion, manifest_set_b_id, export_b,
+                                 manifest_refs, original_set.createdAt)
+    journal = next(item for item in store.list_export_journals() if item.exportId == state.activeExportId)
+    journal_b = replace(journal, exportId=export_b, manifestSetId=manifest_set_b_id, status="committed")
+    with store.mutation():
+        state = store.read_state()
+        for relative, manifest in target_records:
+            store.write_immutable_bytes(relative, canonical_json_bytes(manifest) + b"\n")
+        store.write_immutable_bytes(f"manifests/{export_b}/{manifest_set_b_id}.json", canonical_json_bytes(manifest_set_b) + b"\n")
+        store.write_export_journal(journal_b)
+        store.replace_state(replace(state, activeExportId=export_b, activeManifestSetId=manifest_set_b_id))
+
+    code, explained = _invoke_json(tmp_path, "explain", claim.claimId, "--run", run_id, capsys=capsys)
+    assert code == 0
+    assert explained["result"]["liveLocations"]
+
+    original_set_path.unlink()
+    corrupt_code, corrupt = _invoke_json(tmp_path, "explain", claim.claimId, "--run", run_id, capsys=capsys)
+    assert corrupt_code == 7
+    assert corrupt["findings"][0]["code"] == "ledger.corrupt"
 
 
 def test_final_activation_stale_result_maps_to_exit_four(tmp_path: Path, capsys, monkeypatch) -> None:

@@ -17,6 +17,10 @@ def test_python_manifest_lock_defaults_and_source_test_target(run_ecosystem_fixt
     target = next(item for item in batch.facts if item.value.get("category") == "single-test.v1")
     assert target.value["argv"] == ["python", "-m", "pytest", "tests/test_widget.py::test_widget_name"]
     assert target.derivation == "heuristic"
+    assert target.evidenceIds == tuple(sorted(set(target.evidenceIds)))
+    assert {item.path for item in batch.evidence if item.evidenceId in target.evidenceIds} == {
+        "pyproject.toml", "tests/test_widget.py",
+    }
     read = next(item for item in batch.reads if item.selector.value == "tests/test_widget.py")
     assert read.outcome == "present"
     assert any(item.path == read.selector.value and item.contentHash == read.contentHash for item in batch.evidence)

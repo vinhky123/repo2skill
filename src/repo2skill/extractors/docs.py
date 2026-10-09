@@ -27,6 +27,15 @@ class DocumentationExtractor:
     def extract(self, ctx: ExtractionContext, selectors: Sequence[InputSelector]) -> ExtractionBatch:
         reads = [ctx.read(item).dependency for item in selectors if item.type == "glob"]
         evidence_by_text: dict[str, list[str]] = defaultdict(list)
+        budget_coverage_selectors: set[InputSelector] = set()
+
+        def record_budget_coverage(selector: InputSelector) -> None:
+            if selector not in budget_coverage_selectors:
+                budget_coverage_selectors.add(selector)
+                self.session._coverage.append(CoverageEntry(
+                    1, selector, self.extractor_id, "capped", "documentation-text-budget", (),
+                ))
+
         for selector in selectors:
             if selector.type != "file":
                 continue
@@ -42,13 +51,13 @@ class DocumentationExtractor:
                 complete_redacted = redact_text(normalized)
                 safe = self.session._bounded_text(normalized)
                 if safe != complete_redacted:
-                    self.session._coverage.append(CoverageEntry(1, selector, self.extractor_id, "capped", "documentation-text-budget", ()))
+                    record_budget_coverage(selector)
                     continue
                 semantic_key = f"documentation:{safe}"
                 locator = EvidenceLocator("line-range", [line_number, line_number], line_number)
                 evidence_key = {"repository": self.session.repository_id, "path": selector.value, "locator": locator, "semanticKey": f"documentation-line:{safe}"}
                 if not self.session.reserve_fact_text(safe, rule_id=self.rule_id, fact_type="documentation.line", scope=".", semantic_key=semantic_key, additional_preview_bytes=len(safe.encode("utf-8")), preview_identity=evidence_key):
-                    self.session._coverage.append(CoverageEntry(1, selector, self.extractor_id, "capped", "documentation-text-budget", ()))
+                    record_budget_coverage(selector)
                     continue
                 evidence = self.session.add_evidence(extractor_id=self.extractor_id, path=selector.value,
                     content_hash=result.dependency.contentHash or "", semantic_key=f"documentation-line:{safe}",

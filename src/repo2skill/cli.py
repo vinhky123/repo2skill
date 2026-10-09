@@ -24,7 +24,7 @@ from .identity import RepositoryIdentityError
 from .ids import canonical_json_bytes, canonical_record_id, effective_policy_revision
 from .inventory import InventoryError
 from .ledger import ExportRecoveryRequired, LedgerStore, LockBusyError
-from .models import Claim, Diagnostic, Finding, ProjectDocument, ProjectState, ReviewEvent, RunLedger
+from .models import Claim, Diagnostic, Finding, ProjectDocument, ProjectState, ReviewEvent, RunLedger, TargetManifest
 from .ownership import (
     ExportFreshnessError, _active_manifests, _ownership, export_staged,
     inspect_target_ownership, resume_export,
@@ -515,11 +515,7 @@ def _command_review(args: argparse.Namespace):
         if state is None:
             raise FileNotFoundError("project state is missing")
         run = _selected_run(store, args.run, state)
-        validation = validate_claims(run.claims, run)
-        effective = apply_review_dispositions(validation.validClaims, state)
-        effective_by_ref = {(item.claimId, item.claimRevision): item for item in effective}
-        candidates = tuple(effective_by_ref.get((item.claimId, item.claimRevision), replace(item, proposalStatus="pending"))
-                           for item in run.claims)
+        candidates = _effective_run_candidates(run, state)
         if args.review_command == "list":
             selected = [item for item in candidates if args.status is None or item.proposalStatus == args.status]
             return {"runId": run.runId, "claims": selected}, (), (), []
@@ -560,6 +556,14 @@ def _command_review(args: argparse.Namespace):
             "remainingPendingCount": pending}, findings, (), []
 
 
+def _effective_run_candidates(run: RunLedger, state: ProjectState) -> tuple[Claim, ...]:
+    validation = validate_claims(run.claims, run)
+    effective = apply_review_dispositions(validation.validClaims, state)
+    effective_by_ref = {(item.claimId, item.claimRevision): item for item in effective}
+    return tuple(effective_by_ref.get((item.claimId, item.claimRevision), replace(item, proposalStatus="pending"))
+                 for item in run.claims)
+
+
 def _command_check(args: argparse.Namespace):
     project, store = _store_context(args)
     assert project and store
@@ -586,8 +590,8 @@ def _command_check(args: argparse.Namespace):
                 ))
     except (OSError, ValueError, TypeError) as error:
         raise LedgerCorruptionError("export journal history is invalid") from error
-    review = apply_review_dispositions(validate_claims(run.claims, run).validClaims, state)
-    pending_ids = tuple(item.claimId for item in review if item.proposalStatus in {"pending", "contested"})
+    candidates = _effective_run_candidates(run, state)
+    pending_ids = tuple(item.claimId for item in candidates if item.proposalStatus in {"pending", "contested"})
     if pending_ids:
         findings.append(_finding("check.review-pending", "pending", "claims await review", claims=pending_ids))
     if args.strict and result.coverageStatus == "informational-gaps":
@@ -600,10 +604,51 @@ def _command_check(args: argparse.Namespace):
                         "findings": ownership_findings}}, tuple(findings), (), []
 
 
+def _recorded_target_manifests_checked(store: LedgerStore, runs: Sequence[RunLedger]) -> tuple[TargetManifest, ...]:
+    run_ids = {item.runId for item in runs}
+    manifests: dict[tuple[str, str, str], TargetManifest] = {}
+    for journal in store.list_export_journals():
+        if journal.status != "committed":
+            continue
+        if journal.manifestSetId is None:
+            raise ValueError("committed export has no manifest set")
+        relative = f"manifests/{journal.exportId}/{journal.manifestSetId}.json"
+        manifest_set = store.read_manifest_set(relative)
+        if (manifest_set is None or manifest_set.exportId != journal.exportId
+            or manifest_set.manifestSetId != journal.manifestSetId):
+            raise ValueError("committed export manifest set is missing or mismatched")
+        for target_id, reference in manifest_set.targets.items():
+            if reference.targetId != target_id:
+                raise ValueError("target manifest reference is inconsistent")
+            expected_path = f"manifests/{reference.exportId}/{target_id}.json"
+            if reference.path != expected_path:
+                raise ValueError("target manifest reference path is inconsistent")
+            manifest = store.read_target_manifest(reference.path)
+            if (manifest is None or manifest.manifestId != reference.manifestId
+                or manifest.targetId != target_id or manifest.exportId != reference.exportId):
+                raise ValueError("recorded target manifest is missing or mismatched")
+            if manifest.runId in run_ids:
+                key = (manifest.manifestId, manifest.targetId, manifest.runId)
+                prior = manifests.get(key)
+                if prior is not None and prior != manifest:
+                    raise ValueError("duplicate target manifest record has conflicting contents")
+                manifests[key] = manifest
+    return tuple(manifests[key] for key in sorted(manifests))
+
+
 def _load_explain_artifacts(store: LedgerStore, runs: Sequence[RunLedger], state: ProjectState):
-    manifests = []
     _manifest_set, active = _active_manifests_checked(store, state)
-    manifests.extend(active.values())
+    manifest_records: dict[tuple[str, str, str], TargetManifest] = {}
+    try:
+        for manifest in (*active.values(), *_recorded_target_manifests_checked(store, runs)):
+            key = (manifest.manifestId, manifest.targetId, manifest.runId)
+            prior = manifest_records.get(key)
+            if prior is not None and prior != manifest:
+                raise ValueError("duplicate target manifest record has conflicting contents")
+            manifest_records[key] = manifest
+    except (OSError, ValueError, TypeError) as error:
+        raise LedgerCorruptionError("recorded historical manifest artifacts are unreadable or invalid") from error
+    manifests = list(manifest_records.values())
     descriptors = {}
     for run in runs:
         revisions = {1, *(item.stageRevision for item in manifests if item.runId == run.runId)}
@@ -640,7 +685,8 @@ def _command_explain(args: argparse.Namespace):
     matches = [item for item in all_runs if item.snapshot.snapshotId == explanation.snapshot.snapshotId
                and any(claim.claimId == explanation.claim.claimId and claim.claimRevision == explanation.claim.claimRevision
                        for claim in item.claims)]
-    selected_run = next((item for item in matches if item.runId == state.currentRunId), matches[-1] if matches else None)
+    preferred_run_id = args.run or state.currentRunId
+    selected_run = next((item for item in matches if item.runId == preferred_run_id), matches[-1] if matches else None)
     if selected_run is None:
         raise ValueError("explanation did not resolve to an immutable run")
     result = {"runId": selected_run.runId,
