@@ -6,8 +6,8 @@ import dataclasses
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import stat
-import tempfile
 import types
 from typing import Any, Iterator, Literal, TypeVar, Union, get_args, get_origin, get_type_hints
 
@@ -25,6 +25,7 @@ from .models import (
     validate_json_value,
 )
 from .safe_fs import open_directory
+from . import store_io
 
 
 T = TypeVar("T")
@@ -68,89 +69,23 @@ def _reject_case_collision(parent: Path, name: str) -> None:
             raise ValueError(f"case-colliding store path component: {name}")
 
 
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _validate_parent(path: Path) -> None:
-    _reject_redirected_ancestors(path.parent)
-    if not path.parent.is_dir() or _is_redirect(path.parent):
-        raise ValueError(f"document parent must be a real directory: {path.parent}")
-    if path.exists() or path.is_symlink():
-        if _is_redirect(path):
-            raise ValueError(f"document path must not be a symlink or reparse point: {path}")
-
-
 def write_immutable_document(path: Path, document: JsonValue) -> None:
     """Durably publish a JSON document without replacing an existing path."""
     validate_json_value(document)
-    _validate_parent(path)
-    if path.exists():
-        raise FileExistsError(path)
     payload = canonical_json_bytes(document) + b"\n"
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    store_io.write_immutable_path(path, payload)
 
 
 def write_immutable_bytes(path: Path, payload: bytes) -> None:
     """Durably publish exact immutable bytes without replacing an existing path."""
     if not isinstance(payload, bytes):
         raise TypeError("immutable payload must be bytes")
-    _validate_parent(path)
-    if path.exists():
-        raise FileExistsError(path)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    store_io.write_immutable_path(path, payload)
 
 
 def _replace_json(path: Path, document: JsonValue) -> None:
     validate_json_value(document)
-    _validate_parent(path)
-    payload = canonical_json_bytes(document) + b"\n"
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    store_io.replace_json_path(path, document)
 
 
 def _encode(value: object) -> JsonValue:
@@ -184,14 +119,14 @@ def replace_state(path: Path, state: ProjectState) -> None:
 @contextmanager
 def acquire_project_lock(state_dir: Path) -> Iterator[None]:
     """Acquire the persistent lock file without waiting or unlinking it."""
-    _reject_redirected_ancestors(state_dir)
-    if not state_dir.is_dir() or _is_redirect(state_dir):
-        raise ValueError("state directory must be a real directory")
-    lock_path = state_dir / ".lock"
-    if lock_path.is_symlink() or (lock_path.exists() and _is_redirect(lock_path)):
-        raise ValueError("lock file must not be a symlink or reparse point")
-    stream = lock_path.open("a+b")
-    try:
+    with _acquire_project_lock_at(state_dir, ()):
+        yield
+
+
+@contextmanager
+def _acquire_project_lock_at(root: Path, state_parts: tuple[str, ...]) -> Iterator[None]:
+    _reject_redirected_ancestors(root.joinpath(*state_parts))
+    with store_io.lock_file(root, state_parts) as stream:
         stream.seek(0, os.SEEK_END)
         if stream.tell() == 0:
             stream.write(b"\0")
@@ -217,8 +152,6 @@ def acquire_project_lock(state_dir: Path) -> Iterator[None]:
             else:
                 import fcntl
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-    finally:
-        stream.close()
 
 
 def _load_json(path: Path) -> dict[str, JsonValue]:
@@ -364,27 +297,17 @@ class LedgerStore:
 
     def _ensure_state_dir(self) -> None:
         relative = self.state_dir.relative_to(self.root)
-        current = self.root
-        for part in relative.parts:
-            _reject_case_collision(current, part)
-            current = current / part
-            if current.exists() or current.is_symlink():
-                if not current.is_dir() or _is_redirect(current):
-                    raise ValueError(f"state path is not a real directory: {current}")
-            else:
-                try:
-                    current.mkdir()
-                except FileExistsError:
-                    if not current.is_dir() or _is_redirect(current):
-                        raise ValueError(f"state path is not a real directory: {current}")
-        _fsync_directory(self.state_dir.parent)
+        _reject_redirected_ancestors(self.root)
+        store_io.ensure_directories(self.root, relative.parts)
 
     @contextmanager
     def mutation(self) -> Iterator[None]:
         if self._mutation_active:
             raise RuntimeError("nested mutation scopes are not allowed")
         self._ensure_state_dir()
-        with acquire_project_lock(self.state_dir):
+        with _acquire_project_lock_at(
+            self.root, self.state_dir.relative_to(self.root).parts
+        ):
             self._mutation_active = True
             self._state_loaded = False
             self._raw_state = None
@@ -424,6 +347,29 @@ class LedgerStore:
             raise ValueError("run document ID does not match its path")
         return run
 
+    def list_run_ids(self) -> tuple[str, ...]:
+        """Enumerate immutable runs without creating state or acquiring a lock."""
+        state_parts = self.state_dir.relative_to(self.root).parts
+        try:
+            with store_io.guarded_directory(self.root, state_parts) as state_guard:
+                runs_guard = state_guard.open_directory("runs")
+                with runs_guard:
+                    names = runs_guard.names()
+        except FileNotFoundError:
+            return ()
+        run_ids: list[str] = []
+        for name in sorted(names):
+            if not name.endswith(".json"):
+                raise ValueError("unexpected file in run ledger directory")
+            run_id = name[:-5]
+            if not re.fullmatch(r"[a-z][a-z0-9-]*_[0-9a-f]{24}", run_id):
+                raise ValueError("run ledger path contains an invalid run ID")
+            run = self.read_run(run_id)
+            if run is None:
+                raise ValueError(f"run ledger disappeared while enumerating: {name}")
+            run_ids.append(run_id)
+        return tuple(run_ids)
+
     def read_manifest_set(self, relative_path: str) -> ManifestSet | None:
         path = self._store_path(relative_path, create_parents=False)
         if not path.exists():
@@ -444,15 +390,14 @@ class LedgerStore:
 
     def list_export_journals(self) -> tuple[ExportJournal, ...]:
         """Enumerate journals without creating the state directory or lock."""
-        if not self.state_dir.exists():
-            return ()
-        with open_directory(self.state_dir) as state_guard:
-            try:
+        state_parts = self.state_dir.relative_to(self.root).parts
+        try:
+            with store_io.guarded_directory(self.root, state_parts) as state_guard:
                 exports_guard = state_guard.open_directory("exports")
-            except FileNotFoundError:
-                return ()
-            with exports_guard:
-                names = exports_guard.names()
+                with exports_guard:
+                    names = exports_guard.names()
+        except FileNotFoundError:
+            return ()
         journals: list[ExportJournal] = []
         for name in sorted(names):
             if not name.endswith(".json"):
@@ -469,8 +414,15 @@ class LedgerStore:
     def write_export_journal(self, journal: ExportJournal) -> None:
         """Atomically create or update a journal under the active mutation lock."""
         self._require_mutation()
-        path = self._store_path(f"exports/{journal.exportId}.json", create_parents=True)
-        _replace_json(path, encode_record(journal))
+        self._store_path(f"exports/{journal.exportId}.json", create_parents=False)
+        state_parts = self.state_dir.relative_to(self.root).parts
+        store_io.replace_json(
+            self.root,
+            state_parts + ("exports",),
+            f"{journal.exportId}.json",
+            encode_record(journal),
+            create=True,
+        )
 
     def require_no_unresolved_export(self, *, resume_export_id: str | None = None) -> None:
         """Require all prior exports committed, allowing one explicit recovery."""
@@ -527,19 +479,33 @@ class LedgerStore:
         encoded = _encode(state)
         if self._raw_state is not None:
             encoded = _merge_additive(self._raw_state, encoded)
-        _replace_json(self.state_dir / "state.json", encoded)
+        store_io.replace_json(
+            self.root,
+            self.state_dir.relative_to(self.root).parts,
+            "state.json",
+            encoded,
+        )
         self._raw_state = encoded if isinstance(encoded, dict) else None
 
     def write_immutable(self, relative_path: str, document: JsonValue) -> None:
         self._require_mutation()
-        path = self._store_path(relative_path, create_parents=True)
-        write_immutable_document(path, document)
+        validate_json_value(document)
+        path = self._store_path(relative_path, create_parents=False)
+        parts = path.relative_to(self.root).parts
+        store_io.write_immutable(
+            self.root,
+            parts[:-1],
+            parts[-1],
+            canonical_json_bytes(document) + b"\n",
+            create=True,
+        )
 
     def write_immutable_bytes(self, relative_path: str, payload: bytes) -> None:
         """Publish exact bytes below state_dir using an immutable temp-and-link write."""
         self._require_mutation()
-        path = self._store_path(relative_path, create_parents=True)
-        write_immutable_bytes(path, payload)
+        path = self._store_path(relative_path, create_parents=False)
+        parts = path.relative_to(self.root).parts
+        store_io.write_immutable(self.root, parts[:-1], parts[-1], payload, create=True)
 
     def read_immutable_bytes(self, relative_path: str) -> bytes | None:
         """Read an immutable byte artifact through guarded directory handles."""
@@ -593,8 +559,6 @@ class LedgerStore:
                 if current.exists() or current.is_symlink():
                     if not current.is_dir() or _is_redirect(current):
                         raise ValueError(f"store path is redirected: {current}")
-                elif create_parents:
-                    current.mkdir()
         return destination
 
     def _require_mutation(self) -> None:
