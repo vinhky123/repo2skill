@@ -187,10 +187,18 @@ The persisted journal is `<store.state_dir>/exports/<exportId>.json` (its logica
 ```python
 def LedgerStore.list_export_journals(self) -> tuple[ExportJournal, ...]: ...
 def LedgerStore.write_export_journal(self, journal: ExportJournal) -> None: ...
+class RecoveryRequiredError(RuntimeError): ...
+def LedgerStore.require_no_unresolved_exports(
+    self, *, resume_export_id: ExportId | None = None,
+) -> None: ...
 def encode_record(record: object) -> JsonValue: ...
 ```
 
 `list_export_journals` is read-only: it creates neither a lock nor state files, matching the existing `read_*` methods so doctor/check/report can inspect unresolved journals without mutation. A mutating caller must already hold `store.mutation()` when relying on the enumeration as authoritative; consistent snapshot/retry handling for concurrent read-only inspection belongs to that caller. `write_export_journal` requires the active mutation and atomically creates or replaces the journal at its ID-derived path. `encode_record` is pure and supplies typed immutable manifests/sets to the existing `write_immutable(relative_path, JsonValue)`. Do not add a general storage framework. Target manifests use the already-frozen `manifests/<exportId>/<targetId>.json`; the manifest set uses `manifests/<exportId>/<manifestSetId>.json`. A subset export copies each unselected `ManifestReference` unchanged into the new complete set.
+
+`LedgerStore.require_no_unresolved_exports` requires the caller-held mutation lock and uses the journal enumeration as authoritative. With no resume ID, any non-committed journal raises `RecoveryRequiredError`; with a resume ID, only that exact journal may remain non-committed. A missing or committed selected journal is handled by the resume operation's normal lookup/validation. High-level mutating entry points call this guard before their first write; do not put it in `mutation()` or low-level write helpers, because resume must update its journal and an already-prepared export must finish its operations.
+
+`stage_run`, `review_claims`, `export_staged`, and `resume_export` call the shared guard under the caller-held mutation before their first write. Resume passes its selected export ID. They must not change the `mutation()` signature or guard lower-level writes used after a prepared export has been authorized.
 
 After successful preflight, derive deterministic operation IDs and persist final intended bytes at `<store.state_dir>/staging/exports/<exportId>/new/<operationId>` and exact old bytes for replace/delete backups under `.../backup/<operationId>` with `backupPath` storing its normalized repository-relative path; `stagedNewHash`/`backupHash` must verify those immutable payloads before live writes. Persist actual proposed diffs under `.../patch/<operationId>.diff` and store their root-relative paths in `proposedPatchPath`. New-payload paths are derived from journal IDs, so no journal field is added and resume never recomputes a merge from changed outside bytes.
 
@@ -220,3 +228,34 @@ def explain_claim(
 The resolver uses `RunLedger` claims, facts, evidence, and dedup decisions for recorded provenance. A candidate has at most one matching dedup decision per run; multiple matches are corrupt provenance and fail closed rather than changing `Explanation.dedupDecision`. Resolve stage locations and claim spans only from validated descriptors for relevant existing revisions (initial r1, current active revision, or revisions referenced by manifests); a path by itself is not proof that stage bytes are valid. Resolve live locations from supplied target-manifest claim spans and blocks; these are recorded historical locations, not proof that current live bytes still match ownership. The separate check path reports current ownership.
 
 For `--run`, resolve only the exact named run; an omitted revision selects that claim's highest revision in the run. Without `--run`, prefer the current run when it contains the exact requested `(claimId, revision)` pair. Otherwise, if revision is omitted, choose the highest claim revision across matching valid history; break remaining ties by most recent `SourceSnapshot.createdAt`, then `runId`. With an explicit revision, use the matching pair and the same tie-break. A missing pair is not found; corrupt references, duplicate canonical records, or broken lineage fail closed as state corruption. `explain_claim` resolves recorded provenance only: no raw-source reads, network, renderer, mutation, or R5 recheck merely to enrich its answer. The CLI may run `check_freshness` separately and include the resulting stale finding for the requested claim.
+
+## Task 11 — CLI orchestration and state transitions
+
+Keep argparse grammar, JSON formatting, and command-to-exit mapping in `cli.py`; use one focused `pipeline.py` for shared scan/generate orchestration and construction of immutable run records. No provider, AI, or arbitrary repository-command execution is introduced by this task. The existing R7 JSON envelope and exit priority remain unchanged; map Task 11 outcomes to the established statuses/codes.
+
+Every mutating controller acquires the existing `store.mutation()` lock, then calls `store.require_no_unresolved_exports()` before its first write. This includes init, scan activation, generation/staging, review, and export. `export --resume ID` calls the same guard with `resume_export_id=ID`, allowing only that journal to remain unresolved. Map `RecoveryRequiredError` to exit 7. Do not change `LedgerStore.mutation()` or guard low-level operations inside an already-authorized prepared export; those operations must update/finish the selected journal.
+
+A successful, usable `scan` creates and persists an immutable completed `RunLedger` with no claims or staged targets, performs the shared R5 recheck, then activates it with one `ProjectState` pointer replacement: set `currentRunId` to the new run and `activeStageRevision` to null. Preserve review history, accepted-revision history, and active export/manifest pointers. Scan does not derive claims, render, or create a stage. A failed or unusable scan never advances the pointer; a required-input/global-cap failure leaves prior state untouched. `--strict` makes any coverage gap an exit-2/no-activation condition, but is an invocation criterion, not a new effective-policy input or hashed option. An inactive immutable run may remain for reporting/history after a late R5 failure; stale/unknown R5 maps to exit 4.
+
+`generate --from-run ID` accepts only a compatible completed scan with empty `claims` and `stagedTargets`. It reuses that run's frozen snapshot, reads, evidence, and facts, but derives and stages under a fresh new `runId` and absent immutable run path; never pass the source run ID to `stage_run`. Check compatibility and run the shared R5 recheck before deriving any claim, then perform the activation-time R5 recheck through `stage_run`. For a fresh scan, collect inputs and build the run before deriving and staging. The effective policy revision always uses every configured target; CLI-selected render targets do not change it.
+
+For each scan/generation, reconstruct high-water Evidence, Fact, and Claim history from all valid immutable runs for the same repository, including inactive orphans. Enumerate run IDs under the existing mutation lock using Task 10's read-only `LedgerStore.list_run_ids()`; validate each ID/path and fail closed on any enumerated unreadable/invalid record. Pass prior Evidence/Fact records to `ExtractionSession` and prior Claims to `derive_claims`, using `store.id_context`; add no builder parameters, persisted high-water index, or domain fields.
+
+The pure review overlay seam is:
+
+```python
+def apply_review_dispositions(
+    claims: Sequence[Claim], state: ProjectState,
+) -> tuple[Claim, ...]: ...
+```
+
+The caller passes policy-validated claims only. Apply `ProjectState.acceptedClaimRevisions` and review events by exact `(claimId, claimRevision)` and return transient claims with effective `proposalStatus`; preserve `kind` and `origin`. Reuse this helper from the later-review path in `claims.py`. Initial generation overlays the valid candidates, merges those effective statuses back into the complete candidate set for the new immutable run, and leaves invalid candidates pending. Deduplicate/render only the effective valid claims. Thus accepted-but-dedup-suppressed candidates retain accepted status in `RunLedger.claims`, while invalid candidates cannot be accepted; no event or claim creator or unrestricted bulk-accept behavior is added.
+
+Activation freshness errors are distinct from argument/record validation errors:
+
+```python
+class ActivationFreshnessError(ValueError):
+    def __init__(self, result: DependencyRecheckResult) -> None: ...
+```
+
+`stage_run` and `review_claims` raise this error with the exact R5 result for stale or unknown final checks, rather than generic `ValueError`. CLI catches it before generic `ValueError`, maps it to exit 4, and includes the carried findings. There remains one R5 implementation and no duplicate preflight recheck at the CLI boundary. `ExportFreshnessError` remains Task 9's separate public runtime error with the same exit 4 mapping.

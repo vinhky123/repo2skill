@@ -303,8 +303,8 @@ def review_claims(
     excluded_paths: Sequence[RepositoryPath],
 ) -> tuple[ProjectState, StagedRun]: ...
 
-# Exact Task 9 export_staged/resume_export and inspect_target_ownership signatures,
-# freshness handling, journal paths and commit/recovery sequence are in output-contract §Task 9.
+# Exact Task 9 export_staged/resume_export, inspect_target_ownership and unresolved-journal
+# guard signatures, freshness handling, paths, and recovery sequence are in output-contract §Task 9.
 ```
 
 Each operation obtains both absolute paths only from `store.root` and `store.state_dir`. Supplied existing `state`, `run`, stage, ownership, and journal records are compared for canonical equality with authoritative records read inside the active lock; matching IDs do not excuse stale content. Initial `stage_run` instead requires the new run ID/path to be absent, publishes immutable artifacts, performs the R5 recheck, then commits one state pointer. `review_claims` compares the supplied run/state with authoritative records, validates the whole batch, rerenders and publishes a new immutable stage revision without changing the run, validates it, then commits returned state once. Export journals before the first live mutation and commits manifests before the state pointer. Any mismatch or exception before the defined commit point fails closed and leaves the prior pointer unchanged. See `output-contract.md` for the stage descriptor and per-revision rules.
@@ -462,7 +462,7 @@ def check_freshness(
 ) -> CheckResult: ...
 ```
 
-`check_freshness` delegates source comparison to `recheck_dependencies`, passing the explicit root label; the CLI separately requests ownership findings through Task 9 `inspect_target_ownership`. Task 10's exact `explain_claim` runtime artifact inputs and read-only history-resolution rules are defined in `output-contract.md` Task 10; `LedgerStore.snapshot()` remains active-only, and no `Explanation` or `LedgerStoreSnapshot` persisted/runtime fields are added.
+`check_freshness` delegates source comparison to `recheck_dependencies`, passing the explicit root label; the CLI separately requests ownership findings through Task 9 `inspect_target_ownership`. Task 10's exact `explain_claim` runtime artifact inputs and read-only history-resolution rules are defined in `output-contract.md` Task 10; `LedgerStore.snapshot()` remains active-only, and no `Explanation` or `LedgerStoreSnapshot` fields are added.
 
 ## R6 — path representation
 
@@ -540,3 +540,5 @@ Explicit record field lists govern which records carry `recordRevision`. General
 ## Cross-reference maintenance
 
 The MVP design and task briefs defer to this contract and `docs/engineering/output-contract.md` for corrected records, signatures, lifecycle, and paths. `docs/engineering/input-contract.md` governs extraction and recheck inputs.
+
+Task 11 keeps CLI grammar and JSON dispatch in `cli.py`, with shared scan/generate construction in `pipeline.py`. Its scan-only pointer transition, `--from-run` compatibility/freshness, history high-water feed, review-overlay helper, recovery guard use, and typed activation freshness error are specified in `docs/engineering/output-contract.md` Task 11. These are runtime orchestration rules and add no persisted fields or alternate freshness algorithm.
