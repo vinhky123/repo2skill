@@ -4,9 +4,23 @@ repo2skill is an unpublished local alpha that turns repository files into review
 
 The current alpha supports shallow JavaScript/TypeScript, Python, Go, and Rust extraction, plus generic configuration and CI coverage. Unsupported or incomplete inputs remain visible as coverage information. Hashes and locators document the bytes observed; they do not prove a claim is complete or semantically correct. Review generated claims before export.
 
-## Local quickstart
+## Install for use
 
-Python 3.11 or newer is required. From a checkout, install the package and development tools, then inspect the available commands:
+Python 3.11 or newer is required. For a command-line install from this source checkout, install pipx and use it to install the project:
+
+```powershell
+python -m pip install --user pipx
+python -m pipx install .
+python -m pipx ensurepath
+```
+
+Close and reopen the terminal so the updated PATH takes effect. Then run `repo2skill --help`, or use `repo2skill init` and `repo2skill generate --no-ai` from the repository you want to process. This alpha is not published to PyPI, so `pip install repo2skill` is not available. You can also install a locally built wheel with `python -m pipx install "path/to/repo2skill-0.1.0-py3-none-any.whl"`.
+
+Package setup may contact the configured package index to install dependencies. This is separate from repository operations: generation and freshness checks do not use AI or request the network.
+
+## Maintainer quickstart
+
+From a checkout, install the package and development tools in an editable virtual environment, then inspect the available commands:
 
 ```powershell
 python -m venv .venv
