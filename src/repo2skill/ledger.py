@@ -352,23 +352,41 @@ class LedgerStore:
         state_parts = self.state_dir.relative_to(self.root).parts
         try:
             with store_io.guarded_directory(self.root, state_parts) as state_guard:
-                runs_guard = state_guard.open_directory("runs")
-                with runs_guard:
+                with state_guard.open_directory("runs") as runs_guard:
                     names = runs_guard.names()
+                    run_ids: list[str] = []
+                    for name in sorted(names):
+                        if not name.endswith(".json"):
+                            raise ValueError("unexpected file in run ledger directory")
+                        run_id = name[:-5]
+                        if not re.fullmatch(r"[a-z][a-z0-9-]*_[0-9a-f]{24}", run_id):
+                            raise ValueError("run ledger path contains an invalid run ID")
+                        try:
+                            with runs_guard.open_file(name) as opened:
+                                size = opened.stat_before.st_size
+                                payload = opened.read_bounded(size)
+                                if len(payload) != size or not opened.stable_after_read():
+                                    raise ValueError(
+                                        f"run ledger changed while being read: {name}"
+                                    )
+                            raw = json.loads(
+                                payload.decode("utf-8"),
+                                parse_constant=lambda value: (_ for _ in ()).throw(
+                                    ValueError(f"non-finite JSON number: {value}")
+                                ),
+                            )
+                        except FileNotFoundError as error:
+                            raise ValueError(
+                                f"run ledger disappeared while enumerating: {name}"
+                            ) from error
+                        validate_json_value(raw)
+                        run = decode_root_document(raw, RunLedger)
+                        if run.runId != run_id:
+                            raise ValueError("run document ID does not match its path")
+                        run_ids.append(run_id)
+                    return tuple(run_ids)
         except FileNotFoundError:
             return ()
-        run_ids: list[str] = []
-        for name in sorted(names):
-            if not name.endswith(".json"):
-                raise ValueError("unexpected file in run ledger directory")
-            run_id = name[:-5]
-            if not re.fullmatch(r"[a-z][a-z0-9-]*_[0-9a-f]{24}", run_id):
-                raise ValueError("run ledger path contains an invalid run ID")
-            run = self.read_run(run_id)
-            if run is None:
-                raise ValueError(f"run ledger disappeared while enumerating: {name}")
-            run_ids.append(run_id)
-        return tuple(run_ids)
 
     def read_manifest_set(self, relative_path: str) -> ManifestSet | None:
         path = self._store_path(relative_path, create_parents=False)

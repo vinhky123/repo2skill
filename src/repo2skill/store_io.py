@@ -59,12 +59,23 @@ class _Parents:
                 if info is None:
                     if not create:
                         raise FileNotFoundError(part)
+                    try:
+                        if parent._descriptor is not None:
+                            os.mkdir(part, dir_fd=parent._descriptor)
+                        else:
+                            os.mkdir(parent.path / part)
+                    except FileExistsError:
+                        # Revalidate a concurrent creator through the held parent.
+                        info = _child(
+                            parent, part, check_case=index >= len(root_parts)
+                        )
+                        if info is None:
+                            raise
                     if parent._descriptor is not None:
-                        os.mkdir(part, dir_fd=parent._descriptor)
                         os.fsync(parent._descriptor)
-                    else:
-                        os.mkdir(parent.path / part)
-                    info = _child(parent, part)
+                    info = _child(
+                        parent, part, check_case=index >= len(root_parts)
+                    )
                     if info is None:
                         raise UnsafePathError("created store directory disappeared")
                 if _redirect_or_wrong_directory(info):

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 import subprocess
 
 import pytest
 
+from repo2skill import ledger
 from repo2skill import store_io
-from repo2skill.ledger import LedgerStore
+from repo2skill.config import default_claim_policy, default_scan_policy
+from repo2skill.dependencies import build_snapshot
+from repo2skill.ids import canonical_json_bytes, effective_policy_revision
+from repo2skill.identity import capture_repository
+from repo2skill.inventory import collect_inventory
+from repo2skill.ledger import LedgerStore, encode_record
 from repo2skill.models import ExportJournal, ProjectState
+from repo2skill.models import RunLedger
 
 
 def _make_directory_link(link: Path, target: Path) -> bool:
@@ -123,3 +131,94 @@ def test_list_run_ids_rejects_dangling_state_redirect(tmp_path: Path) -> None:
 
     with pytest.raises(OSError):
         store.list_run_ids()
+
+
+def test_mutation_revalidates_state_directory_created_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    store = LedgerStore(root, root / ".repo2skill")
+    original_mkdir = store_io.os.mkdir
+    raced = False
+
+    def mkdir_after_competing_creator(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal raced
+        if not raced and Path(path).name == ".repo2skill":
+            raced = True
+            original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+            raise FileExistsError(path)
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_io.os, "mkdir", mkdir_after_competing_creator)
+    with store.mutation():
+        assert store.state_dir.is_dir()
+
+    assert raced
+    assert (store.state_dir / ".lock").is_file()
+
+
+def _valid_run(root: Path) -> RunLedger:
+    scan_policy = default_scan_policy()
+    claim_policy = default_claim_policy()
+    inventory = collect_inventory(root, scan_policy)
+    identity = capture_repository(
+        root,
+        inventory,
+        "no-git",
+        project_id="project_0123456789abcdef01234567",
+        policy=scan_policy,
+    )
+    policy_revision = effective_policy_revision(
+        scan_policy, claim_policy, (), generation_options={}
+    )
+    snapshot = build_snapshot(
+        "snapshot_0123456789abcdef01234567",
+        identity,
+        inventory,
+        {},
+        (),
+        policy_revision=policy_revision,
+        root_label="repo",
+    )
+    return RunLedger(
+        "1.0", "0.1.0", "run_0123456789abcdef01234567", snapshot,
+        scan_policy, claim_policy, (), (), (), (), (), (), (), (), {}, True,
+    )
+
+
+def test_list_run_ids_reads_each_run_under_its_guarded_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    state_dir = root / ".repo2skill"
+    runs = state_dir / "runs"
+    runs.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_id = "run_0123456789abcdef01234567"
+    run = _valid_run(root)
+    (runs / f"{run_id}.json").write_bytes(canonical_json_bytes(encode_record(run)))
+    outside_run = dataclasses.replace(
+        run, runId="run_1123456789abcdef01234567"
+    )
+    (outside / f"{run_id}.json").write_bytes(
+        canonical_json_bytes(encode_record(outside_run))
+    )
+    store = LedgerStore(root, state_dir)
+    original_reject = ledger._reject_redirected_ancestors
+    swapped = False
+
+    def validate_then_swap(path: Path) -> None:
+        nonlocal swapped
+        original_reject(path)
+        if Path(path) == runs / f"{run_id}.json" and not swapped:
+            runs.rename(state_dir / "runs-parked")
+            if not _make_directory_link(runs, outside):
+                pytest.skip("directory symlink or junction unavailable")
+            swapped = True
+
+    monkeypatch.setattr(ledger, "_reject_redirected_ancestors", validate_then_swap)
+    assert store.list_run_ids() == (run_id,)
+    assert not swapped
