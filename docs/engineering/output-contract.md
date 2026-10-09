@@ -165,9 +165,16 @@ def resume_export(
     current_extractor_versions: Mapping[str, str],
     excluded_paths: Sequence[RepositoryPath],
 ) -> ExportResult: ...
+
+
+def inspect_target_ownership(
+    specs: Sequence[TargetSpec], *, store: LedgerStore,
+) -> tuple[Finding, ...]: ...
 ```
 
 The caller holds `store.mutation()` from authoritative reads through the commit or journal update. `store.root` supplies R5's `root`; all other freshness values are explicit. Resolve the current `ProjectState.currentRunId` and `activeStageRevision`, require the requested run to be current, then load that immutable run and exact `stage.json` descriptor. Check descriptor identity, full selected `TargetSpec` equality against current configuration, repository-relative paths, accepted-mode hashes, spans, and current acceptance via `ProjectState.acceptedClaimRevisions`. Preview files are never export input. `RunLedger.stagedTargets` is only the initial revision-1 projection; later review exports use the active descriptor. Reconstruct supplied `OwnershipState` from active manifest references and target manifests and require canonical equality. A selected target without prior history may be absent from the mapping; reject duplicate/unknown target IDs. Ownership and target validation are distinct from source freshness.
+
+`inspect_target_ownership` is the separate read-only ownership seam for Task 10 `check` and `explain`. It creates neither the state directory nor a lock, accepts only selected specs equal to configured project targets, resolves the coherent active manifest references and target manifests, and applies the same managed-block versus whole-file ownership comparison as export. It returns ownership `Finding`s; a configured target with no prior ownership is clean and unowned. It does not recheck source dependencies, render, stage, or mutate records. The CLI composes its results with the shared R5 freshness result. Export retains its caller-locked preflight and race checks.
 
 Immediately before the first live operation, call the one R5 `recheck_dependencies` with the run, `store.root`, current identity/root label/policy/extractor versions, and exclusions. If its status is `stale` or `unknown`, raise `ExportFreshnessError(result)` before writing a journal or touching live paths; CLI maps either to exit 4, never to ownership-conflict exit 5. Resume repeats this recheck before any further live operation. If the active manifest pointer already names this journal's exact completed manifest set, validate it and finalize the journal without replaying writes or requiring fresh source inputs.
 
@@ -192,3 +199,24 @@ After R5 returns fresh, write the complete `prepared` journal before any live mk
 For file replacement/deletion, use a small guarded publication seam in `safe_fs` or a focused `output_fs` helper: root-relative component traversal with retained non-redirected ancestor guards, safe mkdir, same-directory temp+fsync+atomic replace, and owned-file deletion, each checking expected old state. The current `safe_fs` public surface only guards reads; do not use unchecked `Path.write_bytes` or `os.replace` for live targets. The operation log remains sorted by `(targetId, path, action)`; parent mkdir operations precede descendant paths by canonical path ordering.
 
 Write immutable selected `TargetManifest`s and the complete `ManifestSet` only after every operation reaches its intended hash. Copy references for unselected targets unchanged. Replace `ProjectState.activeExportId` and `activeManifestSetId` once; this is the commit point. Then atomically mark the journal `committed`. If the process stops after pointer commit but before that status update, resume verifies the exact active manifest set and marks committed without replaying operations or checking source freshness. If interrupted earlier, resume accepts only each operation's recorded old or intended new state; a third hash remains untouched and conflicted.
+
+## Task 10 — read-only check and explanation inputs
+
+Task 10 reuses R5 `recheck_dependencies` through `check_freshness` and Task 9 `inspect_target_ownership`; it does not implement a second freshness or ownership algorithm. `check` combines dependency, review, coverage, selected-target ownership, and unresolved export-journal findings. Unresolved noncommitted journals are visible as incomplete/conflict state without creating a lock or state files; `report` may include the same read-only journal status. The CLI applies the existing exit priority to all findings.
+
+Task 10 may add `LedgerStore.list_run_ids() -> tuple[RunId, ...]` as a guarded, read-only enumeration that creates no lock/state files. Validate each path against its decoded run ID and fail closed if enumerated history cannot be read or validated; do not silently omit a corrupt run. Reuse the history enumerator already owned by Task 11 if available. Generation/history mutations call it under the existing mutation lock; read-only commands do not acquire or create a lock.
+
+Keep `LedgerStore.snapshot()` active-only and keep `LedgerStoreSnapshot` and `Explanation` domain fields unchanged. The existing snapshot contains the active run, active manifest set, and active stage location only; it does not load historical runs, stage descriptors, or target manifests. The CLI builds a selected snapshot's existing `runs` mapping from the requested/history run records, and supplies only validated stage descriptors and target manifests to the pure resolver:
+
+```python
+def explain_claim(
+    claim_id: ClaimId, store: LedgerStoreSnapshot,
+    revision: int | None = None, run_id: RunId | None = None, *,
+    staged_descriptors: Mapping[tuple[RunId, int], Mapping[str, object]],
+    target_manifests: Sequence[TargetManifest],
+) -> Explanation: ...
+```
+
+The resolver uses `RunLedger` claims, facts, evidence, and dedup decisions for recorded provenance. A candidate has at most one matching dedup decision per run; multiple matches are corrupt provenance and fail closed rather than changing `Explanation.dedupDecision`. Resolve stage locations and claim spans only from validated descriptors for relevant existing revisions (initial r1, current active revision, or revisions referenced by manifests); a path by itself is not proof that stage bytes are valid. Resolve live locations from supplied target-manifest claim spans and blocks; these are recorded historical locations, not proof that current live bytes still match ownership. The separate check path reports current ownership.
+
+For `--run`, resolve only the exact named run; an omitted revision selects that claim's highest revision in the run. Without `--run`, prefer the current run when it contains the exact requested `(claimId, revision)` pair. Otherwise, if revision is omitted, choose the highest claim revision across matching valid history; break remaining ties by most recent `SourceSnapshot.createdAt`, then `runId`. With an explicit revision, use the matching pair and the same tie-break. A missing pair is not found; corrupt references, duplicate canonical records, or broken lineage fail closed as state corruption. `explain_claim` resolves recorded provenance only: no raw-source reads, network, renderer, mutation, or R5 recheck merely to enrich its answer. The CLI may run `check_freshness` separately and include the resulting stale finding for the requested claim.

@@ -303,8 +303,8 @@ def review_claims(
     excluded_paths: Sequence[RepositoryPath],
 ) -> tuple[ProjectState, StagedRun]: ...
 
-# Exact Task 9 export_staged/resume_export signatures, freshness handling,
-# journal paths and commit/recovery sequence are defined in output-contract §Task 9.
+# Exact Task 9 export_staged/resume_export and inspect_target_ownership signatures,
+# freshness handling, journal paths and commit/recovery sequence are in output-contract §Task 9.
 ```
 
 Each operation obtains both absolute paths only from `store.root` and `store.state_dir`. Supplied existing `state`, `run`, stage, ownership, and journal records are compared for canonical equality with authoritative records read inside the active lock; matching IDs do not excuse stale content. Initial `stage_run` instead requires the new run ID/path to be absent, publishes immutable artifacts, performs the R5 recheck, then commits one state pointer. `review_claims` compares the supplied run/state with authoritative records, validates the whole batch, rerenders and publishes a new immutable stage revision without changing the run, validates it, then commits returned state once. Export journals before the first live mutation and commits manifests before the state pointer. Any mismatch or exception before the defined commit point fails closed and leaves the prior pointer unchanged. See `output-contract.md` for the stage descriptor and per-revision rules.
@@ -449,7 +449,7 @@ def recheck_dependencies(
 
 It re-evaluates only the recorded file, glob, and negative selectors through the extraction read seam under `run.effectiveScanPolicy`. `excluded_paths` is the caller-provided union of the configured state directory, `run.configuredTargets` live paths, and current configured live paths; it remains intrinsically excluded during selector matching. Recheck never falls back to a default policy or reads an arbitrary ignored/live path. It compares existence/raw-byte hashes, canonical match sets, negative predicates, repository identity, `current_root_label` against `run.snapshot.rootLabel`, `current_policy_revision` against `run.snapshot.policyRevision`, and extractor versions, and maps changed reads through facts to all affected claims. A root-label mismatch is `stale` and affects all claims, just like repository identity or policy mismatch. The root label is explicit operation context; recheck does not read `project.json` or consult hidden project state. A definite mismatch is `stale`; an unreadable/capped/I/O outcome is `unknown` with the applicable required or informational coverage finding and is never fresh. `stale` wins over `unknown` when both occur, while all findings remain present.
 
-P0-09 calls this function immediately before the first export replacement. Generation orchestration calls it immediately before activation. P0-10 calls it for `check`; it does not implement a second comparison. Ownership inspection remains a separate P0-09 operation over selected live targets and active manifests. The CLI aggregates the source result, ownership findings, review state, and coverage using the published exit priority. Source status never absorbs an ownership conflict.
+P0-09 calls this function immediately before the first export replacement. Generation orchestration calls it immediately before activation. P0-10 calls it for `check`; it does not implement a second comparison. Ownership inspection remains a separate read-only P0-09 operation over selected live targets and active manifests, exposed as `inspect_target_ownership(specs, *, store)` in `output-contract.md` Task 9. The CLI aggregates the source result, ownership findings, review state, and coverage using the published exit priority. Source status never absorbs an ownership conflict.
 
 The corrected P0-10 source signature removes the misleading general inventory argument:
 
@@ -462,7 +462,7 @@ def check_freshness(
 ) -> CheckResult: ...
 ```
 
-`check_freshness` delegates source comparison to `recheck_dependencies`, passing the explicit root label; the CLI separately requests ownership findings.
+`check_freshness` delegates source comparison to `recheck_dependencies`, passing the explicit root label; the CLI separately requests ownership findings through Task 9 `inspect_target_ownership`. Task 10's exact `explain_claim` runtime artifact inputs and read-only history-resolution rules are defined in `output-contract.md` Task 10; `LedgerStore.snapshot()` remains active-only, and no `Explanation` or `LedgerStoreSnapshot` persisted/runtime fields are added.
 
 ## R6 — path representation
 
