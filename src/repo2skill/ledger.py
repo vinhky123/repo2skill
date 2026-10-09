@@ -24,6 +24,7 @@ from .models import (
     TargetManifest,
     validate_json_value,
 )
+from .safe_fs import open_directory
 
 
 T = TypeVar("T")
@@ -85,6 +86,29 @@ def write_immutable_document(path: Path, document: JsonValue) -> None:
     if path.exists():
         raise FileExistsError(path)
     payload = canonical_json_bytes(document) + b"\n"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_immutable_bytes(path: Path, payload: bytes) -> None:
+    """Durably publish exact immutable bytes without replacing an existing path."""
+    if not isinstance(payload, bytes):
+        raise TypeError("immutable payload must be bytes")
+    _validate_parent(path)
+    if path.exists():
+        raise FileExistsError(path)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -453,6 +477,35 @@ class LedgerStore:
         self._require_mutation()
         path = self._store_path(relative_path, create_parents=True)
         write_immutable_document(path, document)
+
+    def write_immutable_bytes(self, relative_path: str, payload: bytes) -> None:
+        """Publish exact bytes below state_dir using an immutable temp-and-link write."""
+        self._require_mutation()
+        path = self._store_path(relative_path, create_parents=True)
+        write_immutable_bytes(path, payload)
+
+    def read_immutable_bytes(self, relative_path: str) -> bytes | None:
+        """Read an immutable byte artifact through guarded directory handles."""
+        path = self._store_path(relative_path, create_parents=False)
+        if not path.exists():
+            if path.is_symlink():
+                raise ValueError(f"immutable artifact must not be redirected: {path}")
+            return None
+        relative = path.relative_to(self.state_dir)
+        with open_directory(self.state_dir) as guard:
+            for component in relative.parts[:-1]:
+                guard_next = guard.open_directory(component)
+                guard.close()
+                guard = guard_next
+            with guard.open_file(relative.parts[-1]) as opened:
+                payload = opened.read_bounded(opened.stat_before.st_size)
+                if len(payload) != opened.stat_before.st_size or not opened.stable_after_read():
+                    raise ValueError(f"immutable artifact changed while reading: {relative_path}")
+                return payload
+
+    def immutable_path_exists(self, relative_path: str) -> bool:
+        """Check whether an immutable artifact path already exists below state_dir."""
+        return self._store_path(relative_path, create_parents=False).exists()
 
     def _store_path(self, relative_path: str, *, create_parents: bool) -> Path:
         if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:

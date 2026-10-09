@@ -40,6 +40,9 @@ repo2skill = "repo2skill.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+repo2skill = ["templates/*.tmpl"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
