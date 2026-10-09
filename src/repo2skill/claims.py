@@ -193,6 +193,7 @@ def review_claims(
 ) -> tuple[ProjectState, StagedRun]:
     """Review a persisted run and activate one new immutable rendered revision."""
     store._require_mutation()
+    store.require_no_unresolved_export()
     authoritative_state = store.read_state()
     project = store.read_project()
     if authoritative_state is None or project is None:

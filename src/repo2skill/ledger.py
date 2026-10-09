@@ -34,6 +34,14 @@ class LockBusyError(RuntimeError):
     """Another process owns the project mutation lock."""
 
 
+class ExportRecoveryRequired(RuntimeError):
+    """An unresolved export journal must be recovered before mutation."""
+
+    def __init__(self, journals: tuple[ExportJournal, ...]):
+        self.journals = journals
+        super().__init__("an incomplete export journal blocks mutation; resume it first")
+
+
 def _is_redirect(path: Path) -> bool:
     path_stat = path.lstat()
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -161,6 +169,11 @@ def _encode(value: object) -> JsonValue:
         return result
     validate_json_value(value)
     return value  # type: ignore[return-value]
+
+
+def encode_record(value: object) -> JsonValue:
+    """Encode a persisted dataclass or JSON value without writing it."""
+    return _encode(value)
 
 
 def replace_state(path: Path, state: ProjectState) -> None:
@@ -428,6 +441,46 @@ class LedgerStore:
         if not path.exists():
             return None
         return decode_root_document(_load_json(path), ExportJournal)
+
+    def list_export_journals(self) -> tuple[ExportJournal, ...]:
+        """Enumerate journals without creating the state directory or lock."""
+        if not self.state_dir.exists():
+            return ()
+        with open_directory(self.state_dir) as state_guard:
+            try:
+                exports_guard = state_guard.open_directory("exports")
+            except FileNotFoundError:
+                return ()
+            with exports_guard:
+                names = exports_guard.names()
+        journals: list[ExportJournal] = []
+        for name in sorted(names):
+            if not name.endswith(".json"):
+                raise ValueError("unexpected file in export journal directory")
+            relative = f"exports/{name}"
+            journal = self.read_export_journal(relative)
+            if journal is None:
+                raise ValueError(f"export journal disappeared while enumerating: {name}")
+            if name != f"{journal.exportId}.json":
+                raise ValueError("export journal ID does not match its path")
+            journals.append(journal)
+        return tuple(journals)
+
+    def write_export_journal(self, journal: ExportJournal) -> None:
+        """Atomically create or update a journal under the active mutation lock."""
+        self._require_mutation()
+        path = self._store_path(f"exports/{journal.exportId}.json", create_parents=True)
+        _replace_json(path, encode_record(journal))
+
+    def require_no_unresolved_export(self, *, resume_export_id: str | None = None) -> None:
+        """Require all prior exports committed, allowing one explicit recovery."""
+        self._require_mutation()
+        unresolved = tuple(
+            journal for journal in self.list_export_journals()
+            if journal.status != "committed" and journal.exportId != resume_export_id
+        )
+        if unresolved:
+            raise ExportRecoveryRequired(unresolved)
 
     def snapshot(self) -> LedgerStoreSnapshot:
         """Read a coherent active view without creating or rewriting state."""

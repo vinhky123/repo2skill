@@ -292,6 +292,7 @@ def publish_stage_revision(
 ) -> StagedRun:
     """Publish one immutable stage revision without changing the active state pointer."""
     store._require_mutation()
+    store.require_no_unresolved_export()
     project = store.read_project()
     if project is None:
         raise FileNotFoundError("project configuration is required before staging")
@@ -338,6 +339,7 @@ def stage_run(
 ) -> StagedRun:
     """Publish initial revision 1 and activate it with one state pointer replacement."""
     store._require_mutation()
+    store.require_no_unresolved_export()
     state = store.read_state()
     project = store.read_project()
     if state is None or project is None:
