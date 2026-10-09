@@ -21,8 +21,13 @@ def _invoke_json(root: Path, *args: str, config: str | None = None, capsys):
     argv.extend(args)
     code = main(argv)
     captured = capsys.readouterr()
-    assert captured.err == ""
-    return code, json.loads(captured.out)
+    payload = json.loads(captured.out)
+    expected_diagnostics = "".join(
+        f"{item['code']}: {item['path'] + ': ' if item.get('path') else ''}{item['message']}\n"
+        for item in payload["diagnostics"]
+    )
+    assert captured.err == expected_diagnostics
+    return code, payload
 
 
 def test_scan_activates_scan_only_without_stage_and_custom_state_config(tmp_path: Path, capsys) -> None:
@@ -263,3 +268,110 @@ def test_explicit_init_config_mismatch_fails_before_state_creation(tmp_path: Pat
     assert code == 1
     assert result["findings"][0]["code"] == "state.invalid"
     assert not (tmp_path / ".cache/state").exists()
+
+
+def test_internal_read_corruption_uses_exit_seven(tmp_path: Path, capsys) -> None:
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    state_path = tmp_path / ".repo2skill" / "state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    code, checked = _invoke_json(tmp_path, "check", capsys=capsys)
+    assert code == checked["exitCode"] == 7
+    assert checked["findings"][0]["code"] == "ledger.corrupt"
+
+
+def test_corrupt_selected_run_uses_exit_seven(tmp_path: Path, capsys) -> None:
+    (tmp_path / "package.json").write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    _code, generated = _invoke_json(tmp_path, "generate", capsys=capsys)
+    run_id = generated["result"]["runId"]
+    (tmp_path / ".repo2skill" / "runs" / f"{run_id}.json").write_text("{broken", encoding="utf-8")
+    code, reported = _invoke_json(tmp_path, "report", "--run", run_id, capsys=capsys)
+    assert code == reported["exitCode"] == 7
+    assert reported["findings"][0]["code"] == "ledger.corrupt"
+
+
+def test_corrupt_project_document_uses_exit_seven(tmp_path: Path, capsys) -> None:
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    (tmp_path / ".repo2skill" / "project.json").write_text("{broken", encoding="utf-8")
+    code, result = _invoke_json(tmp_path, "scan", capsys=capsys)
+    assert code == result["exitCode"] == 7
+    assert result["findings"][0]["code"] == "ledger.corrupt"
+
+
+def test_review_mutation_acquires_lock_before_reading_state_or_run(tmp_path: Path, capsys, monkeypatch) -> None:
+    import repo2skill.cli as cli
+    from repo2skill.ledger import LockBusyError
+
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+
+    class BusyStore(LedgerStore):
+        def mutation(self):
+            raise LockBusyError("busy")
+
+        def read_state(self):
+            raise AssertionError("mutation read state before acquiring lock")
+
+        def read_run(self, _run_id):
+            raise AssertionError("mutation read selected run before acquiring lock")
+
+    monkeypatch.setattr(cli, "LedgerStore", BusyStore)
+    code, result = _invoke_json(tmp_path, "review", "accept", "--claim", "claim_missing", "--run", "run_missing", capsys=capsys)
+    assert code == 1
+    assert result["findings"][0]["code"] == "state.lock-busy"
+
+
+def test_export_incomplete_result_requires_exit_seven(tmp_path: Path, capsys, monkeypatch) -> None:
+    import repo2skill.cli as cli
+
+    (tmp_path / "package.json").write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    _code, generated = _invoke_json(tmp_path, "generate", capsys=capsys)
+    export_id = canonical_record_id("export", {"incomplete": generated["result"]["runId"]})
+    monkeypatch.setattr(cli, "export_staged", lambda *_args, **_kwargs: ExportResult(export_id, "incomplete", (), (), (), {}))
+    code, result = _invoke_json(tmp_path, "export", capsys=capsys)
+    assert code == result["exitCode"] == 7
+    assert result["findings"][0]["code"] == "export.incomplete"
+
+
+def test_doctor_reports_read_only_environment_checks(tmp_path: Path, capsys) -> None:
+    import os
+
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    state_path = tmp_path / ".repo2skill" / "state.json"
+    state_before = state_path.read_bytes()
+    files_before = sorted(item.relative_to(tmp_path).as_posix() for item in tmp_path.rglob("*"))
+    code, result = _invoke_json(tmp_path, "doctor", capsys=capsys)
+    files_after = sorted(item.relative_to(tmp_path).as_posix() for item in tmp_path.rglob("*"))
+    checks = result["result"]["checks"]
+    assert code == 0
+    assert checks["statePathConfined"] is True
+    assert checks["outputPathsConfined"] is True
+    assert checks["schemaReadable"] is True
+    assert isinstance(checks["gitAvailable"], bool)
+    assert isinstance(checks["filesystemPermissions"]["stateReadable"], bool)
+    assert isinstance(checks["filesystemPermissions"]["outputWritable"], bool)
+    assert files_after == files_before
+    assert state_path.read_bytes() == state_before
+    assert os.path.exists(tmp_path / ".repo2skill")
+
+
+def test_rejected_valid_claim_remains_in_dedup_provenance(tmp_path: Path, capsys) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"name":"demo","version":"1.0.0","scripts":{"test":"pytest"}}', encoding="utf-8",
+    )
+    _invoke_json(tmp_path, "init", "--git-mode", "no-git", capsys=capsys)
+    first_code, first = _invoke_json(tmp_path, "generate", capsys=capsys)
+    assert first_code == 3
+    store = LedgerStore(tmp_path, tmp_path / ".repo2skill")
+    first_run = store.read_run(first["result"]["runId"])
+    rejected = next(item for item in first_run.claims if item.proposalStatus == "pending")
+    reject_code, _ = _invoke_json(
+        tmp_path, "review", "reject", "--claim", rejected.claimId, "--reason", "not applicable", capsys=capsys,
+    )
+    assert reject_code in {0, 3}
+
+    _next_code, generated = _invoke_json(tmp_path, "generate", capsys=capsys)
+    next_run = store.read_run(generated["result"]["runId"])
+    effective = next(item for item in next_run.claims if item.claimId == rejected.claimId)
+    assert effective.proposalStatus == "rejected"
+    assert any(rejected.claimId in decision.candidateClaimIds for decision in next_run.dedupDecisions)

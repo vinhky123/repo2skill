@@ -16,6 +16,10 @@ class PathBoundaryError(ValueError):
     """A configured path cannot be accessed safely below its root."""
 
 
+class ProjectDataCorruptionError(RuntimeError):
+    """A persisted project document or state pointer cannot be decoded safely."""
+
+
 def default_scan_policy() -> ScanPolicy:
     """Return the immutable P0 scan policy; all size caps are bytes."""
     return ScanPolicy(
@@ -96,7 +100,10 @@ def load_project_document(root: Path, config_path: str | Path) -> tuple[ProjectD
     if state_relative in {"", "."}:
         raise ValueError("project state directory must be below repository root")
     store = LedgerStore(root_path, root_path / selected.parent)
-    project = store.read_project()
+    try:
+        project = store.read_project()
+    except (OSError, ValueError, TypeError) as error:
+        raise ProjectDataCorruptionError("project document is unreadable or invalid") from error
     if project is None:
         raise FileNotFoundError("project configuration is not initialized")
     if project.stateDir != state_relative:
@@ -143,8 +150,11 @@ def initialize_project_document(
     root_label = root_path.name or "repository"
     with store.mutation():
         store.require_no_unresolved_export()
-        existing = store.read_project()
-        state = store.read_state()
+        try:
+            existing = store.read_project()
+            state = store.read_state()
+        except (OSError, ValueError, TypeError) as error:
+            raise ProjectDataCorruptionError("project document or state pointer is unreadable or invalid") from error
         if existing is not None:
             expected = replace(
                 existing, rootLabel=root_label, stateDir=state_relative, gitMode=git_mode,

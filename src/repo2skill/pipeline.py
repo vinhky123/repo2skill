@@ -170,10 +170,7 @@ def generate_run(
         for claim in candidate_set.claims
     )
     documentation = tuple(fact for fact in scan_run.facts if fact.factType == "documentation.line")
-    render_eligible = tuple(
-        claim for claim in effective_valid if claim.proposalStatus in {"pending", "accepted"}
-    )
-    deduped = deduplicate(render_eligible, documentation, scan_run.snapshot, id_context=context)
+    deduped = deduplicate(effective_valid, documentation, scan_run.snapshot, id_context=context)
     bundle = render_targets(
         deduped.renderableClaims, selected_specs,
         policy=scan_run.effectiveClaimPolicy, project_id=project.projectId,

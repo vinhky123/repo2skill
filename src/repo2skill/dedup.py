@@ -58,8 +58,8 @@ def deduplicate(
         if claim.claimId in seen_claims:
             raise ValueError("duplicate claim ID in dedup candidates")
         seen_claims.add(claim.claimId)
-        if claim.proposalStatus not in {"pending", "accepted"}:
-            raise ValueError("dedup candidates must be valid and render-eligible")
+        if claim.proposalStatus not in {"pending", "accepted", "rejected", "contested"}:
+            raise ValueError("dedup candidates must be policy-validated claims")
         if claim.lastVerifiedSnapshotId != snapshot.snapshotId:
             raise ValueError("dedup candidate snapshot differs from source snapshot")
         if claim.templateKey is None or claim.renderedText is not None:
@@ -73,6 +73,7 @@ def deduplicate(
     decisions: list[DedupDecision] = []
     for line, group in sorted(grouped.items()):
         ordered = sorted(group, key=lambda item: (item.semanticKey, item.scope, item.claimId, item.claimRevision))
+        eligible = [item for item in ordered if item.proposalStatus in {"pending", "accepted"}]
         claim_ids = tuple(sorted({item.claimId for item in ordered}))
         fact_ids = tuple(sorted({fact_id for item in ordered for fact_id in item.factIds}))
         doc_ids = tuple(sorted(documentation.get(line, ())))
@@ -82,11 +83,13 @@ def deduplicate(
         elif len(ordered) > 1:
             result = "merge"
             reason = "duplicate-candidate-text"
-            renderable.append(ordered[0])
+            if eligible:
+                renderable.append(eligible[0])
         else:
             result = "render"
             reason = "unique-candidate-text"
-            renderable.append(ordered[0])
+            if eligible:
+                renderable.append(eligible[0])
         identity = {
             "repositoryId": snapshot.repositoryId,
             "ruleId": RULE_ID,

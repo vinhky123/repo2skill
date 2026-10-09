@@ -77,3 +77,27 @@ def test_identical_candidate_text_merges_for_render_and_keeps_all_candidate_ids(
     assert result.decisions[0].result == "merge"
     assert result.decisions[0].candidateClaimIds == tuple(sorted(claim.claimId for claim in claims))
     assert all(claim.proposalStatus == "pending" for claim in claims)
+
+
+def test_rejected_duplicate_remains_in_proof_but_pending_candidate_is_renderable() -> None:
+    facts = (_command_fact("1"), _command_fact("2"))
+    claims = derive_claims(facts, default_claim_policy(), repository_id=REPO).claims
+    ordered = sorted(claims, key=lambda item: (item.semanticKey, item.scope, item.claimId, item.claimRevision))
+    rejected = replace(ordered[0], proposalStatus="rejected")
+    pending = replace(ordered[1], proposalStatus="pending")
+
+    result = deduplicate((rejected, pending), (), _snapshot())
+
+    assert result.decisions[0].candidateClaimIds == tuple(sorted((rejected.claimId, pending.claimId)))
+    assert result.renderableClaims == (pending,)
+
+
+def test_all_inactive_candidates_remain_in_decision_without_renderable_claims() -> None:
+    facts = (_command_fact("1"), _command_fact("2"))
+    claims = derive_claims(facts, default_claim_policy(), repository_id=REPO).claims
+    inactive = tuple(replace(item, proposalStatus=status) for item, status in zip(claims, ("rejected", "contested")))
+
+    result = deduplicate(inactive, (), _snapshot())
+
+    assert result.decisions[0].candidateClaimIds == tuple(sorted(item.claimId for item in claims))
+    assert result.renderableClaims == ()

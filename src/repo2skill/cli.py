@@ -5,7 +5,9 @@ import argparse
 from collections import Counter
 from dataclasses import fields, is_dataclass, replace
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 import uuid
 from typing import Sequence
@@ -14,7 +16,8 @@ from . import SCHEMA_VERSION, __version__
 from .checks import check_freshness, explain_claim
 from .claims import apply_review_dispositions, review_claims
 from .config import (
-    PathBoundaryError, initialize_project_document, load_project_document,
+    PathBoundaryError, ProjectDataCorruptionError, canonical_repository_path,
+    initialize_project_document, load_project_document,
 )
 from .dependencies import ActivationFreshnessError, recheck_dependencies
 from .identity import RepositoryIdentityError
@@ -210,15 +213,18 @@ def _diagnostic(findings: Sequence[Finding]) -> tuple[Diagnostic, ...]:
 
 def _print_envelope(envelope: dict[str, object], fmt: str, quiet: bool) -> int:
     code = int(envelope["exitCode"])
+    diagnostics = envelope.get("diagnostics", ())
     if fmt == "json":
         sys.stdout.write(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")) + "\n")
-        return code
-    if code == 0:
+    elif code == 0:
         if not quiet:
             sys.stdout.write(f"{envelope['command']}: completed\n")
     else:
         for finding in envelope["findings"]:
             sys.stderr.write(f"{finding['code']}: {finding['message']}\n")
+    for diagnostic in diagnostics:
+        path = f"{diagnostic['path']}: " if diagnostic.get("path") else ""
+        sys.stderr.write(f"{diagnostic['code']}: {path}{diagnostic['message']}\n")
     return code
 
 
@@ -229,11 +235,46 @@ def _store_context(args: argparse.Namespace, *, required: bool = True) -> tuple[
         config = ".repo2skill/project.json"
     try:
         project, state_dir = load_project_document(root, config)
+    except ProjectDataCorruptionError as error:
+        raise LedgerCorruptionError("project configuration is invalid") from error
     except FileNotFoundError:
         if required:
             raise
         return None, None
     return project, LedgerStore(root, state_dir)
+
+
+def _read_state(store: LedgerStore) -> ProjectState | None:
+    try:
+        return store.read_state()
+    except (OSError, ValueError, TypeError) as error:
+        raise LedgerCorruptionError("project state is unreadable or invalid") from error
+
+
+def _read_run(store: LedgerStore, run_id: str) -> RunLedger | None:
+    try:
+        return store.read_run(run_id)
+    except (OSError, ValueError, TypeError) as error:
+        raise LedgerCorruptionError("selected run ledger is unreadable or invalid") from error
+
+
+def _active_manifests_checked(store: LedgerStore, state: ProjectState):
+    try:
+        return _active_manifests(store, state)
+    except (OSError, ValueError, TypeError) as error:
+        raise LedgerCorruptionError("active manifest records are unreadable or invalid") from error
+
+
+def _existing_directory(path: Path) -> Path:
+    current = path
+    if current.exists() and not current.is_dir():
+        current = current.parent
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return current
+        current = parent
+    return current if current.is_dir() else current.parent
 
 
 def _target_specs(project: ProjectDocument, selected: Sequence[str]):
@@ -327,7 +368,7 @@ def _command_scan(args: argparse.Namespace):
     assert project and store
     with store.mutation():
         store.require_no_unresolved_export()
-        state = store.read_state()
+        state = _read_state(store)
         if state is None:
             raise FileNotFoundError("project state is missing")
         all_runs = _load_history(store)
@@ -373,13 +414,13 @@ def _command_generate(args: argparse.Namespace):
     selected_specs = _target_specs(project, args.target)
     with store.mutation():
         store.require_no_unresolved_export()
-        state = store.read_state()
+        state = _read_state(store)
         if state is None:
             raise FileNotFoundError("project state is missing")
         all_runs = _load_history(store)
         from_run = None
         if args.from_run:
-            from_run = store.read_run(args.from_run)
+            from_run = _read_run(store, args.from_run)
             if from_run is None or not from_run.completed or from_run.claims or from_run.stagedTargets:
                 raise ValueError("--from-run requires a completed scan-only run")
             if (from_run.configuredTargets != project.targets
@@ -437,7 +478,7 @@ def _selected_run(store: LedgerStore, run_id: str | None, state: ProjectState) -
     selected = run_id or state.currentRunId
     if selected is None:
         raise LookupError("no active run exists")
-    run = store.read_run(selected)
+    run = _read_run(store, selected)
     if run is None:
         raise LookupError("requested run does not exist")
     return run
@@ -469,11 +510,11 @@ def _review_events(args, claims: Sequence[Claim], run: RunLedger) -> tuple[Revie
 def _command_review(args: argparse.Namespace):
     project, store = _store_context(args)
     assert project and store
-    state = store.read_state()
-    if state is None:
-        raise FileNotFoundError("project state is missing")
-    run = _selected_run(store, args.run, state)
     if args.review_command in {"list", "show"}:
+        state = _read_state(store)
+        if state is None:
+            raise FileNotFoundError("project state is missing")
+        run = _selected_run(store, args.run, state)
         validation = validate_claims(run.claims, run)
         effective = apply_review_dispositions(validation.validClaims, state)
         effective_by_ref = {(item.claimId, item.claimRevision): item for item in effective}
@@ -496,12 +537,10 @@ def _command_review(args: argparse.Namespace):
                 "coverage": run.coverage}, (), (), []
     with store.mutation():
         store.require_no_unresolved_export()
-        current_state = store.read_state()
-        if current_state is None or current_state != state:
-            raise ValueError("project state changed before review")
-        authoritative = store.read_run(run.runId)
-        if authoritative != run:
-            raise ValueError("run changed before review")
+        state = _read_state(store)
+        if state is None:
+            raise FileNotFoundError("project state is missing")
+        run = _selected_run(store, args.run, state)
         validation = validate_claims(run.claims, run)
         effective = apply_review_dispositions(validation.validClaims, state)
         events = _review_events(args, effective, run)
@@ -524,7 +563,7 @@ def _command_review(args: argparse.Namespace):
 def _command_check(args: argparse.Namespace):
     project, store = _store_context(args)
     assert project and store
-    state = store.read_state()
+    state = _read_state(store)
     if state is None:
         raise FileNotFoundError("project state is missing")
     run = _selected_run(store, args.run, state)
@@ -532,7 +571,10 @@ def _command_check(args: argparse.Namespace):
     result = check_freshness(run, identity, policy_revision, versions, root=store.root,
                              current_root_label=project.rootLabel, excluded_paths=exclusions)
     specs = _target_specs(project, args.target)
-    ownership_findings = inspect_target_ownership(specs, store=store)
+    try:
+        ownership_findings = inspect_target_ownership(specs, store=store)
+    except (OSError, ValueError, TypeError) as error:
+        raise LedgerCorruptionError("target ownership records are unreadable or invalid") from error
     findings = [item for item in result.findings if item.code != "check.review-pending"]
     findings.extend(ownership_findings)
     try:
@@ -560,7 +602,7 @@ def _command_check(args: argparse.Namespace):
 
 def _load_explain_artifacts(store: LedgerStore, runs: Sequence[RunLedger], state: ProjectState):
     manifests = []
-    _manifest_set, active = _active_manifests(store, state)
+    _manifest_set, active = _active_manifests_checked(store, state)
     manifests.extend(active.values())
     descriptors = {}
     for run in runs:
@@ -580,7 +622,7 @@ def _command_explain(args: argparse.Namespace):
         raise InvocationError("--revision must be a positive integer")
     project, store = _store_context(args)
     assert project and store
-    state = store.read_state()
+    state = _read_state(store)
     if state is None:
         raise FileNotFoundError("project state is missing")
     all_runs = _load_history(store)
@@ -611,7 +653,7 @@ def _command_explain(args: argparse.Namespace):
 def _command_report(args: argparse.Namespace):
     project, store = _store_context(args)
     assert project and store
-    state = store.read_state()
+    state = _read_state(store)
     if state is None:
         raise FileNotFoundError("project state is missing")
     run = _selected_run(store, args.run, state)
@@ -646,15 +688,15 @@ def _command_export(args: argparse.Namespace):
     assert project and store
     with store.mutation():
         store.require_no_unresolved_export(resume_export_id=args.resume)
-        state = store.read_state()
+        state = _read_state(store)
         if state is None:
             raise FileNotFoundError("project state is missing")
-        _manifest_set, manifests = _active_manifests(store, state)
+        _manifest_set, manifests = _active_manifests_checked(store, state)
         ownership = _ownership(manifests)
         run_id = args.run or state.currentRunId
         if run_id is None:
             raise LookupError("there is no active run to export")
-        run = store.read_run(run_id)
+        run = _read_run(store, run_id)
         if run is None:
             raise LookupError("requested run does not exist")
         identity, policy_revision, versions, exclusions = current_repository_context(Path(args.root).absolute(), project, run)
@@ -677,18 +719,23 @@ def _command_export(args: argparse.Namespace):
                                      current_extractor_versions=versions, excluded_paths=exclusions,
                                      delete_empty_owned_blocks=args.delete_empty_owned_blocks)
         status_finding = {
-            "incomplete": _finding("export.incomplete", "incomplete", "export requires explicit recovery"),
+            "incomplete": _finding("export.incomplete", "incomplete", "export requires explicit recovery", exit_code=7),
             "conflict": _finding("export.conflict", "conflict", "export encountered an ownership conflict"),
         }.get(outcome.status)
         findings = (status_finding,) if status_finding else ()
-        journal = store.read_export_journal(f"exports/{outcome.exportId}.json")
+        try:
+            journal = store.read_export_journal(f"exports/{outcome.exportId}.json")
+        except (OSError, ValueError, TypeError) as error:
+            raise LedgerCorruptionError("export journal is unreadable or invalid") from error
         stage_revision = journal.stageRevision if journal else state.activeStageRevision or 1
         current_effective = apply_review_dispositions(validate_claims(run.claims, run).validClaims, state)
         effective_status = {(item.claimId, item.claimRevision): item.proposalStatus for item in current_effective}
         pending_count = sum(effective_status.get((item.claimId, item.claimRevision), "pending") in {"pending", "contested"}
                             for item in run.claims)
-        latest_state = store.read_state()
-        _latest_set, latest_manifests = _active_manifests(store, latest_state)
+        latest_state = _read_state(store)
+        if latest_state is None:
+            raise LedgerCorruptionError("project state disappeared during export")
+        _latest_set, latest_manifests = _active_manifests_checked(store, latest_state)
         exported_targets = {}
         for target_id, manifest in latest_manifests.items():
             if target_id not in outcome.manifestIds:
@@ -714,23 +761,87 @@ def _command_doctor(args: argparse.Namespace):
             (_finding("codex.unavailable", "error", "Codex capability checks are unavailable in this P0 build", exit_code=6),),
             (), [],
         )
-    project, store = _store_context(args, required=False)
-    checks = {"python": True, "platform": sys.platform, "projectInitialized": project is not None,
-              "statePathConfined": True, "journals": "clear"}
+    root = Path(args.root).absolute()
+    checks: dict[str, object] = {
+        "python": sys.version_info >= (3, 11),
+        "platform": sys.platform,
+        "platformSupported": sys.platform in {"win32", "linux", "darwin"},
+        "projectInitialized": False,
+        "statePathConfined": False,
+        "outputPathsConfined": False,
+        "filesystemPermissions": {
+            "rootReadable": os.access(root, os.R_OK),
+            "rootWritable": os.access(root, os.W_OK),
+            "stateReadable": None,
+            "stateWritable": None,
+            "outputWritable": None,
+        },
+        "gitAvailable": shutil.which("git") is not None,
+        "schemaReadable": None,
+        "journals": "unknown",
+    }
     findings: list[Finding] = []
+    if not checks["python"]:
+        findings.append(_finding("doctor.python-unsupported", "error", "Python 3.11 or newer is required"))
+    if not checks["platformSupported"]:
+        findings.append(_finding("doctor.platform-unsupported", "error", "this operating system is unsupported"))
+    if not checks["gitAvailable"]:
+        findings.append(_finding("doctor.git-unavailable", "info", "Git is not available on PATH"))
+    try:
+        project, store = _store_context(args, required=False)
+    except PathBoundaryError:
+        checks["schemaReadable"] = False
+        findings.append(_finding("doctor.path-unconfined", "error", "project configuration path is not confined"))
+        return {"checks": checks, "codexRequested": False, "codexCapability": None}, tuple(findings), (), []
+    except LedgerCorruptionError:
+        checks["schemaReadable"] = False
+        findings.append(_finding("doctor.schema-invalid", "error", "project configuration is unreadable or invalid", exit_code=7))
+        return {"checks": checks, "codexRequested": False, "codexCapability": None}, tuple(findings), (), []
+    checks["projectInitialized"] = project is not None
     if store is not None:
+        assert project is not None
         try:
-            state = store.read_state()
+            state = _read_state(store)
+            checks["schemaReadable"] = state is not None
+            if state is None:
+                findings.append(_finding("doctor.state-missing", "error", "project state document is missing"))
+        except LedgerCorruptionError:
+            checks["schemaReadable"] = False
+            state = None
+            findings.append(_finding("doctor.state-invalid", "error", "project state is unreadable or invalid", exit_code=7))
+        try:
+            checks["statePathConfined"] = canonical_repository_path(root, project.stateDir) == project.stateDir
+            checks["outputPathsConfined"] = all(
+                canonical_repository_path(root, target.livePath) == target.livePath
+                for target in project.targets
+            )
+        except PathBoundaryError:
+            checks["statePathConfined"] = False
+            checks["outputPathsConfined"] = False
+        permissions = checks["filesystemPermissions"]
+        assert isinstance(permissions, dict)
+        permissions["stateReadable"] = os.access(store.state_dir, os.R_OK)
+        permissions["stateWritable"] = os.access(store.state_dir, os.W_OK)
+        output_directories = [_existing_directory(root / target.livePath) for target in project.targets]
+        permissions["outputWritable"] = all(os.access(path, os.W_OK) for path in output_directories)
+        if not checks["statePathConfined"] or not checks["outputPathsConfined"]:
+            findings.append(_finding("doctor.path-unconfined", "error", "a configured state or output path escapes the repository"))
+        if not all(permissions.values()):
+            findings.append(_finding("doctor.permissions", "error", "required repository, state, or output permissions are unavailable"))
+        try:
             journals = store.list_export_journals()
             unresolved = [item for item in journals if item.status != "committed"]
             checks["journals"] = "unresolved" if unresolved else "clear"
             for item in unresolved:
                 findings.append(_finding("export.recovery-required", "incomplete", "an export journal requires explicit resume",
                                          details={"exportId": item.exportId, "status": item.status}, exit_code=7))
-            if state is None:
-                findings.append(_finding("doctor.state-missing", "error", "project state document is missing"))
-        except (OSError, ValueError):
-            findings.append(_finding("doctor.state-invalid", "error", "project state or recovery journal is unreadable", exit_code=7))
+        except (OSError, ValueError, TypeError):
+            checks["journals"] = "invalid"
+            findings.append(_finding("doctor.journal-invalid", "error", "export journal history is unreadable or invalid", exit_code=7))
+    elif project is None:
+        checks["statePathConfined"] = True
+        checks["outputPathsConfined"] = True
+        checks["schemaReadable"] = True
     return {"checks": checks, "codexRequested": False, "codexCapability": None}, tuple(findings), (), []
 
 
@@ -787,8 +898,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         findings = tuple(_finding("export.recovery-required", "incomplete", "an unresolved export journal blocks mutation",
                                   details={"exportId": item.exportId, "status": item.status}, exit_code=7) for item in error.journals)
         result, diagnostics, next_actions = None, (), ["resume the named export journal"]
-    except LedgerCorruptionError:
-        result, findings, diagnostics, next_actions = None, (_finding("ledger.corrupt", "error", "immutable run history is invalid", exit_code=7),), (), []
+    except (LedgerCorruptionError, ProjectDataCorruptionError):
+        result, findings, diagnostics, next_actions = None, (_finding("ledger.corrupt", "error", "persisted repository records are invalid", exit_code=7),), (), []
     except ActivationFreshnessError as error:
         result, findings, diagnostics, next_actions = None, error.result.findings, (), ["refresh source inputs before activation"]
     except ExportFreshnessError as error:
@@ -801,7 +912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError:
         result, findings, diagnostics, next_actions = None, (_finding("io.failed", "error", "a required local file operation failed"),), (), []
     except Exception:
-        result, findings, diagnostics, next_actions = None, (_finding("internal.error", "error", "an unexpected internal error occurred"),), (), []
+        result, findings, diagnostics, next_actions = None, (_finding("internal.error", "error", "an unexpected internal error occurred", exit_code=7),), (), []
     command_name = args.command
     if command_name == "review":
         command_name = f"review-{args.review_command}"

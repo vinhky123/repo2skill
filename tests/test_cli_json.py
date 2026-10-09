@@ -57,3 +57,38 @@ def test_json_errors_do_not_expose_absolute_runtime_paths(tmp_path: Path, capsys
     assert str(tmp_path) not in captured.out
     payload = json.loads(captured.out)
     assert payload["findings"][0]["code"] == "lookup.not-found"
+
+
+def test_unexpected_internal_error_uses_exit_seven(tmp_path: Path, capsys, monkeypatch) -> None:
+    import repo2skill.cli as cli
+
+    def fail(_args):
+        raise RuntimeError("private implementation detail")
+
+    monkeypatch.setattr(cli, "_dispatch", fail)
+    code = main(["--root", str(tmp_path), "--format", "json", "doctor"])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert code == payload["exitCode"] == 7
+    assert payload["findings"][0]["code"] == "internal.error"
+    assert "private implementation detail" not in captured.out
+
+
+def test_text_and_json_diagnostics_always_reach_stderr_even_when_quiet(capsys) -> None:
+    from repo2skill.cli import _print_envelope
+
+    envelope = {
+        "command": "scan", "exitCode": 0, "findings": [],
+        "diagnostics": [{"code": "coverage.optional-gap", "severity": "warning", "message": "optional input skipped"}],
+    }
+    assert _print_envelope(envelope, "text", quiet=True) == 0
+    text_output = capsys.readouterr()
+    assert text_output.out == ""
+    assert "coverage.optional-gap: optional input skipped" in text_output.err
+
+    assert _print_envelope(envelope, "json", quiet=True) == 0
+    json_output = capsys.readouterr()
+    assert json.loads(json_output.out) == envelope
+    assert json_output.out.endswith("\n") and json_output.out.count("\n") == 1
+    assert "coverage.optional-gap: optional input skipped" in json_output.err
