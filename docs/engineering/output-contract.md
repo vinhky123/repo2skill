@@ -140,4 +140,55 @@ Use the shared immutable stage publisher and descriptor reader through a separat
 
 ## Task 9 — export from the active immutable stage
 
-While holding the caller-owned mutation, export resolves `ProjectState.currentRunId` and `activeStageRevision`, loads that run and exact `stage.json`, and validates descriptor identity, selected target specs, stage file hashes, paths, and accepted claim spans. Export reads only accepted-mode files; preview files are never export input. The descriptor's target specs are checked against authoritative configured specs. Existing R4/R5 manifest, ownership, journal, recovery, and commit-point rules remain in force. Before the first live replacement, perform the same single dependency recheck required by R5; write the journal before mutation and change the active manifest pointer only after the immutable manifest set is complete. A conflict never authorizes overwriting a third live hash.
+The exact export APIs add explicit live-repository freshness context to R3:
+
+```python
+class ExportFreshnessError(RuntimeError):
+    def __init__(self, result: DependencyRecheckResult) -> None: ...
+
+
+def export_staged(
+    run_id: RunId, targets: Sequence[TargetId],
+    ownership: Mapping[TargetId, OwnershipState], *, store: LedgerStore,
+    current_identity: RepositoryIdentity, current_root_label: str,
+    current_policy_revision: str,
+    current_extractor_versions: Mapping[str, str],
+    excluded_paths: Sequence[RepositoryPath],
+    delete_empty_owned_blocks: bool = False,
+) -> ExportResult: ...
+
+def resume_export(
+    export_id: ExportId,
+    ownership: Mapping[TargetId, OwnershipState], *, store: LedgerStore,
+    current_identity: RepositoryIdentity, current_root_label: str,
+    current_policy_revision: str,
+    current_extractor_versions: Mapping[str, str],
+    excluded_paths: Sequence[RepositoryPath],
+) -> ExportResult: ...
+```
+
+The caller holds `store.mutation()` from authoritative reads through the commit or journal update. `store.root` supplies R5's `root`; all other freshness values are explicit. Resolve the current `ProjectState.currentRunId` and `activeStageRevision`, require the requested run to be current, then load that immutable run and exact `stage.json` descriptor. Check descriptor identity, full selected `TargetSpec` equality against current configuration, repository-relative paths, accepted-mode hashes, spans, and current acceptance via `ProjectState.acceptedClaimRevisions`. Preview files are never export input. `RunLedger.stagedTargets` is only the initial revision-1 projection; later review exports use the active descriptor. Reconstruct supplied `OwnershipState` from active manifest references and target manifests and require canonical equality. A selected target without prior history may be absent from the mapping; reject duplicate/unknown target IDs. Ownership and target validation are distinct from source freshness.
+
+Immediately before the first live operation, call the one R5 `recheck_dependencies` with the run, `store.root`, current identity/root label/policy/extractor versions, and exclusions. If its status is `stale` or `unknown`, raise `ExportFreshnessError(result)` before writing a journal or touching live paths; CLI maps either to exit 4, never to ownership-conflict exit 5. Resume repeats this recheck before any further live operation. If the active manifest pointer already names this journal's exact completed manifest set, validate it and finalize the journal without replaying writes or requiring fresh source inputs.
+
+Preflight every selected target and every intended mkdir/replace/delete before any live write. A conflict returns an `ExportResult(status="conflict")`, may save a proposed diff under staging, and creates no unresolved journal. For managed markers, require the current marker-inclusive block hash to match the prior `ManifestBlock`; a changed full-file hash caused only by outside-marker edits is allowed, and outside bytes are preserved byte-for-byte. A whole-file-owned Skill output requires the full prior file hash to match. Existing text files must use consistent LF or CRLF; mixed EOL conflicts. New files use LF. Convert only generated output to the existing style. `ManifestFile.exactHash` is the final full live-file hash; each `ManifestBlock.exactHash` is the exact marker-inclusive block bytes after EOL conversion. Claim spans are measured in final merged live files. The journal's `expectedOldHash` is the full current preflight file hash (or null if absent), used to detect changes between preflight and replacement; it is not the managed-block ownership check. `stagedNewHash` is the hash of final intended live bytes after merge/EOL conversion.
+
+`delete_empty_owned_blocks` defaults false. When explicitly true, it overrides the frozen `TargetSpec.emptyBlockPolicy="keep"` for this invocation and may remove only empty owned markers while preserving the surrounding file. Whole-file/Skill companion deletion requires a prior whole-file ownership record, matching current full hash, and explicit staged omission; never infer deletion from an unselected target. No directory cleanup is performed.
+
+The persisted journal is `<store.state_dir>/exports/<exportId>.json` (its logical location includes the `stateDir` prefix under R6). Under mutation, the store enumerates journals and atomically creates/updates typed journals at this path. Every non-`committed` journal, including `prepared`, `incomplete`, or `conflict`, blocks every mutating operation except explicit resume of that journal. The minimal store/encoding surface is:
+
+```python
+def LedgerStore.list_export_journals(self) -> tuple[ExportJournal, ...]: ...
+def LedgerStore.write_export_journal(self, journal: ExportJournal) -> None: ...
+def encode_record(record: object) -> JsonValue: ...
+```
+
+Journal enumeration and writes require the active mutation; writes atomically create or replace the journal at its ID-derived path. `encode_record` is pure and supplies typed immutable manifests/sets to the existing `write_immutable(relative_path, JsonValue)`. Do not add a general storage framework. Target manifests use the already-frozen `manifests/<exportId>/<targetId>.json`; the manifest set uses `manifests/<exportId>/<manifestSetId>.json`. A subset export copies each unselected `ManifestReference` unchanged into the new complete set.
+
+After successful preflight, derive deterministic operation IDs and persist final intended bytes at `<store.state_dir>/staging/exports/<exportId>/new/<operationId>` and exact old bytes for replace/delete backups under `.../backup/<operationId>` with `backupPath` storing its normalized repository-relative path; `stagedNewHash`/`backupHash` must verify those immutable payloads before live writes. Persist actual proposed diffs under `.../patch/<operationId>.diff` and store their root-relative paths in `proposedPatchPath`. New-payload paths are derived from journal IDs, so no journal field is added and resume never recomputes a merge from changed outside bytes.
+
+After R5 returns fresh, write the complete `prepared` journal before any live mkdir, replacement, or deletion. Keep R4's exact deterministic `(targetId, path, action)` operation ordering; canonical parent paths sort before descendants. A missing parent shared by targets is assigned once to the first target in canonical `targetId` order. Journal `createdDirectories` and target-manifest directory records contain only paths confirmed created by this tool; carry forward previously owned target directories, add newly confirmed paths, and do not clean directories up. If resume sees a planned mkdir path already present without journal proof that this transaction created it, mark conflict and do not adopt it. Journal each successful operation atomically; a third hash becomes a conflict without touching that path. A mid-transaction conflict is unresolved and blocks other mutation until resume resolves it.
+
+For file replacement/deletion, use a small guarded publication seam in `safe_fs` or a focused `output_fs` helper: root-relative component traversal with retained non-redirected ancestor guards, safe mkdir, same-directory temp+fsync+atomic replace, and owned-file deletion, each checking expected old state. The current `safe_fs` public surface only guards reads; do not use unchecked `Path.write_bytes` or `os.replace` for live targets. The operation log remains sorted by `(targetId, path, action)`; parent mkdir operations precede descendant paths by canonical path ordering.
+
+Write immutable selected `TargetManifest`s and the complete `ManifestSet` only after every operation reaches its intended hash. Copy references for unselected targets unchanged. Replace `ProjectState.activeExportId` and `activeManifestSetId` once; this is the commit point. Then atomically mark the journal `committed`. If the process stops after pointer commit but before that status update, resume verifies the exact active manifest set and marks committed without replaying operations or checking source freshness. If interrupted earlier, resume accepts only each operation's recorded old or intended new state; a third hash remains untouched and conflicted.

@@ -280,7 +280,7 @@ There is one store implementation:
 LedgerStore(root: Path, state_dir: Path)
 ```
 
-Both constructor paths are resolved absolute paths; `state_dir` must be confined under `root`. The store never consults process cwd or module globals. `with store.mutation():` acquires the one fail-fast OS-owned exclusive state-directory lock before any authoritative state, run, journal, or manifest read. The caller owns this scope and holds it through the final state-pointer replacement or journal update. Mutation depth/ownership is per `LedgerStore` instance and lock owner, never module- or class-global; nested mutation entry is rejected. The store tracks that its mutation scope is active; every stateful operation below rejects an unlocked store before writing. The caller loads authoritative records through that same store, rejects an incomplete unrelated export journal, invokes the operation, and maps failure to the CLI result. Operations do not acquire a second lock.
+Both constructor paths are resolved absolute paths; `state_dir` must be confined under `root`. The store never consults process cwd or module globals. `with store.mutation():` acquires the one fail-fast OS-owned exclusive state-directory lock before any authoritative state, run, journal, or manifest read. The caller owns this scope and holds it through the final state-pointer replacement or journal update. Mutation depth/ownership is per `LedgerStore` instance and lock owner, never module- or class-global; nested mutation entry is rejected. The store tracks that its mutation scope is active; every stateful operation below rejects an unlocked store before writing. The caller loads authoritative records through that same store, rejects every non-committed unrelated export journal, invokes the operation, and maps failure to the CLI result. Only explicit resume may operate while the selected journal is non-committed. Operations do not acquire a second lock.
 
 The corrected signatures are additive and explicit:
 
@@ -303,15 +303,8 @@ def review_claims(
     excluded_paths: Sequence[RepositoryPath],
 ) -> tuple[ProjectState, StagedRun]: ...
 
-def export_staged(
-    run_id: RunId, targets: Sequence[TargetId],
-    ownership: Mapping[TargetId, OwnershipState], *, store: LedgerStore,
-) -> ExportResult: ...
-
-def resume_export(
-    export_id: ExportId,
-    ownership: Mapping[TargetId, OwnershipState], *, store: LedgerStore,
-) -> ExportResult: ...
+# Exact Task 9 export_staged/resume_export signatures, freshness handling,
+# journal paths and commit/recovery sequence are defined in output-contract §Task 9.
 ```
 
 Each operation obtains both absolute paths only from `store.root` and `store.state_dir`. Supplied existing `state`, `run`, stage, ownership, and journal records are compared for canonical equality with authoritative records read inside the active lock; matching IDs do not excuse stale content. Initial `stage_run` instead requires the new run ID/path to be absent, publishes immutable artifacts, performs the R5 recheck, then commits one state pointer. `review_claims` compares the supplied run/state with authoritative records, validates the whole batch, rerenders and publishes a new immutable stage revision without changing the run, validates it, then commits returned state once. Export journals before the first live mutation and commits manifests before the state pointer. Any mismatch or exception before the defined commit point fails closed and leaves the prior pointer unchanged. See `output-contract.md` for the stage descriptor and per-revision rules.
