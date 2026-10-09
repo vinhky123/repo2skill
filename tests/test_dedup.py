@@ -5,7 +5,8 @@ from dataclasses import replace
 from repo2skill.config import default_claim_policy
 from repo2skill.claims import derive_claims
 from repo2skill.dedup import deduplicate
-from repo2skill.models import Fact, SourceSnapshot
+from repo2skill.models import Fact, SourceSnapshot, TargetSpec
+from repo2skill.render import render_targets
 
 
 REPO = "repo_0123456789abcdef01234567"
@@ -101,3 +102,21 @@ def test_all_inactive_candidates_remain_in_decision_without_renderable_claims() 
 
     assert result.decisions[0].candidateClaimIds == tuple(sorted(item.claimId for item in claims))
     assert result.renderableClaims == ()
+
+def test_accepted_duplicate_wins_over_earlier_pending_representative_for_render() -> None:
+    facts = (_command_fact("1"), _command_fact("2"))
+    claims = derive_claims(facts, default_claim_policy(), repository_id=REPO).claims
+    ordered = sorted(claims, key=lambda item: (item.semanticKey, item.scope, item.claimId, item.claimRevision))
+    pending = replace(ordered[0], proposalStatus="pending")
+    accepted = replace(ordered[1], proposalStatus="accepted")
+    assert pending.semanticKey < accepted.semanticKey
+
+    result = deduplicate((pending, accepted), (), _snapshot())
+
+    assert result.renderableClaims == (accepted,)
+    target = TargetSpec("agents-md", "agents-md", "AGENTS.md", "managed-blocks", "keep")
+    rendered = render_targets(result.renderableClaims, (target,), policy=default_claim_policy(),
+                               project_id="project_0123456789abcdef01234567").targets[0]
+    accepted_ref = f"{accepted.claimId}@{accepted.claimRevision}"
+    assert accepted_ref in rendered.claimSpans["AGENTS.md"]
+    assert b"pnpm test" in rendered.relativeFiles["AGENTS.md"]

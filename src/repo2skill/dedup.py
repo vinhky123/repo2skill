@@ -74,6 +74,8 @@ def deduplicate(
     for line, group in sorted(grouped.items()):
         ordered = sorted(group, key=lambda item: (item.semanticKey, item.scope, item.claimId, item.claimRevision))
         eligible = [item for item in ordered if item.proposalStatus in {"pending", "accepted"}]
+        # Prefer accepted output while preserving canonical order within each status.
+        eligible.sort(key=lambda item: item.proposalStatus != "accepted")
         claim_ids = tuple(sorted({item.claimId for item in ordered}))
         fact_ids = tuple(sorted({fact_id for item in ordered for fact_id in item.factIds}))
         doc_ids = tuple(sorted(documentation.get(line, ())))
