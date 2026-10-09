@@ -220,6 +220,60 @@ def test_resume_finalizes_journal_after_pointer_commit_crash(tmp_path: Path, mon
     assert store.list_export_journals()[0].status == "committed"
 
 
+def test_resume_pointer_finalization_refuses_other_unresolved_journal(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.ownership as ownership_module
+    from repo2skill.ledger import ExportRecoveryRequired
+
+    store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
+    original_write_journal = ownership_module._write_journal
+
+    def interrupt_after_pointer(store_arg, journal):
+        if journal.status == "committed":
+            raise OSError("simulated crash after pointer commit")
+        return original_write_journal(store_arg, journal)
+
+    monkeypatch.setattr(ownership_module, "_write_journal", interrupt_after_pointer)
+    with store.mutation():
+        try:
+            export_staged(
+                RUN_ID, (targets[0].targetId,), {}, store=store,
+                current_identity=identity, current_root_label="repo",
+                current_policy_revision=policy_revision,
+                current_extractor_versions={}, excluded_paths=exclusions,
+            )
+        except OSError as error:
+            assert str(error).startswith("simulated crash")
+        else:
+            raise AssertionError("expected simulated crash")
+    monkeypatch.setattr(ownership_module, "_write_journal", original_write_journal)
+    selected = store.list_export_journals()[0]
+    stamp = "2026-10-09T00:00:00Z"
+    other = ExportJournal(
+        "1.0", "0.1.0", "export_1123456789abcdef01234567", RUN_ID, 1,
+        (targets[1].targetId,), (), {}, None, "incomplete", stamp, stamp,
+    )
+    with store.mutation():
+        store.write_export_journal(other)
+    state_before = (store.state_dir / "state.json").read_bytes()
+    live_before = (tmp_path / "AGENTS.md").read_bytes()
+    selected_path = store.state_dir / "exports" / f"{selected.exportId}.json"
+    other_path = store.state_dir / "exports" / f"{other.exportId}.json"
+    selected_before = selected_path.read_bytes()
+    other_before = other_path.read_bytes()
+    with store.mutation():
+        with pytest.raises(ExportRecoveryRequired):
+            resume_export(
+                selected.exportId, {}, store=store, current_identity=identity,
+                current_root_label="renamed-after-commit",
+                current_policy_revision=policy_revision,
+                current_extractor_versions={}, excluded_paths=exclusions,
+            )
+    assert (store.state_dir / "state.json").read_bytes() == state_before
+    assert (tmp_path / "AGENTS.md").read_bytes() == live_before
+    assert selected_path.read_bytes() == selected_before
+    assert other_path.read_bytes() == other_before
+
+
 def test_export_preserves_outside_marker_bytes(tmp_path: Path) -> None:
     store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
     with store.mutation():

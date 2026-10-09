@@ -736,6 +736,7 @@ def resume_export(
         raise FileNotFoundError("project state is required")
     if journal.status == "committed":
         return _result(journal)
+    store.require_no_unresolved_export(resume_export_id=export_id)
     if state.activeExportId == journal.exportId and state.activeManifestSetId == journal.manifestSetId:
         manifest_set = store.read_manifest_set(f"manifests/{journal.exportId}/{journal.manifestSetId}.json") if journal.manifestSetId else None
         if (manifest_set is None or manifest_set.exportId != journal.exportId
@@ -750,7 +751,6 @@ def resume_export(
                 raise ValueError("committed pointer references an invalid target manifest")
         journal = _write_journal(store, replace(journal, status="committed"))
         return _result(journal)
-    store.require_no_unresolved_export(resume_export_id=export_id)
     project, state, run, descriptor, specs, manifests, previous_set = _validate_export_context(
         journal.runId, journal.targetIds, ownership, store=store
     )
