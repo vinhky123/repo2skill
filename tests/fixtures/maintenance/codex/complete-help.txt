@@ -1,0 +1,7 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+If prompt is - or omitted, instructions are read from stdin.
+  --output-schema <FILE>  JSON Schema for final response
+  -o, --output-last-message <FILE>  Write the last message to a file
+  -s, --sandbox <SANDBOX_MODE>  Select execution sandbox: read-only, workspace-write
+  --ignore-user-config  Do not load the user config file
+  -C, --cd <DIR>  Set the working directory

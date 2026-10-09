@@ -1,0 +1,6 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+  --output-schema <FILE>
+  --output-last-message <FILE>
+  --sandbox <SANDBOX_MODE> possible values: read-only, workspace-write
+  --ignore-user-config
+  --cd <DIR>

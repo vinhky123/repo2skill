@@ -1,0 +1,6 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+Prompt is read from stdin when omitted.
+  --output-schema <FILE>
+  --output-last-message <FILE>
+  --sandbox <SANDBOX_MODE> possible values: read-only, workspace-write
+  --ignore-user-config
