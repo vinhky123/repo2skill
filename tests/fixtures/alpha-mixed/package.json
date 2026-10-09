@@ -1,0 +1,8 @@
+{
+  "name": "alpha-mixed-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "test": "python -c \"from pathlib import Path; Path('ALPHA_FIXTURE_EXECUTED').write_text('unexpected')\""
+  }
+}

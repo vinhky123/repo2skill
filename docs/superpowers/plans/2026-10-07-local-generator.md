@@ -4,7 +4,7 @@ During execution, read the [implementation contract](../../engineering/implement
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Status:** P0-01 (`9bb120b`, `466645e`), P0-02 (`d308b04`, `c0244ca`), P0-03 (`800b349`, `9dd2ea5`, `fd6f973`), P0-04, P0-05, and P0-06 have been independently reviewed. P0-04 extraction work is committed through `322568e` (review fixes `6c2b16d`, `322568e`); its scoped review is clean. P0-05 is committed through `2ffd0be` (`cd5e246` implementation plus round 1 fixes); its scoped review is clean. P0-05 baseline full suite passed 134 tests with 1 skip; the latest review-fix covering gate passed 10 tests, with no full-suite rerun. P0-06 is committed through `5f076da` (`bd1d0c1` implementation plus round 1 fixes); its scoped review is clean. P0-06 baseline full suite passed 159 tests with 1 skip; the latest fix covering gate passed 40 tests, with no full-suite rerun. P0-07 is complete at `82610aa` with independent review clean (focused 12 passed; full suite 176 passed, 1 skipped). P0-08 is complete at `b2d1780` with independent review clean (focused review+ledger 25 passed; full suite 182 passed, 1 skipped). P0-09 is complete at `6f569da` with independent review clean (implementation `19e64a5`, review fix `6f569da`; final focused 36 passed; prior full suite 202 passed, 1 skipped before final narrow safety changes). P0-10 is in progress via `p0_10_luna_implementer` (GPT-6 Luna/high), base `6f569da`; P0-11 and P0-12 are pending. Product commands remain FUTURE; the CLI exposes only global `--help` and `--version`. P0-01 wheel/sdist and fresh-wheel smoke checks passed before the ledger changes; release packaging is checked again in P0-12.
+> **Status:** P0-01–P0-11 implementation is complete and their scoped reviews are recorded in task reports. Task 11 final code is at `fccc9f4` after clean round-2 review. Task 12 local verification on Windows/Python 3.13 passed: the integration characterization passed; the full suite passed 258/1 before final integration/provenance and sdist-content assertion refinements; the final focused integration test passed 1 and distribution tests passed 2; the final wheel and sdist build and fresh external-cwd wheel smoke passed. The six Windows/Linux/macOS × Python 3.11/3.13 CI cells remain pending. Task 12 and final project independent reviews are pending; package version `0.1.0` remains unpublished.
 
 **Goal:** Ship a useful local-only alpha that scans a repository, creates traceable claims, stages `AGENTS.md` and a portable Skill, reviews/exports owned content safely, and detects/explains drift without AI or network access.
 
@@ -284,12 +284,12 @@ During execution, read the [implementation contract](../../engineering/implement
 
 **Interfaces:**
 - Consumes: the complete public CLI contract.
-- Produces: installable alpha verified on Windows/Linux/macOS with Python 3.11/3.13 and a maintained release/contribution process.
+- Produces: installable alpha locally verified on Windows/Python 3.13, a configured but still-pending Windows/Linux/macOS × Python 3.11/3.13 CI matrix, and a maintained release/contribution process.
 
-- [ ] **Red:** Add one end-to-end test proving source hash+locator → fact → claim/revision → both staged targets → export span survives update, CRLF, conflict and add/change/delete.
-- [ ] Run `python -m pytest tests/integration/test_no_ai_alpha.py -v`; expect FAIL until the full loop is wired.
-- [ ] **Green:** Add CI matrix, clean-environment wheel smoke test, notice assertion and concise setup/threat/schema/release docs; do not add tests for prose-only documentation.
-- [ ] Run `python -m pytest -q`, `python -m build`, and wheel install smoke test; expect all PASS and `repo2skill --help` exit 0.
-- [ ] Self-review every P0 Must feature has an owning task and evidence, then commit `chore: verify no-ai alpha release`.
+- [x] **Characterization:** Add an end-to-end test proving source hash+locator → fact → claim/revision → both staged targets → export span survives update, CRLF, conflict and add/change/delete. The successful run was green; no product defect was exposed.
+- [x] Run `.venv\Scripts\python.exe -m pytest tests/integration/test_no_ai_alpha.py -v`; 1 passed on Windows/Python 3.13.
+- [x] **Green:** Add CI matrix, clean-environment wheel smoke test, notice assertion and concise setup/threat/schema/release docs; no prose-only test was added.
+- [x] Run `.venv\Scripts\python.exe -m pytest -q` (258 passed, 1 skipped), `.venv\Scripts\python.exe -m build` (wheel and sdist), fresh wheel smoke, and installed `repo2skill --help`/`--version`; local checks passed on Windows/Python 3.13.
+- [x] Self-review F001–F035 ownership and evidence; Task 12 independent review and final project review remain pending. Commit `chore: verify no-ai alpha release` after final packaging verification.
 
-Task P0-01 is implemented and independently reviewed. Tasks P0-02 through P0-12 have not been executed; their checkboxes and commands remain future work.
+P0-01 through P0-11 are implemented and independently reviewed as recorded in their task reports. P0-12 local implementation verification is complete; its review and cross-platform CI matrix remain pending. Keep configured-but-unrun cells unchecked and do not claim publication.

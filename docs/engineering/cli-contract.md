@@ -4,9 +4,9 @@ The [implementation contract](implementation-contract.md) supplies the exact JSO
 
 ## Scope and status
 
-Status: planned contract for review; no command described here is implemented yet.
+Status: implemented P0 CLI contract for the unpublished local alpha. Task 12 local verification passed on Windows/Python 3.13; cross-platform CI and independent final reviews remain pending.
 
-This is the command-line contract for the planned repo2skill MVP. The examples are labeled **FUTURE** because no product CLI exists yet. Commands operate on one repository root and local `.repo2skill/` state. They never execute commands found in the repository. No-AI behavior is the default and performs no network access.
+This is the command-line contract for the repo2skill P0 alpha. Commands operate on one repository root and local `.repo2skill/` state. They never execute commands found in the repository. No-AI behavior is the default and performs no network access.
 
 The executable form is `repo2skill`. All commands accept `--root PATH` (default: current directory), `--config PATH` (default: `<root>/.repo2skill/project.json`), `--format text|json` (default: `text`), and `--quiet` (default: false). Paths printed in JSON are normalized repository-relative paths unless a field explicitly says it is absolute. `--quiet` suppresses successful human summaries, never diagnostics or JSON.
 
@@ -152,12 +152,10 @@ The exact marker grammar is renderer-owned and versioned: `<!-- repo2skill:begin
 
 Default live targets are `<root>/AGENTS.md` and `<root>/.agents/skills/<project-slug>/`. `--target` selects configured logical targets; it never accepts an arbitrary destination. Paths are resolved before access and must remain under the configured output root. Symlinked target components conflict.
 
-## FUTURE examples
-
-The commands below specify intended flow and are not runnable today.
+## Example workflows
 
 ```powershell
-# FUTURE: initialize, generate entirely locally, inspect pending proposals
+# Initialize, generate entirely locally, inspect pending proposals
 repo2skill init --git-mode auto
 repo2skill generate --no-ai
 repo2skill review list --status pending
@@ -165,7 +163,7 @@ repo2skill review show --claim claim.command.test.root.ab12cd34
 ```
 
 ```powershell
-# FUTURE: accept named claims, use constrained bulk acceptance for observed claims,
+# Accept named claims, use constrained bulk acceptance for observed claims,
 # then export only after check succeeds
 repo2skill review accept --claim claim.convention.tests.root.12ab34cd
 repo2skill review accept --all-observed
@@ -180,7 +178,7 @@ repo2skill generate --ai codex --codex-config repo-docs
 ```
 
 ```powershell
-# FUTURE: trace a live or suppressed claim without rescanning
+# Trace a live or suppressed claim without rescanning
 repo2skill explain claim.command.test.root.ab12cd34 --format json
 repo2skill report --section coverage
 ```

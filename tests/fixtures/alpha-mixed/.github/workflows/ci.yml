@@ -1,0 +1,8 @@
+name: Synthetic fixture workflow
+
+on: push
+
+jobs:
+  inspect:
+    steps:
+      - run: cargo test

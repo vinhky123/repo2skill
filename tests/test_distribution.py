@@ -68,11 +68,22 @@ def test_wheel_and_sdist_contain_upstream_notice(tmp_path: Path) -> None:
         assert len(wheel_notices) == 1
         wheel_notice = archive.read(wheel_notices[0]).decode("utf-8")
     with tarfile.open(sdist, "r:gz") as archive:
-        sdist_notices = [name for name in archive.getnames() if name.endswith("THIRD_PARTY_NOTICES")]
+        sdist_names = set(archive.getnames())
+        sdist_notices = [name for name in sdist_names if name.endswith("THIRD_PARTY_NOTICES")]
         assert len(sdist_notices) == 1
         member = archive.extractfile(sdist_notices[0])
         assert member is not None
         sdist_notice = member.read().decode("utf-8")
+
+    sdist_root = "repo2skill-0.1.0/"
+    assert {
+        sdist_root + "tests/extractors/conftest.py",
+        sdist_root + "tests/fixtures/alpha-mixed/package.json",
+        sdist_root + "tests/fixtures/alpha-mixed/src/client.ts",
+        sdist_root + "tests/fixtures/ecosystems/go/go.mod",
+        sdist_root + "tests/integration/test_no_ai_alpha.py",
+    } <= sdist_names
+    assert not any("/__pycache__/" in name or name.endswith((".pyc", ".pyo")) for name in sdist_names)
 
     expected = "Copyright (c) 2026 Osmane B."
     assert expected in wheel_notice

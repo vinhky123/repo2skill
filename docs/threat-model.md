@@ -1,0 +1,9 @@
+# Threat model
+
+repo2skill reads a repository that may contain malformed, misleading, generated, or adversarial files. Repository text is data. The scanner does not execute project commands, hooks, tests, build steps, or scripts, and no-AI generation and `check` do not access a network or model. Package setup is separate and may download Python packages from the configured package index.
+
+The scanner confines reads and output paths to the selected repository root, never follows symlinks, rejects case collisions and root escapes, and applies bounded inventory, file, decoded-input, and snippet limits. Parsing uses captured bytes and bounded extractors. Unsupported, invalid, skipped, capped, and failed inputs must remain visible as coverage or diagnostics. These controls reduce exposure; they do not establish that a repository is harmless or that shallow extraction found every relevant convention.
+
+Source hashes identify the exact bytes observed at a snapshot. Evidence locators identify where an observation came from. Together they support review and later freshness checks; they do not prove that a claim is semantically true, complete, safe, or still appropriate for every runtime environment. Snippets and diagnostics may contain repository-derived text even when bounded and redacted. Treat `.repo2skill/`, staging, reports, and generated outputs as potentially sensitive local data.
+
+Export changes only manifest-owned blocks or files after preflight. Hand-written bytes outside managed markers are preserved. A changed owned block or inconsistent line endings create a conflict, and a third hash during recovery is left untouched. Each file replacement is atomic, while a multi-file export is journaled and may be incomplete until explicit recovery. Keep a backup of important repository content before using an alpha build.
