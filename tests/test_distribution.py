@@ -18,7 +18,7 @@ def _source_environment() -> dict[str, str]:
     return environment
 
 
-def test_module_entry_point_exposes_only_help_and_version() -> None:
+def test_module_entry_point_exposes_commands_help_and_version() -> None:
     help_result = subprocess.run(
         [sys.executable, "-m", "repo2skill", "--help"],
         cwd=PROJECT_ROOT,
@@ -38,8 +38,8 @@ def test_module_entry_point_exposes_only_help_and_version() -> None:
 
     assert help_result.returncode == 0
     assert "repository knowledge generator" in help_result.stdout
-    assert "scan" not in help_result.stdout
-    assert "generate" not in help_result.stdout
+    for command in ("init", "scan", "generate", "review", "check", "explain", "report", "export", "doctor"):
+        assert command in help_result.stdout
     assert version_result.returncode == 0
     assert version_result.stdout.strip() == "repo2skill 0.1.0"
 

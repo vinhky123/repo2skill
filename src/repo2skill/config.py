@@ -5,8 +5,11 @@ from pathlib import Path, PureWindowsPath
 import re
 import stat
 import unicodedata
+import uuid
 
-from .models import ClaimPolicy, ScanPolicy, TargetSpec
+from . import SCHEMA_VERSION, __version__
+from .ids import canonical_json_bytes
+from .models import ClaimPolicy, ProjectDocument, ProjectState, ScanPolicy, TargetSpec
 
 
 class PathBoundaryError(ValueError):
@@ -54,6 +57,122 @@ def default_targets(root: Path) -> tuple[TargetSpec, ...]:
             "keep",
         ),
     )
+
+
+def canonical_repository_path(root: Path, candidate: str | Path) -> str:
+    """Resolve an existing or future root-relative path without redirect traversal."""
+    root_path = _validated_root(root)
+    raw = str(candidate)
+    if not raw or "\x00" in raw:
+        raise PathBoundaryError("path must be a nonempty root-relative path")
+    candidate_path = Path(raw)
+    windows = PureWindowsPath(raw)
+    if windows.drive or windows.is_absolute() or (os.sep != "\\" and "\\" in raw):
+        if not candidate_path.is_absolute():
+            raise PathBoundaryError("path must use canonical root-relative syntax")
+    if candidate_path.is_absolute():
+        try:
+            relative = candidate_path.relative_to(root_path)
+        except ValueError as error:
+            raise PathBoundaryError("path must remain inside repository root") from error
+    else:
+        relative = candidate_path
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise PathBoundaryError("path must not contain empty or dot segments")
+    resolved = resolve_under(root_path, relative)
+    return resolved.relative_to(root_path).as_posix()
+
+
+def load_project_document(root: Path, config_path: str | Path) -> tuple[ProjectDocument, Path]:
+    """Read the single canonical project document selected by --config."""
+    from .ledger import LedgerStore
+
+    root_path = _validated_root(root)
+    relative = canonical_repository_path(root_path, config_path)
+    selected = Path(*relative.split("/"))
+    if selected.name != "project.json":
+        raise ValueError("--config must name the canonical project.json document")
+    state_relative = selected.parent.as_posix()
+    if state_relative in {"", "."}:
+        raise ValueError("project state directory must be below repository root")
+    store = LedgerStore(root_path, root_path / selected.parent)
+    project = store.read_project()
+    if project is None:
+        raise FileNotFoundError("project configuration is not initialized")
+    if project.stateDir != state_relative:
+        raise ValueError("project stateDir does not match the canonical config parent")
+    return project, root_path / selected.parent
+
+
+def initialize_project_document(
+    root: Path,
+    *,
+    state_dir: str | Path,
+    config_path: str | Path,
+    config_was_explicit: bool,
+    git_mode: str,
+    targets: tuple[str, ...],
+) -> tuple[ProjectDocument, bool]:
+    """Create the authoritative project and initial state under one mutation lock."""
+    from dataclasses import replace
+
+    from .ledger import LedgerStore
+
+    root_path = _validated_root(root)
+    state_relative = canonical_repository_path(root_path, state_dir)
+    if config_was_explicit and canonical_repository_path(root_path, config_path) != f"{state_relative}/project.json":
+        raise ValueError("explicit --config must equal <state-dir>/project.json on init")
+    if git_mode not in {"auto", "head", "worktree", "no-git"}:
+        raise ValueError("invalid Git mode")
+    target_map = {target.targetId: target for target in default_targets(root_path)}
+    if not targets:
+        selected_targets = tuple(target_map.values())
+    else:
+        if len(set(targets)) != len(targets) or any(target_id not in target_map for target_id in targets):
+            raise ValueError("targets must be unique configured target IDs")
+        selected_targets = tuple(target_map[target_id] for target_id in targets)
+    for target in selected_targets:
+        path = target.livePath
+        if path == state_relative or path.startswith(state_relative + "/") or state_relative.startswith(path + "/"):
+            raise ValueError("state directory and live target paths must not overlap")
+    for index, first in enumerate(selected_targets):
+        for second in selected_targets[index + 1:]:
+            if first.livePath == second.livePath or first.livePath.startswith(second.livePath + "/") or second.livePath.startswith(first.livePath + "/"):
+                raise ValueError("configured live target paths must not overlap")
+    store = LedgerStore(root_path, root_path / Path(*state_relative.split("/")))
+    root_label = root_path.name or "repository"
+    with store.mutation():
+        store.require_no_unresolved_export()
+        existing = store.read_project()
+        state = store.read_state()
+        if existing is not None:
+            expected = replace(
+                existing, rootLabel=root_label, stateDir=state_relative, gitMode=git_mode,
+                scanPolicy=default_scan_policy(), claimPolicy=default_claim_policy(),
+                targets=selected_targets,
+            )
+            if existing != expected or state is None or state.projectId != existing.projectId:
+                raise ValueError("existing project state is incompatible with init options")
+            return existing, False
+        if state is not None:
+            raise ValueError("state exists without its project document")
+        known = {".lock"}
+        unknown = {
+            item.name for item in store.state_dir.iterdir()
+            if item.name not in known
+        }
+        if unknown:
+            raise ValueError("state directory contains unrecognized files")
+        project = ProjectDocument(
+            SCHEMA_VERSION, __version__, str(uuid.uuid4()), root_label, state_relative,
+            git_mode, default_scan_policy(), default_claim_policy(), selected_targets,
+        )
+        store.write_immutable("project.json", __import__("json").loads(canonical_json_bytes(project)))
+        store.read_state()
+        store.replace_state(ProjectState(
+            SCHEMA_VERSION, __version__, project.projectId, None, None, (), {}, None, None,
+        ))
+        return project, True
 
 
 def resolve_under(root: Path, candidate: Path) -> Path:

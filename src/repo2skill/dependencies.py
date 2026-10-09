@@ -28,6 +28,14 @@ class DependencyRecheckResult:
     findings: tuple[Finding, ...]
 
 
+class ActivationFreshnessError(ValueError):
+    """Final activation failed because the shared source recheck was not fresh."""
+
+    def __init__(self, result: DependencyRecheckResult):
+        self.result = result
+        super().__init__(f"source dependencies are {result.status}; activation was not performed")
+
+
 def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 

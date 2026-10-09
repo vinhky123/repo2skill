@@ -6,7 +6,7 @@ from dataclasses import replace
 
 from .claim_templates import format_claim_text, template_key_for
 from .dedup import deduplicate
-from .dependencies import recheck_dependencies
+from .dependencies import ActivationFreshnessError, recheck_dependencies
 from .ids import CanonicalIdContext, canonical_json_bytes, canonical_record_id, latest_by_id, revise_record
 from .ledger import LedgerStore
 from .models import (
@@ -260,6 +260,6 @@ def review_claims(
         root=store.root, current_root_label=current_root_label, excluded_paths=excluded_paths,
     )
     if freshness.status != "fresh":
-        raise ValueError(f"source dependencies are {freshness.status}; review stage was not activated")
+        raise ActivationFreshnessError(freshness)
     store.replace_state(new_state)
     return new_state, staged

@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import unicodedata
 
-from .dependencies import recheck_dependencies
+from .dependencies import ActivationFreshnessError, recheck_dependencies
 from .ids import canonical_json_bytes
 from .ledger import LedgerStore
 from .models import (
@@ -381,7 +381,7 @@ def stage_run(
         root=store.root, current_root_label=current_root_label, excluded_paths=excluded_paths,
     )
     if result.status != "fresh":
-        raise ValueError(f"source dependencies are {result.status}; run was not activated")
+        raise ActivationFreshnessError(result)
     accepted_revisions = dict(state.acceptedClaimRevisions)
     current_claim_ids = {claim.claimId for claim in run.claims}
     for claim_id in current_claim_ids:
