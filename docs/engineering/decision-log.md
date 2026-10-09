@@ -137,3 +137,23 @@ This log preserves every `Ruling:` line from the P0 local-generator progress led
 - Ruling: Include the full tests tree in the sdist with `MANIFEST.in` and verify representative extractor/integration tests and fixtures are present while Python bytecode is excluded — setuptools included top-level test modules but omitted fixture-dependent test packages and non-Python fixtures — cost: the source archive carries synthetic maintainer test assets; the runtime wheel is unchanged.
 
 - Ruling: Task 12 changes pyproject.toml only if release verification exposes a required metadata correction; otherwise the existing version, entry point, templates, notice and dependency metadata remain as verified by build/install smoke. Amend the task file list to make that conditional — the specification requires an installable alpha, not an arbitrary metadata edit, and MANIFEST.in already fixes the actual archive defect — cost if wrong: a missed metadata requirement must be added and the artifacts rebuilt; no unneeded project URL, authorship or license assertion is invented.
+
+- Ruling: Finish by retaining the local codex/p0-foundation branch and managed worktree; do not make completion depend on a new integration-choice question — the authorized scope is implementation and local review, and the user repeatedly requested continuous work — cost if wrong: the owner still chooses a later merge, push or publication step; no shared branch or external release is changed.
+
+- Ruling: Keep P1 Codex execution and measurement unavailable in P0 — the contracts explicitly defer provider and measurement implementations — cost if wrong: those features need separate P1 work rather than being silently implied.
+
+- Ruling: Keep whole-file Skill deletion unsupported and preserve/conflict on omission while retaining explicit AGENTS empty-block behavior — no P0 deletion-intent producer exists and the approved deletion scenario covers claim spans with other content retained — cost if wrong: final-file removal remains manual until an explicit intent API is designed.
+
+- Ruling: Keep per-file atomic export plus explicit journal recovery rather than global multi-file atomicity — that is the documented export guarantee — cost if wrong: users can observe an incomplete export before resume and must retain its journal.
+
+- Ruling: Explain reports recorded historical spans/hashes and does not read current live bytes; fix historical manifest selection while keeping current ownership checks in check — the output contract separates recorded provenance from current byte verification — cost if wrong: explain alone cannot prove live bytes still match and users must run check.
+
+- Ruling: Keep coverage fields in review show/report envelopes, but eliminate identical per-line capped metadata — those fields are required while duplicate rows add no new selector or locator information — cost if wrong: useful distinct records must not be merged by a too-coarse key; regress full-row/path-level preservation.
+
+- Ruling: Keep informational diagnostics on stderr with one JSON envelope on stdout — this is the existing CLI contract and does not corrupt JSON parsing — cost if wrong: callers seeking silence must handle stderr separately; no new quiet-mode promise is introduced.
+
+- Ruling: Retain Task12 E2E direct LedgerStore descriptor/manifest reads to verify physical stage/live hashes and spans — the invariant includes immutable persisted representation and the coupling is a nonblocking test-maintenance tradeoff — cost if wrong: schema changes require updating this characterization alongside unit tests.
+
+- Ruling: Retain all six hosted CI matrix cells as pending and version0.1.0 as unpublished — only Windows/Python3.13 local execution is evidenced — cost if wrong: platform defects remain unknown until actual CI and publication stays owner-controlled.
+
+- Ruling: Treat Task3 no-Git-spy concern as addressed by its later gate and the optional Task10 ambiguous-candidate direct-test gap as nonblocking — the ledger/review records no remaining required behavior change for either — cost if wrong: a future bug in that ambiguity path needs a focused regression; no exhaustive coverage is claimed.
