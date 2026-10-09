@@ -296,6 +296,10 @@ def decode_root_document(raw: dict[str, JsonValue], record_type: type[T]) -> T:
 def _merge_additive(
     old: JsonValue, new: JsonValue, *, field_name: str | None = None
 ) -> JsonValue:
+    # This is a complete claimId -> accepted revision projection, so omitted
+    # entries express revocation (for example when an accepted claim is contested).
+    if isinstance(old, dict) and isinstance(new, dict) and field_name == "acceptedClaimRevisions":
+        return new
     if isinstance(old, dict) and isinstance(new, dict):
         merged = dict(old)
         for key, value in new.items():
