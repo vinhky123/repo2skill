@@ -10,10 +10,10 @@ import pytest
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.dependencies import build_snapshot
 from repo2skill.identity import capture_repository
-from repo2skill.ids import canonical_json_bytes, effective_policy_revision
+from repo2skill.ids import canonical_json_bytes, canonical_record_id, effective_policy_revision
 from repo2skill.inventory import collect_inventory
 from repo2skill.ledger import LedgerStore
-from repo2skill.models import ProjectDocument, ProjectState, RunLedger
+from repo2skill.models import Claim, ProjectDocument, ProjectState, RunLedger
 from repo2skill.render import render_targets
 from repo2skill.stage import publish_stage_revision, read_stage_descriptor, stage_run
 
@@ -59,6 +59,15 @@ def _initialize(root: Path, project: ProjectDocument, *, current_run: str = OLD_
     return store
 
 
+def _claim(name: str, status: str, *, kind: str = "observed") -> Claim:
+    claim_id = canonical_record_id("claim", {"name": name})
+    fact_id = canonical_record_id("fact", {"name": name})
+    evidence_id = canonical_record_id("evidence", {"name": name})
+    return Claim(1, claim_id, 1, name, ".", {"text": name}, name, None, kind,
+                 "deterministic", (fact_id,), (evidence_id,), status, (), (),
+                 "snapshot_0123456789abcdef01234567")
+
+
 def test_stage_run_publishes_hashed_revision_then_activates_one_pointer(tmp_path: Path) -> None:
     project, run, bundle, identity, revision, exclusions, targets = _scenario(tmp_path)
     store = _initialize(tmp_path, project)
@@ -85,6 +94,57 @@ def test_stage_run_publishes_hashed_revision_then_activates_one_pointer(tmp_path
     assert not (tmp_path / ".agents").exists()
 
 
+def test_stage_run_seeds_accepted_projection_from_initial_render_and_clears_current_nonaccepted_ids(
+    tmp_path: Path,
+) -> None:
+    project, run, _empty_bundle, identity, revision, exclusions, targets = _scenario(tmp_path)
+    accepted = _claim("initial autoaccepted", "accepted")
+    dedup_suppressed = _claim("initial accepted but dedup suppressed", "accepted")
+    pending = _claim("initial pending", "pending", kind="inferred")
+    claims = (accepted, dedup_suppressed, pending)
+    run = replace(run, claims=claims)
+    # The second accepted run claim was suppressed by dedup and has no rendered span.
+    bundle = render_targets((accepted, pending), targets, policy=project.claimPolicy,
+                            project_id=project.projectId)
+    run = replace(run, stagedTargets={
+        target.targetId: {
+            "accepted": dict(target.exactHashes),
+            "preview": dict(target.previewHashes),
+        }
+        for target in bundle.targets
+    })
+    store = _initialize(tmp_path, project)
+    absent_history_id = canonical_record_id("claim", {"name": "absent history"})
+    with store.mutation():
+        store.replace_state(replace(
+            store.read_state(),
+            acceptedClaimRevisions={accepted.claimId: 7, dedup_suppressed.claimId: 6,
+                                    pending.claimId: 1, absent_history_id: 4},
+        ))
+
+    with store.mutation():
+        stage_run(bundle, run, store=store, current_identity=identity,
+                  current_root_label="repo", current_policy_revision=revision,
+                  current_extractor_versions={}, excluded_paths=exclusions,
+                  selected_specs=targets)
+
+    state = store.read_state()
+    assert state is not None
+    assert state.acceptedClaimRevisions == {
+        accepted.claimId: 1, dedup_suppressed.claimId: 1, absent_history_id: 4,
+    }
+    descriptor = read_stage_descriptor(store, RUN_ID, 1)
+    accepted_refs = {
+        reference
+        for target in descriptor["targets"].values()
+        for file_entry in target["accepted"].values()
+        for reference in file_entry["claimSpans"]
+    }
+    assert accepted_refs == {f"{accepted.claimId}@1"}
+    assert all(state.acceptedClaimRevisions.get(reference.rsplit("@", 1)[0]) == int(reference.rsplit("@", 1)[1])
+               for reference in accepted_refs)
+
+
 def test_spec_mismatch_leaves_the_active_pointer_unchanged(tmp_path: Path) -> None:
     project, run, bundle, identity, revision, exclusions, targets = _scenario(tmp_path)
     store = _initialize(tmp_path, project)
@@ -105,6 +165,8 @@ def test_freshness_failure_never_activates_published_initial_revision(tmp_path: 
     project, run, bundle, identity, revision, exclusions, targets = _scenario(tmp_path)
     store = _initialize(tmp_path, project)
 
+    before = store.read_state()
+    assert before is not None
     with store.mutation():
         with pytest.raises(ValueError, match="stale"):
             stage_run(bundle, run, store=store, current_identity=identity,
@@ -112,7 +174,7 @@ def test_freshness_failure_never_activates_published_initial_revision(tmp_path: 
                       current_extractor_versions={}, excluded_paths=exclusions,
                       selected_specs=targets)
 
-    assert store.read_state().currentRunId == OLD_RUN_ID  # type: ignore[union-attr]
+    assert store.read_state() == before
     assert store.read_run(RUN_ID) is not None
 
 

@@ -380,9 +380,17 @@ def stage_run(
     )
     if result.status != "fresh":
         raise ValueError(f"source dependencies are {result.status}; run was not activated")
+    accepted_revisions = dict(state.acceptedClaimRevisions)
+    current_claim_ids = {claim.claimId for claim in run.claims}
+    for claim_id in current_claim_ids:
+        accepted_revisions.pop(claim_id, None)
+    accepted_revisions.update({
+        claim.claimId: claim.claimRevision
+        for claim in run.claims if claim.proposalStatus == "accepted"
+    })
     store.replace_state(ProjectState(
         state.schemaVersion, state.toolVersion, state.projectId, run.runId, 1,
-        state.reviewEvents, state.acceptedClaimRevisions,
+        state.reviewEvents, accepted_revisions,
         state.activeExportId, state.activeManifestSetId,
     ))
     return staged
