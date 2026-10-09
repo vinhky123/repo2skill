@@ -93,28 +93,27 @@ def _claim_revision_index(claims: Sequence[Claim]) -> dict[tuple[str, int], Clai
 def _effective_review_claims(state: ProjectState, run: RunLedger) -> tuple[Claim, ...]:
     """Apply persisted dispositions transiently, without changing the immutable run."""
     validated = validate_claims(run.claims, run)
-    valid_by_ref = {(claim.claimId, claim.claimRevision): claim for claim in validated.validClaims}
-    status_by_ref = {reference: claim.proposalStatus for reference, claim in valid_by_ref.items()}
+    return apply_review_dispositions(validated.validClaims, state)
 
-    # The accepted-revision projection also carries initial observed auto-accepts,
-    # which do not necessarily have a ReviewEvent.
-    for reference, claim in valid_by_ref.items():
+
+def apply_review_dispositions(claims: Sequence[Claim], state: ProjectState) -> tuple[Claim, ...]:
+    """Overlay persisted dispositions onto caller-validated exact claim revisions."""
+    statuses: dict[tuple[str, int], str] = {}
+    for claim in claims:
+        reference = (claim.claimId, claim.claimRevision)
+        if reference in statuses:
+            raise ValueError(f"duplicate validated claim revision: {claim.claimId}@{claim.claimRevision}")
+        statuses[reference] = claim.proposalStatus
         if state.acceptedClaimRevisions.get(claim.claimId) == claim.claimRevision:
-            status_by_ref[reference] = "accepted"
-
+            statuses[reference] = "accepted"
     for event in state.reviewEvents:
         reference = (event.claimId, event.claimRevision)
-        if reference not in status_by_ref:
-            continue
-        status_by_ref[reference] = {
-            "accept": "accepted", "reject": "rejected", "contest": "contested",
-        }[event.action]
-
-    effective = tuple(
-        replace(claim, proposalStatus=status_by_ref[(claim.claimId, claim.claimRevision)])
-        for claim in validated.validClaims
+        if reference in statuses:
+            statuses[reference] = {"accept": "accepted", "reject": "rejected", "contest": "contested"}[event.action]
+    return tuple(
+        replace(claim, proposalStatus=statuses[(claim.claimId, claim.claimRevision)])
+        for claim in claims
     )
-    return effective
 
 
 def _validate_review_batch(
