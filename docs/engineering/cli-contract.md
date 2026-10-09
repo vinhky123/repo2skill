@@ -10,6 +10,8 @@ This is the command-line contract for the planned repo2skill MVP. The examples a
 
 The executable form is `repo2skill`. All commands accept `--root PATH` (default: current directory), `--config PATH` (default: `<root>/.repo2skill/project.json`), `--format text|json` (default: `text`), and `--quiet` (default: false). Paths printed in JSON are normalized repository-relative paths unless a field explicitly says it is absolute. `--quiet` suppresses successful human summaries, never diagnostics or JSON.
 
+There is one authoritative project document at `<stateDir>/project.json`. `--config` selects that document; an explicit path may be absolute or root-relative, but must resolve canonically inside `--root`, and the decoded document's `stateDir` must identify the document's parent. On `init`, omitting `--config` uses `<root>/.repo2skill/project.json`, except that a custom `--state-dir` selects `<root>/<state-dir>/project.json`. If `--config` is explicit on `init`, it must resolve to `<stateDir>/project.json`; a mismatch is an invocation/configuration error before writes. For a custom state directory, pass its project document on later invocations, for example `repo2skill --config .cache/repo2skill/project.json scan`. No duplicate project documents or config synchronization are supported.
+
 Every mutating invocation acquires the project's OS-owned exclusive state lock before reading authoritative mutable state and holds it through its pointer commit or journal update. Lock contention fails immediately with exit 1 and performs no write. Scan/generate activation, review, export, and `export --resume` use the same lock, so concurrent writers cannot lose a state update.
 
 Global `--version` and `--help` exit 0. Unknown commands/options, mutually exclusive options, missing operands, invalid enum values, and unreadable explicit config paths are invocation errors.
@@ -24,7 +26,7 @@ repo2skill init [--git-mode auto|head|worktree|no-git]
                 [--state-dir PATH]
 ```
 
-Creates the state directory and `project.json`; it does not scan or create live outputs. Defaults are `--git-mode auto`, both targets, and `<root>/.repo2skill`. A state directory and output target must resolve inside the repository root. Re-running with an identical compatible project returns 0. Existing incompatible state, a project UUID mismatch, or nonempty unrecognized state returns 1 and writes nothing.
+Creates the state directory and its authoritative `project.json`; it does not scan or create live outputs. Defaults are `--git-mode auto`, both targets, and `<root>/.repo2skill`. A state directory and output target must resolve inside the repository root. Re-running with an identical compatible project returns 0. Existing incompatible state, a project UUID mismatch, or nonempty unrecognized state returns 1 and writes nothing. With `--state-dir .cache/repo2skill`, initialize with `repo2skill init --state-dir .cache/repo2skill`, then use `--config .cache/repo2skill/project.json` on later commands. An explicit `--config` on init must resolve to that same state directory's `project.json`.
 
 `auto` records current worktree content. `head` requires a clean Git worktree. `worktree` requires Git but permits dirty/untracked inputs. `no-git` forbids using Git identity even if present. Outside Git, `auto` selects no-Git mode.
 
@@ -52,7 +54,11 @@ Runs scan unless `--from-run` names a compatible completed scan, derives and val
 
 No-AI is the default. `--no-ai` is accepted as an explicit assertion and cannot be combined with any Codex option. `--ai codex` is a P1 explicit opt-in. It requires a successful installed-capability probe, prints the fact/claim counts, payload bytes, estimated input/context, and estimated output before invocation, and requires interactive confirmation unless `--yes-ai` is supplied. `--yes-ai` consents only to the displayed EvidencePack for this invocation; it is invalid without `--ai codex`. `--codex-config NAME` selects a pre-existing official Codex CLI configuration. There is no `--model`, provider, credential, arbitrary argument, or shell-command option.
 
+P0 Task 11 implements the P1 option grammar without a provider: valid explicit `generate --ai codex` and `doctor --codex` requests return an unavailable-capability result with exit 6 before mutation. Invalid Codex option combinations remain invocation errors with exit 1. The P1 capability and transport behavior described above remains future behavior; this P0 unavailable result does not claim that a capability probe occurred.
+
 `--measure` is a P1 pilot opt-in and appends one local JSONL record to `.repo2skill/pilot-measurements.jsonl`. The allowlist is schema/tool version, OS family, Git mode, AI/no-AI mode, target kinds, inventory/fact/claim/diagnostic/coverage counts, stage byte counts, phase durations, final status, and exit code. It contains no repository/source path, project or claim ID, branch/commit, URL, command text, fact value, evidence snippet, error text, or secret. It never transmits the file. Without this flag no pilot measurement is written.
+
+P0 Task 11 recognizes `--measure` but returns an unavailable-invocation error with exit 1 before mutation; it writes no measurement. The local P1 pilot behavior above remains future behavior.
 
 Successful staging with only accepted claims exits 0. A valid stage containing pending proposals exits 3. Coverage failure exits 2. Codex unavailable, declined, timed out, nonzero, malformed, or schema-invalid exits 6 and does not fall back silently; the user can rerun explicitly with `--no-ai`. JSON output includes `runId`, `snapshotId`, stage paths and hashes, counts by claim status/kind/origin, diagnostics, dedup counts, coverage, and `nextActions`.
 
