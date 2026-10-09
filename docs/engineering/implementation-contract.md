@@ -297,6 +297,10 @@ def stage_run(
 def review_claims(
     state: ProjectState, run: RunLedger, events: Sequence[ReviewEvent],
     specs: Sequence[TargetSpec], *, store: LedgerStore,
+    current_identity: RepositoryIdentity, current_root_label: str,
+    current_policy_revision: str,
+    current_extractor_versions: Mapping[str, str],
+    excluded_paths: Sequence[RepositoryPath],
 ) -> tuple[ProjectState, StagedRun]: ...
 
 def export_staged(

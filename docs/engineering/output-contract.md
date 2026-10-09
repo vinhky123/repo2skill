@@ -39,7 +39,7 @@ P0 claim templates are a pure allowlist in `src/repo2skill/claim_templates.py`, 
 
 ## Task 7 — deterministic rendering and initial stage
 
-Retain the positional `specs` parameter and add policy explicitly:
+Retain the positional `specs` parameter; pass policy and all rendering identity context explicitly:
 
 ```python
 def render_targets(
@@ -47,10 +47,23 @@ def render_targets(
     specs: Sequence[TargetSpec],
     *,
     policy: ClaimPolicy,
+    project_id: str,
+    id_context: CanonicalIdContext | None = None,
 ) -> RenderBundle: ...
 ```
 
-The caller passes review-effective valid `renderableClaims`, `run.effectiveClaimPolicy`, and an explicit subset of configured specs. Process claims in canonical design order, considering accepted claims first. For each target and each mode, `renderBudget` caps the sum of UTF-8 byte lengths of every output file, ordered by output repository path. Count templates, markers, labels, companions, and newlines. Accepted and preview budgets are independent. Preview starts with exactly accepted content that fit, then adds visibly labelled pending inferred claims in canonical order while space remains. Pending content never enters `relativeFiles`; rejected, contested, invalid, or dedup-suppressed claims enter neither mapping. Each omitted-for-budget claim has a stable diagnostic naming claim and target IDs.
+The caller passes review-effective valid `renderableClaims`, `run.effectiveClaimPolicy`, the explicit project ID, an optional shared `CanonicalIdContext`, and an explicit subset of configured specs. `project_id` is required; rendering reads no project/store/cwd state. When `id_context` is omitted, rendering uses a fresh per-call context. Process claims in canonical design order, considering accepted claims first. For each target and each mode, `renderBudget` caps the sum of UTF-8 byte lengths of every output file, ordered by output repository path. Count templates, markers, labels, companions, and newlines. Accepted and preview budgets are independent. Preview starts with exactly accepted content that fit, then adds visibly labelled pending inferred claims in canonical order while space remains. Pending content never enters `relativeFiles`; rejected, contested, invalid, or dedup-suppressed claims enter neither mapping. Each omitted-for-budget claim has a stable diagnostic naming claim and target IDs.
+
+A managed `agents-md` target has exactly one fixed `repository-guide` block. Its marker grammar is:
+
+```text
+<!-- repo2skill:begin project=<projectId> block=<blockId> -->
+<!-- repo2skill:end project=<projectId> block=<blockId> -->
+```
+
+Derive `blockId` from the canonical `managed-block` identity containing exactly `projectId`, `targetId`, and fixed `sectionKey="repository-guide"`, allocated through the supplied collision context. The ID is independent of claims, revisions, ordering, and rendered bytes. Marker formatting/parsing are pure helpers reusable by ownership/export; malformed, duplicate, or mismatched pairs fail closed.
+
+A `skill` target emits concise `SKILL.md` and deterministic `repo2skill-provenance.json`. The companion contains stable claim revision references plus their sorted fact/evidence IDs only; it carries no source blobs, run/stage IDs, timestamps, or self-hash. It is generated from the same accepted or preview selection as the content. `stage.json` remains authoritative for exact hashes and spans. The companion's bytes count toward the per-target accepted/preview budget, and its key is a full repository-relative output path.
 
 `RenderedTarget.relativeFiles` / `exactHashes` / `claimSpans` are accepted-only canonical UTF-8/LF output; preview counterparts may contain visibly labelled pending content. File keys in every bytes/hash/spans triplet are normalized `/` paths relative to the repository root, including the full target output path (for example `AGENTS.md` or `.agents/skills/foo/SKILL.md`). They are never paths relative to the target directory. Spans use `<claimId>@<claimRevision>` and identify content in that exact file. Hashes are SHA-256 of exact bytes. Path rules are those of R6.
 
@@ -82,7 +95,7 @@ def stage_run(
 ) -> StagedRun: ...
 ```
 
-The caller holds `store.mutation()` from authoritative reads through activation; the operation does not lock a second time. This is an initial-generation operation: under the lock, require that the new run ID/path is absent, rather than comparing the not-yet-persisted run with a nonexistent authoritative record. Verify that selected specs exactly match configured target entries by ID, bundle target IDs equal the selection, `run.stagedTargets` equals the bundle's accepted/preview path/hash projection, each hash/span mapping has matching keys, every span reference resolves to an exact revision in `run.claims`, and accepted spans reference only accepted render-selection claims. Verify output paths and enforce the effective run byte limit independently. Since `RenderBundle` stores no policy identity, the controller must pass `run.effectiveClaimPolicy` to rendering; stage cannot reconstruct the renderer policy or selected specs from the bundle.
+The caller holds `store.mutation()` from authoritative reads through activation; the operation does not lock a second time. This is an initial-generation operation: under the lock, require that the new run ID/path is absent, rather than comparing the not-yet-persisted run with a nonexistent authoritative record. Verify that selected specs exactly match configured target entries by ID, bundle target IDs equal the selection, `run.stagedTargets` equals the bundle's accepted/preview path/hash projection, each hash/span mapping has matching keys, every span reference resolves to an exact revision in `run.claims`, and accepted spans reference only accepted render-selection claims. Verify output paths and enforce the effective run byte limit independently. Configuration validation and the stage publication boundary reject target outputs that escape, equal, contain, or are contained by `stateDir`; duplicate or overlapping output paths after canonical normalization also fail closed. Verify paths before writing immutable artifacts. Since `RenderBundle` stores no policy identity, the controller must pass `run.effectiveClaimPolicy` to rendering; stage cannot reconstruct the renderer policy or selected specs from the bundle.
 
 Publish the immutable run and stage artifacts under temporary names and atomically rename them into place. The immutable stage revision starts at 1; never replace an existing revision. Runtime `StagedRun.stageRoot` is `<store.state_dir>/staging/<runId>/r1`. Place target bytes at `targets/<targetId>/<accepted|preview>/<full-output-repository-path>`; the full output path is preserved under the physical stage mode directory. `StagedRun.targetHashes` and `previewTargetHashes` map target IDs to full output repository-relative paths and hashes. Persisted stage locations are normalized repository-relative `/` paths beneath `stateDir`, including the configured `stateDir` prefix, as required by R6. Recheck immediately before changing the single `ProjectState` pointer; if activation fails, immutable run/stage artifacts may remain as inactive orphans.
 
@@ -110,9 +123,20 @@ Immediately before activation call the only `recheck_dependencies` implementatio
 
 ## Task 8 — review a persisted run
 
-`review_claims` reads authoritative state and run through the same locked store and rejects stale supplied records. Validate the complete event batch before publishing any change. Accept/reject apply only to pending exact claim revisions; contest may apply to pending or accepted revisions; reject/contest require reasons. The state records event history and accepted revisions. For rerendering, overlay state on valid run candidates by exact `(claimId, claimRevision)` transiently, then deduplicate/render using the run's effective claim policy and the explicit selected configured specs. Do not mutate the immutable run or compare a later stage against its initial `stagedTargets`.
+```python
+def review_claims(
+    state: ProjectState, run: RunLedger, events: Sequence[ReviewEvent],
+    specs: Sequence[TargetSpec], *, store: LedgerStore,
+    current_identity: RepositoryIdentity, current_root_label: str,
+    current_policy_revision: str,
+    current_extractor_versions: Mapping[str, str],
+    excluded_paths: Sequence[RepositoryPath],
+) -> tuple[ProjectState, StagedRun]: ...
+```
 
-Use the same immutable stage publisher through a separate review path, not a review flag on `stage_run`. Allocate the next unused positive revision for the run, store its own `stage.json` and files, validate all descriptors/hashes, then update `ProjectState.reviewEvents`, `acceptedClaimRevisions`, and `activeStageRevision` in one pointer replacement. A failed validation/publish leaves the previous state pointer active. The new descriptor is authoritative for that revision's target specs, paths, hashes, and spans.
+`review_claims` reads authoritative state and run through the same locked store and rejects stale supplied records. The caller holds the mutation and supplies current identity, root label, policy revision, extractor versions, and exclusions explicitly; review invokes the shared dependency recheck immediately before pointer activation and performs no hidden project/config read or second freshness algorithm. Validate the complete event batch before publishing any change. Accept/reject apply only to pending exact claim revisions; contest may apply to pending or accepted revisions; reject/contest require reasons. The state records event history and accepted revisions. For rerendering, overlay state on valid run candidates by exact `(claimId, claimRevision)` transiently, then deduplicate/render using the run's effective claim policy and the explicit selected configured specs. Do not mutate the immutable run or compare a later stage against its initial `stagedTargets`.
+
+Use the shared immutable stage publisher and descriptor reader through a separate review path, not a review flag on `stage_run`. Task 7 owns them in `src/repo2skill/stage.py`, separate from pure formatting in `render.py`. Minimal immutable-byte LedgerStore reads/writes are allowed because the existing immutable writer handles JSON only; choose the smallest operations that fit the current store. Do not introduce a general storage framework or domain fields. Allocate the next unused positive revision for the run, store its own `stage.json` and files, validate all descriptors/hashes, then update `ProjectState.reviewEvents`, `acceptedClaimRevisions`, and `activeStageRevision` in one pointer replacement. A failed validation/publish leaves the previous state pointer active. The new descriptor is authoritative for that revision's target specs, paths, hashes, and spans.
 
 ## Task 9 — export from the active immutable stage
 
