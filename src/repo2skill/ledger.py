@@ -155,11 +155,13 @@ def _acquire_project_lock_at(root: Path, state_parts: tuple[str, ...]) -> Iterat
 
 
 def _load_json(path: Path) -> dict[str, JsonValue]:
-    _reject_redirected_ancestors(path)
-    if path.is_symlink() or (path.exists() and _is_redirect(path)):
-        raise ValueError(f"persisted document must not be redirected: {path}")
-    with path.open("r", encoding="utf-8", newline="") as stream:
-        value = json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"non-finite JSON number: {value}")))
+    payload = store_io.read_file_path(path)
+    value = json.loads(
+        payload.decode("utf-8"),
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"non-finite JSON number: {value}")
+        ),
+    )
     validate_json_value(value)
     if not isinstance(value, dict):
         raise ValueError("persisted root document must be a JSON object")

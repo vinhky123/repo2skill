@@ -17,6 +17,7 @@ from repo2skill.inventory import collect_inventory
 from repo2skill.ledger import LedgerStore, encode_record
 from repo2skill.models import ExportJournal, ProjectState
 from repo2skill.models import RunLedger
+from repo2skill.safe_fs import GuardedDirectory
 
 
 def _make_directory_link(link: Path, target: Path) -> bool:
@@ -222,3 +223,40 @@ def test_list_run_ids_reads_each_run_under_its_guarded_directory(
     monkeypatch.setattr(ledger, "_reject_redirected_ancestors", validate_then_swap)
     assert store.list_run_ids() == (run_id,)
     assert not swapped
+
+
+def test_load_json_reads_from_the_checked_parent_after_junction_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    runs = root / ".repo2skill" / "runs"
+    runs.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    document = runs / "document.json"
+    document.write_text('{"source":"inside"}', encoding="utf-8")
+    (outside / document.name).write_text('{"source":"outside"}', encoding="utf-8")
+    original_open_file = GuardedDirectory.open_file
+    attempted_swap = False
+    swapped = False
+
+    def swap_before_guarded_open(parent: GuardedDirectory, name: str):
+        nonlocal attempted_swap, swapped
+        if parent.path == runs and name == document.name and not attempted_swap:
+            attempted_swap = True
+            try:
+                runs.rename(runs.parent / "runs-parked")
+            except OSError:
+                # The retained Windows directory handle denies delete sharing.
+                pass
+            else:
+                if not _make_directory_link(runs, outside):
+                    pytest.skip("directory symlink or junction unavailable")
+                swapped = True
+        return original_open_file(parent, name)
+
+    monkeypatch.setattr(GuardedDirectory, "open_file", swap_before_guarded_open)
+
+    assert ledger._load_json(document) == {"source": "inside"}
+    assert attempted_swap
+    assert (not swapped) or (runs / document.name).read_text(encoding="utf-8") == '{"source":"outside"}'

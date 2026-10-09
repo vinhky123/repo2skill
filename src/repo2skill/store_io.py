@@ -257,6 +257,18 @@ def replace_json_path(path: Path, document: JsonValue) -> None:
     replace_json(root, parts, leaf, document)
 
 
+def read_file_path(path: Path) -> bytes:
+    """Read a file through retained guards from its filesystem anchor to its parent."""
+    root, parts, leaf = _path_parent(path)
+    with guarded_parent(root, parts) as parent:
+        with parent.open_file(leaf) as opened:
+            size = opened.stat_before.st_size
+            payload = opened.read_bounded(size)
+            if len(payload) != size or not opened.stable_after_read():
+                raise UnsafePathError("guarded file changed while being read")
+            return payload
+
+
 @contextmanager
 def lock_file(root: Path, directory_parts: tuple[str, ...]) -> Iterator[Any]:
     with guarded_parent(root, directory_parts) as parent:
