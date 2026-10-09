@@ -23,3 +23,23 @@ def test_go_mod_without_supported_module_directive_is_visible_as_invalid(run_eco
     )
     assert any(item.reasonCode == "parse-invalid" and item.status == "invalid" for item in batch.coverage)
     assert not any(item.value.get("category") == "ecosystem" for item in batch.facts)
+
+
+def test_unsupported_go_directive_has_visible_partial_coverage(run_ecosystem_fixture):
+    def add_replace(root):
+        path = root / "go.mod"
+        path.write_text(path.read_text(encoding="utf-8") + "replace example.invalid/old => example.invalid/new v1.0.0\n", encoding="utf-8")
+
+    batch = run_ecosystem_fixture("go", mutate=add_replace)
+    assert any(item.status == "unsupported" and item.reasonCode == "go-mod-unsupported-directive" for item in batch.coverage)
+    single = next(item for item in batch.facts if item.value.get("category") == "single-test.v1")
+    assert single.derivation == "template"
+    assert single.semanticKey == "command.invocation:single-test.v1:go:one-test"
+
+
+def test_malformed_recognized_go_directive_is_invalid_not_ignored(run_ecosystem_fixture):
+    batch = run_ecosystem_fixture(
+        "go", mutate=lambda root: (root / "go.mod").write_text("module example.invalid/fixture\ngo nope\n", encoding="utf-8")
+    )
+    assert any(item.status == "invalid" and item.reasonCode == "go-mod-unsupported-syntax" for item in batch.coverage)
+    assert not any(item.value.get("category") == "ecosystem" for item in batch.facts)

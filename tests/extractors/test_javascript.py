@@ -1,4 +1,5 @@
 from importlib.util import find_spec
+import json
 
 
 def test_javascript_literals_manager_invocations_and_source_convention(run_ecosystem_fixture):
@@ -64,3 +65,30 @@ def test_invalid_package_json_is_visible_as_invalid_coverage(run_ecosystem_fixtu
     )
     assert any(item.reasonCode == "parse-invalid" and item.status == "invalid" for item in batch.coverage)
     assert not any(item.value.get("category") == "ecosystem" for item in batch.facts)
+
+
+def test_dynamic_manifest_keys_are_json_pointer_escaped(run_ecosystem_fixture, tmp_path):
+    def add_special_keys(root):
+        path = root / "package.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["devDependencies"]["@scope/pkg~name"] = "1.2.3"
+        document["scripts"]["test/path~unit"] = "node --test"
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    batch = run_ecosystem_fixture("javascript", mutate=add_special_keys)
+    dependency = next(item for item in batch.facts if item.value.get("name") == "@scope/pkg~name@1.2.3")
+    dependency_evidence = next(item for item in batch.evidence if item.evidenceId in dependency.evidenceIds)
+    assert dependency_evidence.locator.value == "/devDependencies/@scope~1pkg~0name"
+    manifest = json.loads((tmp_path / "javascript/package.json").read_text(encoding="utf-8"))
+    script = next(item for item in batch.facts if item.factType == "task.definition" and item.value.get("name") == "test/path~unit")
+    script_evidence = next(item for item in batch.evidence if item.evidenceId in script.evidenceIds)
+    assert script_evidence.locator.value == "/scripts/test~1path~0unit"
+
+    def resolve(pointer):
+        value = manifest
+        for segment in pointer[1:].split("/"):
+            value = value[segment.replace("~1", "/").replace("~0", "~")]
+        return value
+
+    assert resolve(dependency_evidence.locator.value) == "1.2.3"
+    assert resolve(script_evidence.locator.value) == "node --test"

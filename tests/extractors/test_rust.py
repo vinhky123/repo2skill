@@ -16,6 +16,8 @@ def test_rust_package_commands_and_test_directory_convention(run_ecosystem_fixtu
         {"category": "single-test.v1", "argv": ["cargo", "test", "<test_name>"]},
     ):
         assert any(item.value == value and item.derivation == "template" for item in batch.facts)
+    single = next(item for item in batch.facts if item.value.get("category") == "single-test.v1")
+    assert single.semanticKey == "command.invocation:single-test.v1:cargo:one-test"
     convention = next(item for item in batch.facts if item.value.get("name") == "integration-tests-directory")
     assert convention.derivation == "heuristic"
     assert any(item.selector.value == "tests/smoke.rs" and item.outcome == "present" for item in batch.reads)

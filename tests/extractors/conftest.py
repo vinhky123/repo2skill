@@ -54,7 +54,7 @@ def run_ecosystem_fixture(tmp_path: Path):
                 assert dependency.outcome == "present"
                 assert dependency.contentHash == evidence.contentHash
         if with_snapshot:
-            versions = {"javascript": "1.0", "python": "1.0", "go": "1.0", "rust": "1.0", "inventory": INVENTORY_VERSION}
+            versions = {"javascript": "1.1", "python": "1.0", "go": "1.1", "rust": "1.1", "inventory": INVENTORY_VERSION}
             snapshot = build_snapshot(snapshot_id, identity, inventory, versions, batch.reads,
                                       policy_revision="sha256:" + "0" * 64, root_label=name)
             return batch, snapshot

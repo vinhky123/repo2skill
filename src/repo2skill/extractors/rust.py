@@ -11,9 +11,9 @@ from .parsing import parse_selected
 
 class RustExtractor:
     extractor_id = "rust"
-    version = "1.0"
+    version = "1.1"
     rule_id = "rust.cargo"
-    rule_version = "rust-shallow-v1"
+    rule_version = "rust-shallow-v2"
 
     def __init__(self, session: ExtractionSession):
         self.session = session
@@ -56,7 +56,7 @@ class RustExtractor:
                                ("single-test.v1", ["cargo", "test", "<test_name>"])):
             record_fact(self.session, extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version,
                         result=cargo, path="Cargo.toml", fact_type="command.invocation",
-                        semantic_key=f"command.invocation:{category}:cargo:repo-root",
+                        semantic_key=f"command.invocation:{category}:cargo:{'one-test' if category == 'single-test.v1' else 'repo-root'}",
                         value={"category": category, "argv": argv}, derivation="template", locator=package_locator)
         for path in (test_glob.dependency.matchPaths if test_glob else ()):
             result = results.get(path)

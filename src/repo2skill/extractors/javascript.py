@@ -14,8 +14,9 @@ _LOCKS = (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun")
 _SOURCE_PATTERNS = ("**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx")
 
 
-def _pointer(value: str) -> EvidenceLocator:
-    return EvidenceLocator("json-pointer", value, None)
+def _pointer(*segments: str) -> EvidenceLocator:
+    escaped = (segment.replace("~", "~0").replace("/", "~1") for segment in segments)
+    return EvidenceLocator("json-pointer", "/" + "/".join(escaped), None)
 
 
 def _argv_for_script(manager: str, name: str) -> list[str]:
@@ -39,9 +40,9 @@ def _command_category(name: str) -> str | None:
 
 class JavaScriptExtractor:
     extractor_id = "javascript"
-    version = "1.0"
+    version = "1.1"
     rule_id = "javascript.package"
-    rule_version = "javascript-shallow-v1"
+    rule_version = "javascript-shallow-v2"
 
     def __init__(self, session: ExtractionSession):
         self.session = session
@@ -65,7 +66,7 @@ class JavaScriptExtractor:
         if not isinstance(document, dict) or manifest is None:
             return finish(reads)
 
-        presence_locator = _pointer("/scripts" if isinstance(document.get("scripts"), dict) else "/name")
+        presence_locator = _pointer("scripts" if isinstance(document.get("scripts"), dict) else "name")
         record_fact(self.session, extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version,
                     result=manifest, path="package.json", fact_type="artifact.presence",
                     semantic_key="artifact.presence:ecosystem:javascript:package.json",
@@ -79,7 +80,7 @@ class JavaScriptExtractor:
         declared = document.get("packageManager")
         if isinstance(declared, str) and "@" in declared:
             manager_name = declared.split("@", 1)[0]
-            manager_pointer = _pointer("/packageManager")
+            manager_pointer = _pointer("packageManager")
             manager_derivation = "observed"
             record_fact(self.session, extractor_id=self.extractor_id, rule_id=self.rule_id, rule_version=self.rule_version,
                         result=manifest, path="package.json", fact_type="artifact.presence",
@@ -112,7 +113,7 @@ class JavaScriptExtractor:
             manager_name = "npm"
             manager_path = "package.json"
             manager_derivation = "template"
-            manager_pointer = _pointer("/scripts")
+            manager_pointer = _pointer("scripts")
 
         name = document.get("name")
         version = document.get("version")
@@ -122,7 +123,7 @@ class JavaScriptExtractor:
                         result=manifest, path="package.json", fact_type="artifact.presence",
                         semantic_key="artifact.presence:package.v1:package.json",
                         value={"category": "package.v1", "name": identity, "path": "package.json"},
-                        derivation="observed", locator=_pointer("/name"))
+                        derivation="observed", locator=_pointer("name"))
         engines = document.get("engines")
         if isinstance(engines, dict):
             for runtime, runtime_range in sorted(engines.items()):
@@ -131,7 +132,7 @@ class JavaScriptExtractor:
                                 result=manifest, path="package.json", fact_type="artifact.presence",
                                 semantic_key=f"artifact.presence:runtime.v1:{runtime}:package.json",
                                 value={"category": "runtime.v1", "name": f"{runtime}{runtime_range}", "path": "package.json"},
-                                derivation="observed", locator=_pointer(f"/engines/{runtime}"))
+                                derivation="observed", locator=_pointer("engines", runtime))
 
         scripts = document.get("scripts")
         if isinstance(scripts, dict):
@@ -140,7 +141,7 @@ class JavaScriptExtractor:
                     continue
                 body = self.session._bounded_text(body)
                 semantic_key = f"task.definition:package-script.v1:repo-root:{script_name}"
-                locator = _pointer(f"/scripts/{script_name}")
+                locator = _pointer("scripts", script_name)
                 evidence_identity = {"repository": self.session.repository_id, "path": "package.json", "locator": locator, "semanticKey": semantic_key}
                 if not self.session.reserve_fact_text(body, rule_id=self.rule_id, fact_type="task.definition", scope=".",
                                                      semantic_key=semantic_key,
@@ -174,7 +175,7 @@ class JavaScriptExtractor:
                         result=manifest, path="package.json", fact_type="artifact.presence",
                         semantic_key=f"artifact.presence:dependency.v1:{package}:package.json",
                         value={"category": "dependency.v1", "name": f"{package}@{package_version}", "path": "package.json"},
-                        derivation="observed", locator=_pointer(f"/{section}/{package}"))
+                        derivation="observed", locator=_pointer(section, package))
         runner = next((candidate for candidate in ("vitest", "jest", "mocha") if candidate in dependencies), None)
         if runner:
             _, section = dependencies[runner]
@@ -186,7 +187,7 @@ class JavaScriptExtractor:
                         result=manifest, path="package.json", fact_type="command.invocation",
                         semantic_key=f"command.invocation:single-test.v1:{manager_name}:one-test",
                         value={"category": "single-test.v1", "argv": args},
-                        derivation="template", locator=_pointer(f"/{section}/{runner}"))
+                        derivation="template", locator=_pointer(section, runner))
 
         if source_results:
             source_paths = sorted({path for item in source_results for path in item.dependency.matchPaths})
