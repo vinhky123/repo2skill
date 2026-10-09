@@ -57,9 +57,14 @@ def test_documentation_change_affects_dedup_candidates_without_fact_link(tmp_pat
             excluded_paths=(), control_observations=controls) as session:
         read = session.bind("docs", "1", "docs.normalized-line", "1").read(InputSelector("file", "README.md", ".", True)).dependency
     claim_id = canonical_record_id("claim", {"test": "claim"})
-    evidence_id = canonical_record_id("evidence", {"test": "evidence"})
+    locator = EvidenceLocator("line-range", [1, 1], 1)
+    semantic_key = "documentation-line:A useful sentence."
+    evidence_id = canonical_record_id("evidence", {
+        "repository": identity.repositoryId, "path": "README.md", "locator": locator,
+        "semanticKey": semantic_key,
+    })
     claim = Claim(1, claim_id, 1, "claim", ".", {"text": "A claim"}, "A claim", None, "observed", "deterministic", (), (), "pending", (), (), "snapshot_222222222222222222222222")
-    evidence = Evidence(1, evidence_id, 1, read.snapshotId, "README.md", read.contentHash, "documentation-line:A useful sentence.", "text/markdown", "utf-8-sig", EvidenceLocator("line-range", [1, 1], 1), "A useful sentence.", "available")
+    evidence = Evidence(1, evidence_id, 1, read.snapshotId, "README.md", read.contentHash, semantic_key, "text/markdown", "utf-8-sig", locator, "A useful sentence.", "available")
     policy_revision = effective_policy_revision(policy, default_claim_policy(), (), generation_options={})
     snapshot = build_snapshot(read.snapshotId, identity, inventory, {"docs": "1"}, [read], policy_revision=policy_revision, root_label="repo")
     decision = DedupDecision(1, canonical_record_id("decision", {"test": "dedup"}), read.snapshotId, (claim_id,), (), (evidence_id,), "dedup.docs", "1", "suppress", "documented")
