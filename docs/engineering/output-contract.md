@@ -1,6 +1,6 @@
 # P0 output and claim lifecycle contract
 
-**Status:** normative supplement for P0-06 through P0-09. This document supplements `docs/engineering/implementation-contract.md`, `docs/engineering/input-contract.md`, and the MVP design. Where its corrected signatures or lifecycle rules differ from older task briefs/design sketches, this contract governs. It retains the frozen persisted dataclass fields; the `stage.json` descriptor is a versioned immutable stage artifact, not a new field on `RunLedger`, `ProjectState`, or `StagedRun`.
+**Status:** normative supplement for P0-06 through P0-10. This document supplements `docs/engineering/implementation-contract.md`, `docs/engineering/input-contract.md`, and the MVP design. Where its corrected signatures or lifecycle rules differ from older task briefs/design sketches, this contract governs. It retains the frozen persisted dataclass fields; the `stage.json` descriptor is a versioned immutable stage artifact, not a new field on `RunLedger`, `ProjectState`, or `StagedRun`.
 
 ## Task 6 — claim derivation, validation, and deduplication
 
