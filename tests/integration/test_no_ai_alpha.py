@@ -7,6 +7,7 @@ import shutil
 import socket
 
 from repo2skill.cli import main
+from repo2skill.ledger import LedgerStore
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "alpha-mixed"
@@ -76,7 +77,21 @@ def _explain(root: Path, run_id: str, claim_id: str, *, capsys) -> dict:
     return {**result["result"], "diagnostics": result["diagnostics"]}
 
 
-def _assert_staged_and_live_spans(explanation: dict, claim: dict, exported: dict) -> None:
+def _span_text(data: bytes, span: list[int]) -> str:
+    start, end = span
+    assert start >= 1 and end >= start
+    lines = data.decode("utf-8").splitlines()
+    assert end <= len(lines)
+    return "\n".join(lines[start - 1:end])
+
+
+def _assert_staged_and_live_spans(
+    root: Path,
+    explanation: dict,
+    claim: dict,
+    exported: dict,
+    expected_content: tuple[str, ...],
+) -> None:
     claim_ref = f"{claim['claimId']}@{claim['claimRevision']}"
     staged = [item for item in explanation["diagnostics"]
               if item["code"] == "explain.stage-location.v1"
@@ -93,14 +108,53 @@ def _assert_staged_and_live_spans(explanation: dict, claim: dict, exported: dict
     assert any(path.endswith("/SKILL.md") for path in explanation["stagedLocations"])
     assert any(path.endswith("/SKILL.md") for path in explanation["liveLocations"])
 
-    for location in (*staged, *live):
-        start, end = location["details"]["lineSpans"][0]
-        assert start >= 1 and end >= start
     targets = exported["result"]["targets"]
     assert set(targets) == expected_targets
+    store = LedgerStore(root, root / ".repo2skill")
+    state = store.read_state()
+    assert state is not None and state.activeExportId and state.activeManifestSetId
+    manifest_set = store.read_manifest_set(
+        f"manifests/{state.activeExportId}/{state.activeManifestSetId}.json"
+    )
+    assert manifest_set is not None
+
     for target in targets.values():
         assert any(claim_ref in item["exportedClaimRevisions"]
                    for item in target["paths"].values())
+        for path, metadata in target["paths"].items():
+            live_bytes = root.joinpath(*path.split("/")).read_bytes()
+            assert _content_hash(live_bytes) == metadata["exactHash"]
+
+    for location in staged:
+        details = location["details"]
+        target_id = details["targetId"]
+        path = location["path"]
+        stage_root = root / ".repo2skill" / "staging" / explanation["runId"] / f"r{details['stageRevision']}"
+        descriptor = json.loads((stage_root / "stage.json").read_text(encoding="utf-8"))
+        staged_metadata = descriptor["targets"][target_id][details["mode"]][path]
+        staged_bytes = stage_root.joinpath("targets", target_id, details["mode"], *path.split("/")).read_bytes()
+        assert _content_hash(staged_bytes) == staged_metadata["sha256"] == details["artifactHash"]
+        assert staged_metadata["claimSpans"][claim_ref] == details["lineSpans"]
+        for span in details["lineSpans"]:
+            span_text = _span_text(staged_bytes, span)
+            assert all(marker in span_text for marker in expected_content)
+
+    for location in live:
+        details = location["details"]
+        target_id = details["targetId"]
+        path = location["path"]
+        manifest_ref = manifest_set.targets[target_id]
+        manifest = store.read_target_manifest(manifest_ref.path)
+        assert manifest is not None and manifest.manifestId == details["manifestId"]
+        file_record = next(item for item in manifest.files if item.path == path)
+        live_bytes = root.joinpath(*path.split("/")).read_bytes()
+        assert file_record.exactHash == details["artifactHash"] == _content_hash(live_bytes)
+        manifest_spans = [list(span) for span in file_record.claimSpans[claim_ref]]
+        assert manifest_spans == details["lineSpans"]
+        assert claim_ref in exported["result"]["targets"][target_id]["paths"][path]["exportedClaimRevisions"]
+        for span in details["lineSpans"]:
+            span_text = _span_text(live_bytes, span)
+            assert all(marker in span_text for marker in expected_content)
 
 
 def _content_hash(data: bytes) -> str:
@@ -156,7 +210,9 @@ def test_no_ai_alpha_preserves_provenance_and_owned_spans_across_updates(tmp_pat
     assert script_evidence1["locator"] == {"kind": "json-pointer", "value": "/scripts/test", "lineHint": None}
     assert script_claim1["factIds"] == [script_fact1["factId"]]
     assert script_evidence1["evidenceId"] in script_claim1["evidenceIds"]
-    _assert_staged_and_live_spans(script_explanation1, script_claim1, exported1)
+    _assert_staged_and_live_spans(
+        tmp_path, script_explanation1, script_claim1, exported1, ("ALPHA_FIXTURE_EXECUTED",),
+    )
 
     agents1 = agents_path.read_bytes()
     prefix1, suffix1 = _outside_managed_block(agents1)
@@ -207,7 +263,9 @@ def test_no_ai_alpha_preserves_provenance_and_owned_spans_across_updates(tmp_pat
     assert script_evidence2["revision"] == script_evidence1["revision"] + 1
     assert script_evidence2["contentHash"] == _content_hash((tmp_path / "package.json").read_bytes())
     assert script_evidence2["contentHash"] != script_evidence1["contentHash"]
-    _assert_staged_and_live_spans(script_explanation2, script_claim2, exported2)
+    _assert_staged_and_live_spans(
+        tmp_path, script_explanation2, script_claim2, exported2, ("ALPHA_FIXTURE_EXECUTED",),
+    )
     prefix2, suffix2 = _outside_managed_block(agents_path.read_bytes())
     assert (prefix2, suffix2) == (prefix1, suffix1)
 
@@ -235,7 +293,13 @@ def test_no_ai_alpha_preserves_provenance_and_owned_spans_across_updates(tmp_pat
     assert convention_claim2["claimRevision"] == convention_claim1["claimRevision"] + 1
     assert convention_fact2["factRevision"] == convention_fact1["factRevision"] + 1
     assert convention_evidence2["path"] == "src/api_client.ts"
-    _assert_staged_and_live_spans(convention_explanation2, convention_claim2, exported3)
+    _assert_staged_and_live_spans(
+        tmp_path,
+        convention_explanation2,
+        convention_claim2,
+        exported3,
+        ("http-client-wrapper", "src/api_client.ts"),
+    )
 
     (tmp_path / "src" / "api_client.ts").unlink()
     (tmp_path / "src" / "client.ts").unlink()

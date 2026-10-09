@@ -1,7 +1,7 @@
 # P0 release evidence map
 
-**Status:** Task 12 evidence map, updated after the Windows/Python 3.13 local alpha verification. P0-01–P0-11 ownership and review evidence below is retained from their task reports; the Task 12 focused integration and full-suite evidence was recorded against base `fccc9f4`. Packaging-only changes were followed by a focused distribution/archive check and final wheel rebuild/smoke. Task 12 independent and final project reviews, plus all CI matrix cells, remain pending.
-Feature ownership follows `docs/product/feature-catalog.md` P0 F001–F035 and the task briefs. Each feature keeps its owning test paths; current-checkout coverage was exercised by Task 12 full suite (258 passed, 1 skipped in 85.90s) before the final sdist-only manifest assertion, then the distribution test passed separately after that packaging change.
+**Status:** Task 12 evidence map, updated after the Windows/Python 3.13 local alpha verification. P0-01–P0-11 ownership and review evidence below is retained from their task reports; the Task 12 full-suite evidence was recorded against base `fccc9f4`; the final review-fix tree has a strengthened integration run (1 passed in 12.72s), distribution/archive run (2 passed in 6.99s), final wheel/sdist build, and fresh-wheel smoke. No full-suite rerun is claimed for these scoped test/doc changes. Task 12 independent and final project reviews, plus all CI matrix cells, remain pending.
+Feature ownership follows `docs/product/feature-catalog.md` P0 F001–F035 and the task briefs. Each feature keeps its owning test paths; current-checkout coverage was exercised by Task 12 full suite (258 passed, 1 skipped in 85.90s) before final integration and sdist-content refinements. The strengthened integration test and distribution/archive tests passed separately afterward.
 
 Local verification host: Windows/Python 3.13. No Linux/macOS or Python 3.11 result is claimed. The six-cell workflow is configured; every matrix result remains pending until CI executes it.
 
@@ -9,7 +9,7 @@ Local verification host: Windows/Python 3.13. No Linux/macOS or Python 3.11 resu
 
 | Feature | Owner(s) | Existing evidence / status |
 |---|---|---|
-| F001 | Task 1; Task 12 release replay | `tests/test_distribution.py`; Task 1 root verification on `466645e`; Task 12 final wheel/sdist build and fresh-wheel smoke passed on Windows/Python 3.13. Smoke verified import under the clean venv, templates, help/version, and byte-identical MIT notice. |
+| F001 | Task 1; Task 12 release replay | `tests/test_distribution.py`; Task 1 root verification on `466645e`; Final Task 12 fix-round-1 wheel/sdist build and fresh-wheel smoke passed on Windows/Python 3.13. Smoke verified import under the clean venv, templates, help/version, and byte-identical MIT notice. |
 | F002 | Task 1 config; Task 11 CLI | `tests/test_config.py`; Task 1 review-clean commit `466645e` covers path/config boundary. Task 11 CLI grammar and dispatch are implemented and covered by `tests/test_cli.py`, `tests/test_cli_json.py`, and `tests/test_cli_lifecycle.py`; full Task 12 suite passed 258/1. |
 | F003 | Task 3 | `tests/test_inventory.py`; Task 3 review-clean through `fd6f973`; full suite 88 passed/1 skipped before final fix, latest affected gate 40 passed plus three final affected tests. |
 | F004 | Task 2 schema; Task 3 identity/inventory | `tests/test_models.py`, `tests/test_identity.py`, `tests/test_inventory.py`; Task 3 commit `fd6f973`, review clean; full suite 88/1 predates last fix. |
@@ -42,11 +42,11 @@ Local verification host: Windows/Python 3.13. No Linux/macOS or Python 3.11 resu
 | F031 | Task 11 report/exit aggregation | `tests/test_cli_json.py`, `tests/test_cli_lifecycle.py`; Task 11 implementation at `fccc9f4`, round-2 review clean; Task 12 full suite 258/1. |
 | F032 | Task 3 untrusted traversal; Task 4 bounded redaction | `tests/test_inventory.py`, `tests/test_redact.py`; Task 4 report has 107/1 baseline, final scoped gates 13 and 30 passed; Task 3 review clean through `fd6f973`. |
 | F033 | Task 2 persistence invariant; Task 9 transaction/recovery | `tests/test_ledger_transactions.py`, `tests/test_export_recovery.py`; Task 2 review clean through `c0244ca`; Task 9 final 36-pass integration gate, independent review clean. |
-| F034 | Task 5 ecosystem fixtures; Task 12 alpha update E2E | Existing `tests/fixtures/ecosystems/` plus ecosystem extractor tests support JavaScript/Python/Go/Rust and mixed inputs. `tests/fixtures/alpha-mixed/`, `tests/integration/test_no_ai_alpha.py`; focused characterization passed (1 test) and asserted source hash/locator→fact/claim revisions→both staged/live targets across change/add/delete, CRLF preservation, conflict, and read-only checks. The synthetic script marker remained absent. |
+| F034 | Task 5 ecosystem fixtures; Task 12 alpha update E2E | Existing `tests/fixtures/ecosystems/` plus ecosystem extractor tests support JavaScript/Python/Go/Rust and mixed inputs. `tests/fixtures/alpha-mixed/`, `tests/integration/test_no_ai_alpha.py`; final strengthened focused characterization passed (1 in 12.72s) and compared every reported staged/live span to expected claim content, physical stage descriptors and manifests, export revisions, and hashes of raw stage/live bytes across initial, changed, and added claims including CRLF. It also verifies deletion from both outputs and provenance while other accepted claims remain, conflict/read-only behavior, and the synthetic script marker stays absent. |
 | F035 | Task 12 contributor/install/threat/schema/release docs and CI evidence | `CONTRIBUTING.md`, `docs/install.md`, `docs/threat-model.md`, `docs/schema-migrations.md`, `docs/release-checklist.md`, `.github/workflows/ci.yml`; six CI cells configured and pending. Windows/Python 3.13 docs, wheel/sdist smoke, MIT notice and local verification evidence recorded. Task 12 independent review remains pending. |
 
 ## Remaining release gates
 
-- P0 F001–F035 all have an owning task and evidence path in the table. Task 12 local verification is complete; the independent Task 12/final project reviews remain pending.
+- P0 F001–F035 all have an owning task and evidence path in the table. Task 12 local verification and fix round 1 are complete; scoped Task 12 re-review and final project review remain pending.
 - Windows/Linux/macOS × Python 3.11/3.13 is configured, but no workflow result is recorded yet; do not claim those cells verified.
 - The alpha is local and unpublished at version `0.1.0`.

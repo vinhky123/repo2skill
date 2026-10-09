@@ -4,12 +4,12 @@ repo2skill 0.1.0 is an unpublished local alpha. The checklist separates complete
 
 ## Current evidence
 
-- Windows/Python 3.13: the full suite passed (258 passed, 1 skipped in 85.90s) before the final integration/provenance and sdist-content assertion refinements. The final focused integration test passed (1 test) after those refinements; the distribution tests passed (2 tests), then the final wheel and sdist were rebuilt. The final wheel installed in a fresh environment outside the checkout and passed import-location, template, notice-byte, `--help`, and `--version` checks.
+- Windows/Python 3.13: the full suite passed (258 passed, 1 skipped in 85.90s) before the final integration/provenance and sdist-content assertion refinements. The final strengthened integration test passed (1 in 12.72s) after review fix round 1; distribution/archive tests passed (2 in 6.99s), then the final wheel and sdist were rebuilt and the wheel smoke was rerun. The final wheel installed in a fresh environment outside the checkout and passed import-location, template, notice-byte, `--help`, and `--version` checks.
 - The built sdist includes the test package and fixture tree, including the mixed alpha fixture and integration test. The distribution test checks this archive content and confirms wheel/sdist notice text equality.
 - The no-AI integration test blocks socket connection APIs and confirms the synthetic package-script marker was not created. No model or network result is used by product operations.
 - Linux/Python 3.11, Linux/Python 3.13, Windows/Python 3.11, Windows/Python 3.13, macOS/Python 3.11, and macOS/Python 3.13 workflow results remain pending. The earlier Windows/Python 3.13 Task 10 baseline is not a Task 12 workflow result.
 - Publication: none. Do not describe this alpha as available from a package index.
-- Task 12 implementation verification is complete locally; independent Task 12 review and final project review remain pending.
+- Task 12 implementation verification and review fix round 1 are complete locally; scoped Task 12 re-review and final project review remain pending.
 
 ## Before publication
 
