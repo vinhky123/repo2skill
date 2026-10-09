@@ -104,6 +104,41 @@ def revise_record(
     return cast(T, dataclasses.replace(new, **{revision_field: revision}))
 
 
+def latest_by_id(
+    records: Sequence[T],
+    *,
+    id_field: str,
+    revision_field: str,
+    semantic_payload: Callable[[T], JsonValue],
+) -> dict[str, T]:
+    """Select each stable ID's semantic high-water record, rejecting ties that disagree."""
+    grouped: dict[str, list[T]] = {}
+    for record in records:
+        if not dataclasses.is_dataclass(record) or isinstance(record, type):
+            raise TypeError("history records must be dataclass instances")
+        if not hasattr(record, id_field) or not hasattr(record, revision_field):
+            raise TypeError(f"history record does not contain {id_field} and {revision_field}")
+        stable_id = getattr(record, id_field)
+        revision = getattr(record, revision_field)
+        if not isinstance(stable_id, str) or not stable_id:
+            raise ValueError("history stable IDs must be nonempty strings")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise ValueError("history revisions must be positive integers")
+        grouped.setdefault(stable_id, []).append(record)
+
+    selected: dict[str, T] = {}
+    for stable_id, group in grouped.items():
+        if any(type(record) is not type(group[0]) for record in group):
+            raise ValueError(f"conflicting record types in semantic history for {stable_id}")
+        maximum = max(getattr(record, revision_field) for record in group)
+        at_maximum = [record for record in group if getattr(record, revision_field) == maximum]
+        projections = {canonical_json_bytes(semantic_payload(record)) for record in at_maximum}
+        if len(projections) != 1:
+            raise ValueError(f"conflicting semantic history for {stable_id} at revision {maximum}")
+        selected[stable_id] = at_maximum[0]
+    return selected
+
+
 def effective_policy_revision(
     scan_policy: ScanPolicy,
     claim_policy: ClaimPolicy,

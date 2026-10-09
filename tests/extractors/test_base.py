@@ -2,11 +2,50 @@ from pathlib import Path
 from dataclasses import replace
 import hashlib
 
+import pytest
+
 from repo2skill.config import default_scan_policy
 from repo2skill.identity import capture_repository
 from repo2skill.inventory import collect_inventory
 from repo2skill.models import EvidenceLocator, InputSelector
 from repo2skill.extractors.base import ExtractionSession
+
+
+def test_prior_history_selects_max_revision_even_when_older_record_is_last(run_ecosystem_fixture):
+    initial = run_ecosystem_fixture("javascript")
+    evidence = tuple(initial.evidence)
+    facts = tuple(initial.facts)
+    prior_evidence = tuple(replace(item, revision=4) for item in evidence) + tuple(
+        replace(item, revision=2) for item in evidence
+    )
+    prior_facts = tuple(replace(item, factRevision=7) for item in facts) + tuple(
+        replace(item, factRevision=2) for item in facts
+    )
+
+    current = run_ecosystem_fixture("javascript", prior_evidence=prior_evidence, prior_facts=prior_facts)
+
+    assert {item.revision for item in current.evidence} == {4}
+    assert {item.factRevision for item in current.facts} == {7}
+
+
+def test_prior_history_equal_maximum_conflict_fails_closed(run_ecosystem_fixture):
+    initial = run_ecosystem_fixture("javascript")
+    item = initial.facts[0]
+    conflict = replace(item, factRevision=3, value={"conflict": True})
+    maximum = replace(item, factRevision=3)
+
+    with pytest.raises(ValueError, match="conflicting semantic history"):
+        run_ecosystem_fixture("javascript", prior_facts=(maximum, conflict))
+
+
+def test_prior_evidence_equal_maximum_conflict_fails_closed(run_ecosystem_fixture):
+    initial = run_ecosystem_fixture("javascript")
+    item = initial.evidence[0]
+    maximum = replace(item, revision=3)
+    conflict = replace(item, revision=3, contentHash="sha256:" + "f" * 64)
+
+    with pytest.raises(ValueError, match="conflicting semantic history"):
+        run_ecosystem_fixture("javascript", prior_evidence=(maximum, conflict))
 
 
 def test_read_finalizes_raw_hash_and_parses_captured_buffer_after_mutation(tmp_path: Path):

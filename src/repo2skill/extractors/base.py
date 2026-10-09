@@ -11,7 +11,7 @@ from typing import Protocol
 
 from pathspec import GitIgnoreSpec
 
-from ..ids import CanonicalIdContext, canonical_json_bytes, revise_record
+from ..ids import CanonicalIdContext, canonical_json_bytes, latest_by_id, revise_record
 from ..inventory import INVENTORY_VERSION, IgnoreControlObservation
 from ..models import (
     CoverageEntry, Diagnostic, Evidence, EvidenceLocator, ExtractionBatch,
@@ -51,8 +51,15 @@ class ExtractionSession:
         self.snapshot_id, self.inventory, self.policy = snapshot_id, inventory, policy
         self.repository_id = repository_id
         self.id_context = id_context or CanonicalIdContext()
-        self.prior_evidence = {item.evidenceId: item for item in prior_evidence}
-        self.prior_facts = {item.factId: item for item in prior_facts}
+        self.prior_evidence = latest_by_id(
+            prior_evidence, id_field="evidenceId", revision_field="revision",
+            semantic_payload=lambda item: {"contentHash": item.contentHash, "locator": item.locator,
+                                           "preview": item.redactedPreview},
+        )
+        self.prior_facts = latest_by_id(
+            prior_facts, id_field="factId", revision_field="factRevision",
+            semantic_payload=lambda item: item.value,
+        )
         self.excluded_paths = tuple(excluded_paths)
         self.control_observations = tuple(control_observations)
         self._validate_controls()

@@ -77,6 +77,30 @@ def test_revise_record_starts_at_one_and_rejects_a_different_identity() -> None:
         )
 
 
+def test_latest_by_id_selects_maximum_revision_independent_of_input_order() -> None:
+    from repo2skill.ids import latest_by_id
+
+    older = _claim(text="old", payload={"command": "old"}, revision=2)
+    latest = _claim(text="new", payload={"command": "new"}, revision=5)
+    selected = latest_by_id(
+        (latest, older), id_field="claimId", revision_field="claimRevision",
+        semantic_payload=lambda claim: {"payload": claim.payload, "kind": claim.kind, "origin": claim.origin},
+    )
+    assert selected[latest.claimId] == latest
+
+
+def test_latest_by_id_fails_closed_on_equal_maximum_semantic_conflict() -> None:
+    from repo2skill.ids import latest_by_id
+
+    first = _claim(text="first", payload={"command": "first"}, revision=5)
+    second = _claim(text="second", payload={"command": "second"}, revision=5)
+    with pytest.raises(ValueError, match="conflicting semantic history"):
+        latest_by_id(
+            (first, second), id_field="claimId", revision_field="claimRevision",
+            semantic_payload=lambda claim: {"payload": claim.payload, "kind": claim.kind, "origin": claim.origin},
+        )
+
+
 def test_effective_policy_revision_sorts_targets_and_refuses_unknown_options() -> None:
     from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
     from pathlib import Path

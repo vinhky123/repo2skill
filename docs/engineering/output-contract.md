@@ -13,16 +13,29 @@ def derive_claims(
     *,
     repository_id: str,
     prior_claims: Sequence[Claim] = (),
+    id_context: CanonicalIdContext | None = None,
 ) -> ClaimSet: ...
+
+def deduplicate(
+    candidates: Sequence[Claim],
+    docs: Sequence[Fact],
+    snapshot: SourceSnapshot,
+    *,
+    id_context: CanonicalIdContext | None = None,
+) -> DedupResult: ...
 ```
 
 `prior_claims` contains this repository's prior valid immutable claim history, including valid inactive orphan runs; derivation groups records by stable claim ID and compares only those at the maximum `claimRevision`. Derivation creates every candidate with `proposalStatus="pending"`; it never accepts, rejects, or contests. It uses canonical stable identity and the R1 semantic projection (`payload`, `kind`, `origin`): unchanged semantic payload retains the maximum revision, while a changed payload increments it. Formatting-only changes (including `templateKey`/rendered representation changes) do not affect revision. Equal-maximum prior records with conflicting semantic payloads fail closed. Prefer a versioned `templateKey` for structured deterministic claims; use `renderedText` only when bounded literal prose is itself the semantic payload. P0 creates no `human_policy` or `llm` claim. Task 11 enumerates history under the caller-held mutation; unreadable/invalid enumerated records fail closed. With no persisted history index, missing historical files cannot be detected, and no new index or schema field is introduced.
+
+`id_context` is an optional caller-owned `CanonicalIdContext` used to preserve collision detection across multiple builders in one session. When omitted, each call creates a fresh context; no module-global collision state is used.
 
 The controller next calls `validate_claims(ClaimSet.claims, draft_run)`. A returned valid claim may become `accepted` only when it is `observed`/`deterministic` and `draft_run.effectiveClaimPolicy.autoAcceptObserved` is true. Other valid claims remain pending. `rejectedClaims` means invalid for this run, not review-rejected; invalid candidates stay pending. An observed claim requires observed support with an agreeing payload. Validation checks all referenced facts/evidence, snapshot, scope, and provenance. Each candidate's direct `evidenceIds` is the sorted union of cited facts' evidence IDs unless a declared versioned rule narrows the chain and validation proves it.
 
 For a new run, the controller applies matching prior review disposition from authoritative `ProjectState` to valid claims only, after validation autoaccept, using exact `(claimId, claimRevision)`. This preserves an explicit matching accept/reject/contest and never accepts an invalid candidate. It then merges effective valid-claim statuses back into every original candidate by exact pair; invalid candidates remain pending. Persist every original candidate and all support in `RunLedger.claims` with those initial effective statuses. Dedup receives the effective valid claims. This ordering ensures the staged accepted spans agree with the candidate statuses in the run. A new semantic revision has no matching prior disposition and remains pending unless current validation auto-accepts it. Formatting changes do not make a new revision. Later review of a persisted run uses transient `ProjectState` overlays and never rewrites that immutable run.
 
 Dedup receives valid candidates and documentation facts. Every `DedupDecision` records sorted unique `candidateClaimIds`, `candidateFactIds`, and `documentationEvidenceIds`; include every evidence record used, including identical normalized text at multiple paths. Define `decisionId = canonical_record_id("dedup", identity)` with identity containing repository ID, rule ID/version, and those three ID tuples. Prose, previews, hashes, diagnostics, and input order are excluded. `snapshotId`, result, and `reasonCode` remain recorded fields. Persist all candidates and decisions, including dedup-suppressed candidates. Only `DedupResult.renderableClaims` proceeds to rendering; suppression never changes status or erases proof.
+
+P0 claim templates are a pure allowlist in `src/repo2skill/claim_templates.py`, shared by Task 6 dedup and Task 7 rendering. Structured payloads use versioned template keys; unknown keys or unsupported typed payloads fail closed. Both consumers use the same formatter text. Dedup collapses whitespace for exact line matching, groups identical candidate text, and compares it with normalized documentation facts. A documentation match suppresses rendering while preserving every candidate and documentation evidence ID in its decision; identical candidate text without a documentation match keeps one renderable representative and records the complete candidate proof group.
 
 ## Task 7 — deterministic rendering and initial stage
 
