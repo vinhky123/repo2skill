@@ -41,7 +41,7 @@ def test_provenance_records_are_frozen_and_keep_the_exact_contract_fields() -> N
         "recordRevision", "claimId", "claimRevision", "semanticKey", "scope",
         "payload", "renderedText", "templateKey", "kind", "origin", "factIds",
         "evidenceIds", "proposalStatus", "supersedes", "derivedFrom",
-        "lastVerifiedSnapshotId",
+        "lastVerifiedSnapshotId", "supportMode",
     )
     assert tuple(field.name for field in dataclasses.fields(ProjectState)) == (
         "schemaVersion", "toolVersion", "projectId", "currentRunId",

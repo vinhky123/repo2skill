@@ -148,6 +148,8 @@ def _unique_index(records: Sequence[object], field: str) -> dict[str, object]:
 def _support_error(claim: Claim, run: RunLedger, facts_by_id: dict[str, object],
                    evidence_by_id: dict[str, object], reads_by_rule: dict[str, list[object]],
                    run_error: str | None) -> str | None:
+    if claim.supportMode == "evidence-backed-prose":
+        return _prose_support_error(claim, run, facts_by_id, evidence_by_id, reads_by_rule, run_error)
     if run_error:
         return run_error
     snapshot = run.snapshot
@@ -218,6 +220,68 @@ def _support_error(claim: Claim, run: RunLedger, facts_by_id: dict[str, object],
         return "claim-evidence-chain-mismatch"
     if len(set(claim.evidenceIds)) != len(claim.evidenceIds):
         return "claim-evidence-ids-duplicate"
+    return None
+
+
+def _prose_support_error(claim: Claim, run: RunLedger, facts_by_id: dict[str, object],
+                         evidence_by_id: dict[str, object], reads_by_rule: dict[str, list[object]],
+                         run_error: str | None) -> str | None:
+    """Validate model-authored text against captured source-fragment records."""
+    if run_error:
+        return run_error
+    snapshot = run.snapshot
+    if claim.lastVerifiedSnapshotId != snapshot.snapshotId:
+        return "claim-snapshot-mismatch"
+    if claim.kind != "inferred" or claim.origin != "llm":
+        return "prose-origin-invalid"
+    if claim.renderedText is None or not claim.renderedText.strip() or claim.templateKey is not None:
+        return "prose-text-invalid"
+    if claim.payload != {"text": claim.renderedText}:
+        return "prose-payload-mismatch"
+    if not claim.factIds or tuple(sorted(set(claim.factIds))) != claim.factIds:
+        return "claim-fact-ids-invalid"
+    selected_facts = []
+    for fact_id in claim.factIds:
+        fact = facts_by_id.get(fact_id)
+        if fact is None:
+            return "unknown-fact"
+        selected_facts.append(fact)
+    if any(fact.scope != claim.scope or fact.snapshotId != snapshot.snapshotId
+           or fact.factType != "source.fragment.v1" or fact.ruleId != "maintenance.source-fragment"
+           for fact in selected_facts):
+        return "prose-fact-support-invalid"
+    expected_id = canonical_record_id("claim", {"repository": snapshot.repositoryId,
+                                                   "scope": claim.scope,
+                                                   "recordType": "claim",
+                                                   "semanticKey": claim.semanticKey})
+    if claim.claimId != expected_id:
+        return "claim-identity-mismatch"
+    expected_evidence: set[str] = set()
+    for fact in selected_facts:
+        if not fact.evidenceIds or tuple(sorted(set(fact.evidenceIds))) != fact.evidenceIds:
+            return "fact-evidence-ids-invalid"
+        expected_evidence.update(fact.evidenceIds)
+        for evidence_id in fact.evidenceIds:
+            evidence = evidence_by_id.get(evidence_id)
+            if evidence is None:
+                return "unknown-evidence"
+            if (evidence.snapshotId != snapshot.snapshotId or evidence.availability != "available"
+                    or evidence.contentHash is None or evidence.locator.kind != "line-range"):
+                return "prose-evidence-invalid"
+            if _locator_error(evidence.locator, evidence.path):
+                return "prose-evidence-locator-invalid"
+            matching_reads = [read for read in reads_by_rule.get(fact.ruleId, ())
+                              if read.extractorId == "maintenance.source-fragment"
+                              and read.ruleVersion == fact.ruleVersion
+                              and read.snapshotId == evidence.snapshotId
+                              and read.dependencyType == "file" and read.outcome == "present"
+                              and read.selector.type == "file" and read.selector.scope == fact.scope
+                              and read.selector.value == evidence.path
+                              and read.contentHash == evidence.contentHash]
+            if len(matching_reads) != 1:
+                return "evidence-read-provenance-mismatch"
+    if tuple(sorted(expected_evidence)) != claim.evidenceIds or len(set(claim.evidenceIds)) != len(claim.evidenceIds):
+        return "claim-evidence-chain-mismatch"
     return None
 
 

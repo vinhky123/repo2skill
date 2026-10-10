@@ -117,6 +117,68 @@ class MaintenanceJob:
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimOperation:
+    op: Literal["add", "update", "delete"]
+    semanticKey: str
+    scope: str
+    renderedText: str | None
+    factIds: tuple[str, ...]
+    evidenceIds: tuple[str, ...]
+    claimRef: str | None
+
+    def __post_init__(self) -> None:
+        if self.op not in {"add", "update", "delete"}:
+            raise ValueError("unsupported claim operation")
+        _nonempty(self.semanticKey, "semanticKey")
+        _nonempty(self.scope, "scope")
+        if self.renderedText is not None and not isinstance(self.renderedText, str):
+            raise ValueError("renderedText must be a string or null")
+        if any(not isinstance(value, str) for value in self.factIds + self.evidenceIds):
+            raise ValueError("claim operation support IDs must be strings")
+        if self.claimRef is not None and not isinstance(self.claimRef, str):
+            raise ValueError("claimRef must be a string or null")
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationAuthorization:
+    authorizationId: str
+    jobId: str
+    approvalBindingHash: str
+    responseHash: str
+    acceptedClaimRefs: tuple[str, ...]
+    targetKinds: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _identifier(self.authorizationId, "authorizationId")
+        _identifier(self.jobId, "jobId")
+        _hash(self.approvalBindingHash, "approvalBindingHash")
+        _hash(self.responseHash, "responseHash")
+        if len(set(self.acceptedClaimRefs)) != len(self.acceptedClaimRefs):
+            raise ValueError("acceptedClaimRefs must be unique")
+        for reference in self.acceptedClaimRefs:
+            if not re.fullmatch(r"[a-z][a-z0-9-]*_[0-9a-f]{24}@[1-9][0-9]*", reference):
+                raise ValueError("acceptedClaimRefs must contain claimId@revision values")
+        if any(kind not in {"agents-md", "skill"} for kind in self.targetKinds):
+            raise ValueError("unsupported authorization target kind")
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedSourceGuard:
+    jobId: str
+    targetCommit: str
+    sourceContextHash: str
+    policyRevision: str
+    authorizationId: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.jobId, "jobId")
+        _commit(self.targetCommit, "targetCommit")
+        _hash(self.sourceContextHash, "sourceContextHash")
+        _nonempty(self.policyRevision, "policyRevision")
+        _identifier(self.authorizationId, "authorizationId")
+
+
+@dataclass(frozen=True, slots=True)
 class MaintenanceLifecycle:
     status: Literal["pending", "approved", "running", "skipped", "applied", "failed", "stale"]
     approvalSource: Literal["user", "auto"] | None

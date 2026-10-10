@@ -62,9 +62,15 @@ def deduplicate(
             raise ValueError("dedup candidates must be policy-validated claims")
         if claim.lastVerifiedSnapshotId != snapshot.snapshotId:
             raise ValueError("dedup candidate snapshot differs from source snapshot")
-        if claim.templateKey is None or claim.renderedText is not None:
-            raise ValueError("P0 dedup candidates must use a versioned claim template")
-        line = _normalized_line(format_claim_text(claim.templateKey, claim.payload))
+        if claim.supportMode == "evidence-backed-prose":
+            if claim.templateKey is not None or not isinstance(claim.renderedText, str):
+                raise ValueError("prose dedup candidates must carry rendered text")
+            rendered = claim.renderedText
+        else:
+            if claim.templateKey is None or claim.renderedText is not None:
+                raise ValueError("typed dedup candidates must use a versioned claim template")
+            rendered = format_claim_text(claim.templateKey, claim.payload)
+        line = _normalized_line(rendered)
         if not line:
             raise ValueError("claim formatter produced empty text")
         grouped[line].append(claim)

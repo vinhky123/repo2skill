@@ -609,6 +609,25 @@ def enqueue_event(
         run = _run_for_store(store)
         exact_outputs, output_prefixes = _project_output_paths(store, project, project_state)
         impact = _filter_project_outputs(impact, exact_outputs, output_prefixes)
+        # Apply the saved P0 eligibility policy to changed paths before job
+        # selection so excluded names never enter the model-facing job binding.
+        from .inventory import _final_exclusion, _generated_or_security, _normalize_exclude
+        from pathspec import GitIgnoreSpec
+        configured_exclusions = [store.state_dir.relative_to(store.root).as_posix(), "AGENTS.md"]
+        configured_exclusions.extend(target.livePath for target in project.targets)
+        exclude_spec = GitIgnoreSpec.from_lines(
+            (_normalize_exclude(item) for item in project.scanPolicy.exclude), backend="simple",
+        )
+        statuses = impact.changeStatuses or tuple(("M", path) for path in impact.paths)
+        statuses = tuple((status, path) for status, path in statuses
+                         if _final_exclusion(path, False, tuple(configured_exclusions), exclude_spec) is None
+                         and _generated_or_security(path, False) is None)
+        eligible_paths = tuple(sorted({path for _status, path in statuses}))
+        impact = replace(impact, paths=eligible_paths,
+                         renames=tuple(pair for pair in impact.renames if all(path in eligible_paths for path in pair)),
+                         scopes=_classify(eligible_paths, statuses)[0],
+                         requiredFullScan=impact.requiredFullScan or any(status == "D" for status, _path in statuses),
+                         changeStatuses=statuses)
         if not impact.paths and impact.baselineCommit is not None:
             maint.replace_state(replace(state, observedEventCursor=event.cursor))
             return None
@@ -617,7 +636,8 @@ def enqueue_event(
             # A previously unobserved input or selector gap cannot prove that
             # changed committed source is irrelevant. Preserve it for review.
             scopes = impact.scopes or ("full",)
-        extractor_revisions = dict(run.snapshot.extractorVersions) if run is not None else {}
+        from .maintenance_source_fragment import maintenance_extractor_versions
+        extractor_revisions = maintenance_extractor_versions()
         from .ids import effective_policy_revision
         policy_revision = effective_policy_revision(
             project.scanPolicy, project.claimPolicy, project.targets, generation_options={},
@@ -640,6 +660,13 @@ def enqueue_event(
         selected_paths = {
             path for path in selected_paths
             if not _is_project_output(path, exact_outputs, output_prefixes)
+        }
+        # Committed Git entries remain eligible even when .gitignore matches
+        # them. Apply P0's final boundaries before materialization and caps.
+        selected_paths = {
+            path for path in selected_paths
+            if _final_exclusion(path, False, tuple(configured_exclusions), exclude_spec) is None
+            and _generated_or_security(path, False) is None
         }
         try:
             with tempfile.TemporaryDirectory(prefix="repo2skill-context-") as temp_dir:

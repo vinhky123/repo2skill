@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 import unicodedata
-from typing import Protocol
+from typing import Callable, Protocol
 
 from pathspec import GitIgnoreSpec
 
@@ -44,6 +44,7 @@ class ExtractionSession:
                  policy: ScanPolicy, repository_id: str, prior_evidence: Sequence[Evidence],
                  prior_facts: Sequence[Fact], excluded_paths: Sequence[RepositoryPath],
                  control_observations: Sequence[IgnoreControlObservation],
+                 committed_reader: Callable[[str, int], bytes] | None = None,
                  id_context: CanonicalIdContext | None = None):
         self.root = Path(os.path.abspath(root))
         if Path(os.path.abspath(inventory.root)) != self.root:
@@ -74,6 +75,7 @@ class ExtractionSession:
         )
         self.excluded_paths = tuple(excluded_paths)
         self.control_observations = tuple(control_observations)
+        self._committed_reader = committed_reader
         self._validate_controls()
         self._entries = {entry.path: entry for entry in inventory.entries}
         self._inventory_incomplete = any(item.status in {"capped", "failed"} for item in inventory.coverage)
@@ -309,6 +311,33 @@ class ExtractionSession:
             return self._captures[path]
         if self._opened >= self.policy.maxOpenedFiles:
             result = (None, None, "open-budget", "capped", None)
+            self._captures[path] = result
+            return result
+        if self._committed_reader is not None:
+            self._opened += 1
+            try:
+                raw = self._committed_reader(path, self.policy.maxFileBytes)
+                if len(raw) > self.policy.maxFileBytes:
+                    result = (None, None, "file-cap", "capped", None)
+                else:
+                    content_hash = _hash(raw)
+                    selected = None
+                    for candidate in self.policy.encodings:
+                        try:
+                            raw.decode(candidate)
+                            selected = candidate
+                            break
+                        except (LookupError, UnicodeError):
+                            continue
+                    if selected is None:
+                        result = (None, None, "decode-error", "decode-error", content_hash)
+                    elif self._decoded + len(raw) > self.policy.maxDecodedBytes:
+                        result = (None, None, "decoded-budget", "capped", None)
+                    else:
+                        self._decoded += len(raw)
+                        result = (raw, selected, None, "present", content_hash)
+            except Exception:
+                result = (None, None, "io-error", "io-error", None)
             self._captures[path] = result
             return result
         directory, _, leaf = path.rpartition("/")

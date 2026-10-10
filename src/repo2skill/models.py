@@ -246,6 +246,7 @@ class Claim:
     supersedes: tuple[ClaimRevisionRef, ...]
     derivedFrom: tuple[ClaimRevisionRef, ...]
     lastVerifiedSnapshotId: SnapshotId
+    supportMode: Literal["typed", "evidence-backed-prose"] = "typed"
 
     def __post_init__(self) -> None:
         _positive(self.recordRevision, "recordRevision"); _positive(self.claimRevision, "claimRevision")
@@ -256,6 +257,7 @@ class Claim:
         _one_of(self.kind, {"observed", "inferred", "human_policy"}, "kind")
         _one_of(self.origin, {"deterministic", "llm", "human"}, "origin")
         _one_of(self.proposalStatus, {"pending", "accepted", "rejected", "contested"}, "proposalStatus")
+        _one_of(self.supportMode, {"typed", "evidence-backed-prose"}, "supportMode")
         for value in self.factIds: _identifier(value, "factId")
         for value in self.evidenceIds: _identifier(value, "evidenceId")
         for value in self.supersedes + self.derivedFrom:
@@ -507,10 +509,13 @@ class RunLedger:
     coverage: tuple[CoverageEntry, ...]
     stagedTargets: Mapping[TargetId, Mapping[Literal["accepted", "preview"], Mapping[RepositoryPath, Sha256]]]
     completed: bool
+    applicationAuthorizationId: str | None = None
 
     def __post_init__(self) -> None:
         _schema(self.schemaVersion); _identifier(self.runId, "runId")
         if not self.toolVersion: raise ValueError("toolVersion is required")
+        if self.applicationAuthorizationId is not None:
+            _identifier(self.applicationAuthorizationId, "applicationAuthorizationId")
         for modes in self.stagedTargets.values():
             if set(modes) - {"accepted", "preview"}: raise ValueError("invalid staged target mode")
             for files in modes.values():
