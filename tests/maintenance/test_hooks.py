@@ -247,3 +247,33 @@ def test_isolated_hook_module_ignores_repo_local_shadow_module(tmp_path: Path) -
 
     assert b"SHADOW MODULE EXECUTED" not in result.stdout + result.stderr
     assert b"disabled" in result.stdout
+
+
+def test_windows_git_bash_runs_installed_wrapper_for_real_commit(tmp_path: Path) -> None:
+    root, store = _repo(tmp_path / "repo")
+    baseline = _commit(root, "src.py")
+    with store.mutation():
+        maint = MaintenanceStore(root, store)
+        maint.replace_state(dataclasses.replace(maint.read_state(), appliedBaseline=baseline))
+    trap = root / "repo2skill.py"
+    trap.write_text("raise RuntimeError('SHADOW MODULE EXECUTED')\n", encoding="utf-8")
+    install = install_hooks(root, store)
+    assert install.installed is True
+
+    (root / "src.py").write_text("source = 2\n", encoding="utf-8")
+    _git(root, "add", "src.py")
+    result = subprocess.run(
+        ["git", "-C", str(root), "commit", "-m", "event through installed hook"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output.decode("utf-8", "replace")
+    assert b"SHADOW MODULE EXECUTED" not in output
+    assert b"maintain approve maintenance-job_" in output
+    state = MaintenanceStore(root, store).read_state()
+    assert len(state.jobs) == 1
+    lifecycle = next(iter(state.jobs.values()))
+    assert lifecycle.status == "pending"
+    assert lifecycle.notificationState == "pending"
+    assert lifecycle.activeAttemptId is None

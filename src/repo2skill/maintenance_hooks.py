@@ -96,7 +96,8 @@ def _wrapper_bytes(hook_name: str, python: Path | None = None) -> bytes:
     if os.name == "nt":
         executable = '"$(cygpath -u ' + shlex.quote(str(python).replace("\\", "/")) + ')"'
     script = (
-        _MARKER.decode("ascii")
+        "#!/bin/sh\n"
+        + _MARKER.decode("ascii")
         + "# This wrapper observes committed Git state and always returns success.\n"
         + f"exec {executable} -I -m repo2skill.maintenance_hooks {shlex.quote(hook_name)} \"$@\"\n"
     )
