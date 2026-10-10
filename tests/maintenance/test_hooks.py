@@ -110,6 +110,23 @@ def test_main_checkout_refuses_hooks_shared_with_linked_worktrees(tmp_path: Path
     assert {item.name: item.read_bytes() for item in _hook_dir(root).iterdir() if item.is_file()} == hooks_before
 
 
+def test_disable_removes_owned_hooks_after_linked_worktree_is_added(tmp_path: Path) -> None:
+    root, store = _repo(tmp_path / "main")
+    _commit(root)
+    installed = install_hooks(root, store)
+    assert installed.installed is True
+    linked = tmp_path / "linked"
+    _git(root, "worktree", "add", "-q", str(linked), "HEAD")
+
+    result = remove_owned_hooks(root, store)
+
+    assert result.installed is True
+    assert result.manualIntegrationRequired is False
+    assert set(result.hooks) == set(HOOK_NAMES)
+    assert all(not (_hook_dir(root) / name).exists() for name in HOOK_NAMES)
+    assert MaintenanceStore(root, store).read_state().enabled is False
+
+
 def test_setup_installs_only_absent_local_hooks(tmp_path: Path) -> None:
     root, store = _repo(tmp_path / "repo")
     result = install_hooks(root, store)
@@ -350,12 +367,19 @@ def test_post_checkout_wrapper_returns_success_after_diagnostic(tmp_path: Path, 
 def test_wrapper_launch_failure_is_diagnostic_but_returns_success(tmp_path: Path) -> None:
     from repo2skill.maintenance_hooks import _wrapper_bytes
 
-    bash = Path(r"C:\Program Files\Git\bin\bash.exe")
     wrapper = tmp_path / "post-commit"
     wrapper.write_bytes(_wrapper_bytes("post-commit", tmp_path / "missing python.exe"))
+    if os.name == "nt":
+        shell = Path(r"C:\Program Files\Git\bin\bash.exe")
+        command = [str(shell), str(wrapper)]
+    else:
+        shell = Path("/bin/sh")
+        command = [str(shell), str(wrapper)]
+    if not shell.is_file():
+        pytest.skip(f"portable shell is unavailable at {shell}")
 
     result = subprocess.run(
-        [str(bash), str(wrapper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=5, check=False,
     )
 
