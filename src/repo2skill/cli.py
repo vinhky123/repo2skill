@@ -7,6 +7,7 @@ from dataclasses import fields, is_dataclass, replace
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import uuid
@@ -165,6 +166,16 @@ def build_parser() -> argparse.ArgumentParser:
     setup = maintain_commands.add_parser("setup")
     _common(setup)
     setup.add_argument("--manual-hooks", action="store_true")
+    setup.add_argument("--auto-approve", action="store_true")
+    status = maintain_commands.add_parser("status")
+    _common(status)
+    for action in ("approve", "skip", "retry"):
+        sub = maintain_commands.add_parser(action)
+        _common(sub)
+        sub.add_argument("job_id")
+    catch_up = maintain_commands.add_parser("catch-up")
+    _common(catch_up)
+    catch_up.add_argument("--rebuild", action="store_true")
     disable = maintain_commands.add_parser("disable")
     _common(disable)
     return parser
@@ -905,11 +916,24 @@ def _command_doctor(args: argparse.Namespace):
 def _command_maintain(args: argparse.Namespace):
     _project, store = _store_context(args)
     assert store is not None
+    maintenance = MaintenanceStore(store.root, store)
+    if args.maintain_command in {"approve", "skip", "retry"} and not re.fullmatch(
+        r"[a-z][a-z0-9-]*_[0-9a-f]{24}\Z", args.job_id if isinstance(args.job_id, str) else "",
+    ):
+        return None, (_finding("invocation.invalid", "error", "job ID is invalid", details={"exitCode": 1}),), (), []
     if args.maintain_command == "setup":
+        if args.auto_approve:
+            from .maintenance_approval import AutoGrantUnavailableError, configure_auto_approval
+            try:
+                configure_auto_approval(store)
+            except AutoGrantUnavailableError as error:
+                return {"installed": False, "policy": maintenance.read_state().policy}, (
+                    _finding("maintenance.auto-grant-unavailable", "error", str(error), details={"exitCode": 1}),
+                ), (), ["approve pending jobs individually"]
+        else:
+            from .maintenance_approval import revoke_auto_approval
+            revoke_auto_approval(store, enabled=True)
         if args.manual_hooks:
-            maintenance = MaintenanceStore(store.root, store)
-            with store.mutation():
-                maintenance.replace_state(replace(maintenance.read_state(), enabled=True))
             result = HookInstallResult(True, True, (), "maintenance enabled; install only the documented observation call in your own hook")
         else:
             result = install_hooks(store.root, store)
@@ -917,11 +941,111 @@ def _command_maintain(args: argparse.Namespace):
             _finding("maintenance.manual-integration-required", "error", result.message,
                      details={"exitCode": 1}),
         )
-        actions = [] if result.installed else ["run maintain setup --manual-hooks and invoke maintain catch-up manually"]
-        return result, findings, (), actions
+        if result.manualIntegrationRequired and result.installed:
+            findings = ()
+        actions = [] if result.installed and not result.manualIntegrationRequired else ["invoke maintain catch-up manually, then inspect maintain status"]
+        result_value = {"installed": result.installed, "manualIntegrationRequired": result.manualIntegrationRequired,
+                        "hooks": result.hooks, "message": result.message,
+                        "policy": maintenance.read_state().policy}
+        return result_value, findings, (), actions
     if args.maintain_command == "disable":
         result = remove_owned_hooks(store.root, store)
-        return result, (), (), []
+        if not result.installed:
+            return result, (_finding("maintenance.auto-grant-revocation-failed", "error", result.message,
+                                     details={"exitCode": 7}),), (), []
+        return {"disabled": True, "manualIntegrationRequired": result.manualIntegrationRequired,
+                "hooks": result.hooks, "message": result.message,
+                "policy": maintenance.read_state().policy}, (), (), []
+    if args.maintain_command == "status":
+        state = maintenance.read_state()
+        from .maintenance_approval import _matches_current, _policy_revision
+        jobs = []
+        findings = []
+        for job_id, lifecycle in state.jobs.items():
+            job = maintenance.read_job(job_id)
+            if job is None:
+                raise LedgerCorruptionError("maintenance state references a missing job")
+            jobs.append({"jobId": job_id, "targetCommit": job.targetCommit,
+                         "impactScopes": job.impactScopes, "status": lifecycle.status,
+                         "approvalSource": lifecycle.approvalSource,
+                         "approvalState": lifecycle.status,
+                         "baselineCommit": job.baselineCommit,
+                         "targetKinds": job.targetKinds})
+            if lifecycle.status == "pending":
+                findings.append(_finding("maintenance.approval-required", "pending",
+                                         "a maintenance job is waiting for approval", details={"jobId": job_id}, exit_code=3))
+            elif lifecycle.status == "stale":
+                findings.append(_finding("maintenance.stale-binding", "stale",
+                                         "a maintenance job must be rebuilt before it can run", details={"jobId": job_id}, exit_code=4))
+            elif lifecycle.status == "failed":
+                code = lifecycle.failureCode or "maintenance.agent-failed"
+                if "conflict" in code:
+                    findings.append(_finding("maintenance.source-conflict", "conflict",
+                                             "maintenance encountered an owned-output conflict", details={"jobId": job_id}, exit_code=5))
+                else:
+                    findings.append(_finding("maintenance.agent-failed", "error",
+                                             "maintenance agent attempt failed", details={"jobId": job_id}, exit_code=6))
+        return {"observedEventCursor": state.observedEventCursor, "appliedBaseline": state.appliedBaseline,
+                "policyRevision": _policy_revision(store),
+                "enabled": state.enabled,
+                "policy": {"approval": state.policy.approval, "grantRevision": state.policy.grantRevision,
+                           "targetKinds": state.policy.targetKinds,
+                           "autoGrantActive": _matches_current(store, state) if state.policy.approval == "auto" else False},
+                "jobs": jobs}, tuple(findings), (), []
+    if args.maintain_command in {"approve", "retry"}:
+        from .maintenance_approval import OwnershipConflictError, StaleApprovalError, approve_job
+        job_id = args.job_id
+        try:
+            state = maintenance.read_state()
+            lifecycle = state.jobs.get(job_id)
+            if lifecycle is None:
+                raise LookupError("maintenance job does not exist")
+            if args.maintain_command == "retry" and lifecycle.status != "failed":
+                return None, (_finding("maintenance.retry-not-allowed", "error",
+                                       "retry requires an explicitly retried failed attempt", details={"exitCode": 1}),), (), []
+            approved = approve_job(store, job_id, grant_revision=state.policy.grantRevision)
+        except StaleApprovalError as error:
+            return None, (_finding("maintenance.stale-binding", "stale", str(error), details={"exitCode": 4}),), (), []
+        except OwnershipConflictError as error:
+            return None, (_finding("maintenance.source-conflict", "conflict", str(error), details={"jobId": job_id, "exitCode": 5}),), (), []
+        from .maintenance_worker import run_worker
+        result = run_worker(store, foreground=True, job_id=job_id)
+        code_by_status = {"applied": 0, "noop": 0, "agent-unavailable": 6, "agent-failed": 6,
+                          "conflict": 5, "stale": 4, "approval-required": 4, "not-found": 1,
+                          "disabled": 4, "busy": 4}
+        exit_code = code_by_status.get(result.status, 6)
+        findings = () if exit_code == 0 else (_finding(
+            {5: "maintenance.source-conflict", 6: "maintenance.agent-unavailable", 4: "maintenance.stale-binding"}.get(exit_code, "maintenance.run-failed"),
+            {5: "conflict", 6: "error", 4: "stale"}.get(exit_code, "error"), result.message,
+            details={"jobId": job_id, "exitCode": exit_code},
+        ),)
+        return {"jobId": job_id, "status": result.status, "approval": approved,
+                "appliedBaseline": maintenance.read_state().appliedBaseline}, findings, (), []
+    if args.maintain_command == "skip":
+        with store.mutation():
+            state = maintenance.read_state()
+            lifecycle = state.jobs.get(args.job_id)
+            job = maintenance.read_job(args.job_id)
+            if lifecycle is None or job is None:
+                raise LookupError("maintenance job does not exist")
+            if lifecycle.status not in {"pending", "failed", "stale"}:
+                return None, (_finding("maintenance.skip-not-allowed", "error", "only pending or unresolved jobs can be skipped",
+                                       details={"exitCode": 1}),), (), []
+            jobs = dict(state.jobs)
+            jobs[args.job_id] = replace(lifecycle, status="skipped", approvalSource=None,
+                                        approvalBindingHash=None, skippedTargetCommit=job.targetCommit)
+            maintenance.replace_state(replace(state, jobs=jobs))
+        return {"jobId": args.job_id, "status": "skipped", "appliedBaseline": state.appliedBaseline}, (), (), []
+    if args.maintain_command == "catch-up":
+        state = maintenance.read_state()
+        if any(item.status == "pending" for item in state.jobs.values()):
+            return {"appliedBaseline": state.appliedBaseline, "jobs": len(state.jobs)}, (
+                _finding("maintenance.approval-required", "pending", "maintenance jobs are waiting for approval", exit_code=3),
+            ), (), []
+        return {"appliedBaseline": state.appliedBaseline, "rebuildRequested": args.rebuild}, (
+            _finding("maintenance.rebuild-required", "stale",
+                     "catch-up processing is not available in this build; no baseline was advanced", exit_code=4),
+        ), (), ["run maintain status"]
     raise InvocationError("unknown maintenance command")
 
 
@@ -965,7 +1089,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.quiet = getattr(args, "quiet", False)
         if args.command == "review":
             args.review_command = args.review_command
-        result, findings, diagnostics, next_actions = _dispatch(args)
+        if args.command == "maintain":
+            try:
+                result, findings, diagnostics, next_actions = _dispatch(args)
+            except (OSError, ValueError, TypeError) as error:
+                raise LedgerCorruptionError("maintenance state or records are invalid") from error
+        else:
+            result, findings, diagnostics, next_actions = _dispatch(args)
     except _ParserExit as exit_request:
         return exit_request.status
     except InvocationError:
@@ -1000,5 +1130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         command_name = f"review-{args.review_command}"
     if command_name == "export" and getattr(args, "resume", None):
         command_name = "export-resume"
+    if command_name == "maintain":
+        command_name = f"maintain {args.maintain_command}"
+        if args.maintain_command in {"approve", "skip", "retry"}:
+            command_name += f" {args.job_id}"
     envelope = _envelope(command_name, result, findings, diagnostics, next_actions)
     return _print_envelope(envelope, args.format, args.quiet)

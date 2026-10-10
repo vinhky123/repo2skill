@@ -148,13 +148,14 @@ def _write_absent(path: Path, payload: bytes) -> None:
 
 
 def _set_enabled(store: LedgerStore, enabled: bool) -> None:
+    if not enabled:
+        from .maintenance_approval import revoke_auto_approval
+        revoke_auto_approval(store, enabled=False)
+        return
     maintenance = MaintenanceStore(store.root, store)
     with store.mutation():
         state = maintenance.read_state()
-        policy = state.policy
-        if not enabled and policy.approval == "auto":
-            policy = replace(policy, approval="ask", grantRevision=policy.grantRevision + 1)
-        maintenance.replace_state(replace(state, enabled=enabled, policy=policy))
+        maintenance.replace_state(replace(state, enabled=True))
 
 
 def install_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
@@ -206,6 +207,11 @@ def remove_owned_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
     try:
         _set_enabled(store, False)
     except (OSError, ValueError, RuntimeError) as error:
+        from .maintenance_approval import AutoGrantRevocationError
+        if isinstance(error, AutoGrantRevocationError):
+            return HookInstallResult(
+                False, True, message="maintenance disabled in state, but private auto grant revocation failed; hooks were left unchanged",
+            )
         return HookInstallResult(
             False, True, message=f"maintenance disable could not be persisted ({type(error).__name__}); hooks were left unchanged",
         )
@@ -276,6 +282,14 @@ def process_hook(
             message = "maintenance event recorded; no new relevant job was queued"
             emit(message)
             return HookProcessResult("observed", message=message)
+        queued_state = maintenance.read_state()
+        lifecycle = queued_state.jobs.get(job.jobId)
+        auto_eligible = False
+        if lifecycle is not None and queued_state.policy.approval == "auto":
+            from .maintenance_approval import auto_approval_binding
+            auto_eligible = auto_approval_binding(store, job, lifecycle) is not None
+        if auto_eligible:
+            launch_worker(root)
         affected = ", ".join(job.targetKinds) or "repository"
         changed = ", ".join(job.changedPaths[:5])
         if len(job.changedPaths) > 5:
@@ -283,7 +297,7 @@ def process_hook(
         message = (
             f"maintenance job {job.jobId} queued for {affected} ({changed or 'committed source'}); "
             f"baseline {job.baselineCommit or 'uninitialized'} -> target {job.targetCommit}; "
-            f"run maintain approve {job.jobId}"
+            + ("automatic processing started" if auto_eligible else f"run maintain approve {job.jobId}")
         )
         emit(message)
         return HookProcessResult("pending", job.jobId, message)

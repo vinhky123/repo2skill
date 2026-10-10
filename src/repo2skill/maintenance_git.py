@@ -672,7 +672,10 @@ def enqueue_event(
             _expected_output_hashes(store, target_kinds=state.policy.targetKinds),
         )
         jobs = dict(state.jobs)
-        jobs[job_id] = MaintenanceLifecycle("pending", None, None, "pending", None, None, None)
+        jobs[job_id] = MaintenanceLifecycle(
+            "pending", None, None, "pending", None, None, None,
+            queuedGrantRevision=state.policy.grantRevision,
+        )
         next_state = replace(
             state,
             observedEventCursor=event.cursor,

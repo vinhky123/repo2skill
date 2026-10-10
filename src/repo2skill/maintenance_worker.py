@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import sys
 from typing import Iterator
 
 from .ledger import LedgerStore, LockBusyError
+from .maintenance_approval import (
+    OwnershipConflictError, StaleApprovalError, auto_approval_binding,
+    verify_approval_binding, verify_job_fingerprints,
+)
 from .maintenance_store import MaintenanceStore
 
 
@@ -70,25 +74,61 @@ def run_worker(
                 return WorkerResult("disabled", job_id, "maintenance is disabled; run maintain setup first")
             selected = job_id
             if selected is None:
-                selected = next(
-                    (candidate for candidate, lifecycle in initial.jobs.items()
-                     if lifecycle.status == "approved"),
-                    None,
-                )
+                selected = next((candidate for candidate, lifecycle in initial.jobs.items()
+                                 if lifecycle.status == "approved"), None)
+                if selected is None and initial.policy.approval == "auto":
+                    for candidate, lifecycle in initial.jobs.items():
+                        job = maintenance.read_job(candidate)
+                        if job is not None and lifecycle.status == "pending" and auto_approval_binding(store, job, lifecycle):
+                            selected = candidate
+                            break
             if selected is None:
                 return WorkerResult("idle", message="no approved maintenance job is eligible")
             if selected not in initial.jobs:
                 return WorkerResult("not-found", selected, "maintenance job does not exist")
             lifecycle = initial.jobs[selected]
+            if lifecycle.status == "pending":
+                job = maintenance.read_job(selected)
+                binding = auto_approval_binding(store, job, lifecycle) if job is not None else None
+                if binding is None:
+                    return WorkerResult("approval-required", selected, "approve this exact job before running the worker")
+                with store.mutation():
+                    current = maintenance.read_state()
+                    current_lifecycle = current.jobs.get(selected)
+                    current_job = maintenance.read_job(selected)
+                    if current_lifecycle is None or current_job != job or current_lifecycle.status != "pending":
+                        return WorkerResult("stale", selected, "job changed before automatic approval")
+                    jobs = dict(current.jobs)
+                    jobs[selected] = replace(
+                        current_lifecycle, status="approved", approvalSource="auto",
+                        approvalBindingHash=binding,
+                    )
+                    maintenance.replace_state(replace(current, jobs=jobs))
+                lifecycle = maintenance.read_state().jobs[selected]
             if lifecycle.status != "approved":
                 return WorkerResult("approval-required", selected, "approve this exact job before running the worker")
+            job = maintenance.read_job(selected)
+            if job is None:
+                return WorkerResult("stale", selected, "approved job is missing")
+            try:
+                lifecycle = verify_approval_binding(store, job, lifecycle)
+            except StaleApprovalError as error:
+                return WorkerResult("stale", selected, str(error))
+            try:
+                if job is None:
+                    return WorkerResult("stale", selected, "approved job is missing")
+                verify_job_fingerprints(store, job)
+            except OwnershipConflictError:
+                return WorkerResult("conflict", selected, "owned output content changed after approval")
+            except (StaleApprovalError, OSError, ValueError):
+                return WorkerResult("stale", selected, "approved job fingerprints are stale")
             # Recheck under the ledger mutation lock immediately before the runner seam.
             with store.mutation():
                 current = maintenance.read_state()
                 current_lifecycle = current.jobs.get(selected)
                 if not current.enabled:
                     return WorkerResult("disabled", selected, "maintenance was disabled before the worker could start")
-                if current_lifecycle is None or current_lifecycle.status != "approved":
+                if current_lifecycle is None or current_lifecycle.status != "approved" or current_lifecycle.approvalBindingHash != lifecycle.approvalBindingHash:
                     return WorkerResult("stale", selected, "job approval changed before worker start")
             # Task 7/8 supplies the runner. Never represent unavailable work as applied.
             return WorkerResult(

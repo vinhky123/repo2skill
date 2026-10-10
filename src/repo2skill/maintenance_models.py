@@ -125,6 +125,7 @@ class MaintenanceLifecycle:
     skippedTargetCommit: str | None
     activeAttemptId: str | None
     failureCode: str | None
+    queuedGrantRevision: int | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"pending", "approved", "running", "skipped", "applied", "failed", "stale"}:
@@ -140,6 +141,11 @@ class MaintenanceLifecycle:
             _identifier(self.activeAttemptId, "activeAttemptId")
         if self.failureCode is not None:
             _nonempty(self.failureCode, "failureCode")
+        if self.queuedGrantRevision is not None and (
+            isinstance(self.queuedGrantRevision, bool) or not isinstance(self.queuedGrantRevision, int)
+            or self.queuedGrantRevision < 0
+        ):
+            raise ValueError("queuedGrantRevision must be a nonnegative integer or null")
 
 
 @dataclass(frozen=True, slots=True)

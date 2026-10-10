@@ -4,9 +4,12 @@ import dataclasses
 import json
 import multiprocessing
 from pathlib import Path
+import subprocess
 
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.ledger import LedgerStore
+from repo2skill.ids import effective_policy_revision
+from repo2skill.maintenance_approval import approve_job
 from repo2skill.maintenance_models import MaintenanceJob, MaintenanceLifecycle, MaintenanceState
 from repo2skill.maintenance_store import MaintenanceStore
 from repo2skill.maintenance_worker import _worker_lease, run_worker
@@ -15,6 +18,7 @@ from repo2skill.models import ProjectDocument, ProjectState
 
 def _store(root: Path) -> tuple[Path, LedgerStore]:
     root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
     state_dir = root / ".repo2skill"
     state_dir.mkdir()
     project = ProjectDocument(
@@ -29,16 +33,31 @@ def _store(root: Path) -> tuple[Path, LedgerStore]:
 
 def _approved_job(store: LedgerStore) -> str:
     maint = MaintenanceStore(store.root, store)
-    job = MaintenanceJob(
-        "maintenance-job_0123456789abcdef01234567", "a" * 40, "b" * 40,
-        ("git-event_0123456789abcdef01234567",), ("src.py",), ("skill",),
-        "sha256:" + "1" * 64, "sha256:" + "2" * 64, "policy", ("skill",), None, {},
+    subprocess.run(
+        ["git", "-C", str(store.root), "-c", "user.name=Repo2Skill Tests",
+         "-c", "user.email=tests@example.invalid", "commit", "--allow-empty", "-m", "fixture"],
+        check=True, capture_output=True, text=True,
     )
-    lifecycle = MaintenanceLifecycle("approved", "user", "sha256:" + "3" * 64, "pending", None, None, None)
+    target_commit = subprocess.run(
+        ["git", "-C", str(store.root), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    project = store.read_project()
+    assert project is not None
+    job = MaintenanceJob(
+        "maintenance-job_0123456789abcdef01234567", None, target_commit,
+        ("git-event_0123456789abcdef01234567",), ("src.py",), ("skill",),
+        "sha256:" + "1" * 64, "sha256:" + "2" * 64,
+        effective_policy_revision(project.scanPolicy, project.claimPolicy, project.targets, generation_options={}),
+        ("skill",), None, {},
+    )
+    lifecycle = MaintenanceLifecycle("pending", None, None, "pending", None, None, None,
+                                    queuedGrantRevision=0)
     with store.mutation():
         maint.write_job(job)
         current = maint.read_state()
         maint.replace_state(dataclasses.replace(current, enabled=True, jobs={job.jobId: lifecycle}))
+    approve_job(store, job.jobId)
     return job.jobId
 
 
