@@ -127,17 +127,42 @@ class MaintenanceStore:
         self.ledger.replace_maintenance_state_document(encoded)
 
     def publish_job(
-        self, job: MaintenanceJob, state: MaintenanceState
+        self, job: MaintenanceJob, state: MaintenanceState, *, supersedes: tuple[str, ...] = (),
     ) -> MaintenanceState:
         """Publish an immutable job then commit its visibility with one pointer write."""
         if not self.ledger._mutation_active:
             raise RuntimeError("maintenance job publication requires an active mutation scope")
         current = self.read_state()
+        superseded = set(supersedes)
+        if len(superseded) != len(supersedes):
+            raise ValueError("superseded job IDs must be unique")
+        if not superseded.issubset(current.jobs):
+            raise ValueError("superseded jobs must be visible in the current maintenance state")
+        carried_ids: set[str] = set()
+        for predecessor_id in superseded:
+            lifecycle = current.jobs[predecessor_id]
+            predecessor = self.read_job(predecessor_id)
+            if lifecycle.status not in {"pending", "approved"} or lifecycle.activeAttemptId is not None or predecessor is None:
+                raise ValueError("only never-attempted pending or approved jobs may be superseded")
+            carried_ids.update(predecessor.eventIds)
+            if state.jobs.get(predecessor_id) is None or state.jobs[predecessor_id].status != "stale":
+                raise ValueError("superseded jobs must become stale in the published state")
+        if not set(job.eventIds).issuperset(carried_ids):
+            raise ValueError("replacement job must retain predecessor event provenance")
         prior_event_ids = {event.eventId for event in current.deferredEvents}
         for job_id in current.jobs:
             prior = self.read_job(job_id)
             if prior is not None:
-                prior_event_ids.update(prior.eventIds)
+                overlap = set(prior.eventIds).intersection(job.eventIds)
+                if not overlap:
+                    continue
+                if job_id in superseded:
+                    continue
+                # Old stale copies are history, and can overlap only with provenance
+                # explicitly carried through a current eligible predecessor.
+                if current.jobs[job_id].status == "stale" and overlap.issubset(carried_ids):
+                    continue
+                prior_event_ids.update(overlap)
         if prior_event_ids.intersection(job.eventIds):
             return current
         lifecycle = state.jobs.get(job.jobId)

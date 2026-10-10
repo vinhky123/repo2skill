@@ -211,21 +211,37 @@ def verify_job_fingerprints(store: LedgerStore, job: MaintenanceJob) -> None:
         raise StaleApprovalError("project state is missing")
     if project_state.activeManifestSetId != job.expectedManifestSetId:
         raise StaleApprovalError("active output manifest changed since the job was queued")
+    project = store.read_project()
+    if project is None:
+        raise StaleApprovalError("project configuration is missing")
+    from .ownership import _active_manifests, inspect_target_ownership
+    manifest_set, manifests = _active_manifests(store, project_state)
     if job.expectedOutputHashes:
-        from .ownership import _active_manifests
-        manifest_set, manifests = _active_manifests(store, project_state)
         if (manifest_set.manifestSetId if manifest_set else None) != job.expectedManifestSetId:
             raise StaleApprovalError("active output manifest changed since the job was queued")
         actual = {file.path: file.exactHash for manifest in manifests.values() for file in manifest.files}
         if any(actual.get(path) != digest for path, digest in job.expectedOutputHashes.items()):
             raise StaleApprovalError("owned output manifest fingerprints changed since the job was queued")
-        project = store.read_project()
-        assert project is not None
-        specs = tuple(spec for spec in project.targets if spec.kind in job.targetKinds)
-        from .ownership import inspect_target_ownership
-        conflicts = inspect_target_ownership(specs, store=store)
-        if conflicts:
-            raise OwnershipConflictError("owned output content changed since the job was queued")
+    specs = tuple(spec for spec in project.targets if spec.kind in job.targetKinds)
+    conflicts = inspect_target_ownership(specs, store=store)
+    if conflicts:
+        raise OwnershipConflictError("owned output content changed since the job was queued")
+
+    # The renderer is the authority for exact generated paths. When there is no
+    # manifest entry for a whole-file path, reject an existing live file before
+    # an agent is probed or invoked; apply planning repeats this check later.
+    from .output_fs import read_live_file
+    from .render import render_targets
+    rendered = render_targets((), specs, policy=project.claimPolicy, project_id=project.projectId)
+    declared_paths = {target.targetId: target.relativeFiles for target in rendered.targets}
+    for spec in specs:
+        if spec.ownershipMode != "whole-files":
+            continue
+        previous = manifests.get(spec.targetId)
+        owned_paths = {item.path for item in previous.files} if previous is not None else set()
+        for path in declared_paths[spec.targetId]:
+            if path not in owned_paths and read_live_file(store.root, path, limit=2 * 1024 * 1024) is not None:
+                raise OwnershipConflictError(f"unowned whole-file output already exists: {path}")
 
 
 def approve_job(

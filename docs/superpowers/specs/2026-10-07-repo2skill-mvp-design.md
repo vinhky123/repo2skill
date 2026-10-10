@@ -1,6 +1,6 @@
 # repo2skill MVP design
 
-> **Scope and precedence:** This remains the baseline for implemented P0 commands and contracts. The proposed [2026-10-09 commit-maintenance design](2026-10-09-commit-skill-maintenance-design.md) adds future maintenance behavior and supersedes this document's earlier hook/AI restrictions only for those future maintenance commands. No maintenance feature is claimed implemented.
+> **Scope and precedence:** This remains the baseline for P0 commands and contracts. The [2026-10-09 commit-maintenance design](2026-10-09-commit-skill-maintenance-design.md) specifies the separate local maintenance subsystem and supersedes this document's earlier hook/AI restrictions for its explicit maintenance commands. P0 `check` remains read-only; maintenance approval is granted before invocation and authorizes the bounded validated apply.
 
 Implementation uses the exact record types and corrected stateful signatures in the [implementation contract](../../engineering/implementation-contract.md). It resolves the schema/context gaps in this design; its explicit corrections take precedence during P0 execution.
 

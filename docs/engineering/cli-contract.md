@@ -12,7 +12,7 @@ The executable form is `repo2skill`. All commands accept `--root PATH` (default:
 
 There is one authoritative project document at `<stateDir>/project.json`. `--config` selects that document; an explicit path may be absolute or root-relative, but must resolve canonically inside `--root`, and the decoded document's `stateDir` must identify the document's parent. On `init`, omitting `--config` uses `<root>/.repo2skill/project.json`, except that a custom `--state-dir` selects `<root>/<state-dir>/project.json`. If `--config` is explicit on `init`, it must resolve to `<stateDir>/project.json`; a mismatch is an invocation/configuration error before writes. For a custom state directory, pass its project document on later invocations, for example `repo2skill --config .cache/repo2skill/project.json scan`. No duplicate project documents or config synchronization are supported.
 
-Every mutating invocation acquires the project's OS-owned exclusive state lock before reading authoritative mutable state and holds it through its pointer commit or journal update. Lock contention fails immediately with exit 1 and performs no write. Scan/generate activation, review, export, and `export --resume` use the same lock, so concurrent writers cannot lose a state update.
+Mutating P0 invocations acquire the project's OS-owned exclusive state lock before reading authoritative mutable state and hold it through their pointer commit or journal update. Lock contention fails immediately with exit 1 and performs no write. Maintenance event processing captures its state and P0 fingerprints under the lock, computes bounded Git/context data outside it, then revalidates the consumed state, manifests, policy, output hashes, and eligible job lifecycles before its single pointer replacement. Scan/generate activation, review, export, and `export --resume` use the same lock, so concurrent writers cannot lose a state update.
 
 Global `--version` and `--help` exit 0. Unknown commands/options, mutually exclusive options, missing operands, invalid enum values, and unreadable explicit config paths are invocation errors.
 
@@ -128,6 +128,47 @@ repo2skill doctor [--codex]
 ```
 
 Read-only. Without `--codex`, checks Python/platform support, state/output path confinement, configured filesystem permissions, schema readability, Git availability, and interrupted transaction journals. Actual atomic-replace behavior is verified by platform tests and by the write path when used; doctor does not probe it by writing. It performs no network call. `--codex` additionally locates the installed official executable and checks its local version/help for the required P1 transport surface. This does not validate authentication, network reachability, an actual structured model response, or effective disabling of tools/repository access/instruction autoload; those are verified only by the P1 capability spike and an explicitly consented `generate --ai codex` transport probe. Doctor does not log in, inspect credentials, execute config commands, or invoke a model. Missing or locally unsupported Codex capability exits 6 when `--codex` was requested.
+
+### `maintain`
+
+```text
+repo2skill maintain setup [--manual-hooks] [--auto-approve]
+repo2skill maintain status
+repo2skill maintain catch-up [--rebuild]
+repo2skill maintain approve JOB_ID
+repo2skill maintain retry JOB_ID
+repo2skill maintain skip JOB_ID
+repo2skill maintain disable
+```
+
+Maintenance is separate from the P0 ledger and reads committed Git objects. The explicit first-run sequence is `repo2skill init`, `repo2skill maintain setup`, `repo2skill maintain catch-up --rebuild`, then approval of the exact job ID shown by catch-up/status. `init` does not scan, infer a baseline, or claim output ownership. Catch-up inventories the current committed `HEAD` only when `--rebuild` is explicit and queues a job; it does not advance `appliedBaseline`. The baseline advances only after a normal approved invocation has completed and verified its P0 stage, manifest, and live output hashes. A rebuild leaves the prior baseline and immutable job history intact until that verified apply. An existing unowned `SKILL.md` or `repo2skill-provenance.json` at a configured Skill output path reports an ownership conflict before the agent is probed or invoked; the conflicting bytes remain unchanged, and unrelated files in the directory are preserved. Bootstrap may add the project-owned `AGENTS.md` block while preserving bytes outside its markers.
+
+`maintain status` is read-only. It reports `observedEventCursor` separately from `appliedBaseline`, along with policy revision and each visible job's ID, target commit, impact scopes, lifecycle, and approval source. With no initialized project it reports the `init`/setup/bootstrap sequence; with an initialized project but no verified baseline it asks for `catch-up --rebuild`. A missing baseline is never inferred from current `HEAD`, branch, P0 run, or hook cursor. An unreachable branch tip or missing baseline object exits 4 until the operator explicitly rebuilds. Required committed context that exceeds a read cap or time budget exits 2 and leaves the baseline unchanged.
+
+Hooks observe supported `post-commit`, `post-merge`, `post-checkout`, and `post-rewrite` events. Hook processing only records/queues committed-tree work; it does not invoke an agent or wait for approval. Hooks cannot observe every way a repository may change, so run `maintain catch-up` after unsupported or missed events. The `check` command remains read-only and does not install or run maintenance hooks.
+
+By default, jobs wait for a user decision. `approve JOB_ID` binds approval to that immutable job and then runs the installed headless agent in the foreground; approval happens before the call and directly authorizes a validated bounded apply. There is no second draft approval step. `retry` is an explicit new attempt for failed work; failed, unknown, running, applied, and skipped attempts are not silently reinvoked. `skip` preserves the job and records its skipped lifecycle. `setup --auto-approve` opts into a private, revocable grant for newly queued eligible work. It is non-retroactive: older pending jobs require explicit approval. Revoking or changing the grant invalidates its authority.
+
+`disable` turns off local workers, revokes automatic approval, and removes only unchanged hooks owned by repo2skill. It preserves queued jobs, immutable history, and exported outputs. If a hook was modified or is foreign, maintenance is still disabled and the result provides manual cleanup instructions. An external call already in progress may finish; the delivered-result guard prevents it from applying after disable.
+
+Committed provenance binds bytes, hashes, support IDs, locators, exact authorization references, and ownership/freshness checks. These checks do not establish semantic truth or completeness of model-written prose. The installed adapter requests structured bounded output and read-only operation, but this is not a claim of full isolation from authentication, instruction loading, or every child process. Maintenance uses no automatic Git commit/push, telemetry, remote notification, arbitrary repository command, or background service. Windows, Linux, and macOS use local Git hooks and a hidden local worker where supported; manual catch-up remains available. The current local implementation was exercised on Windows/Python 3.13; remote cross-platform results remain pending.
+
+Current committed-context limits are 256 files, 2 MiB per file, and 16 MiB total. Structured prompt, schema, and agent output limits are 1 MiB, 128 KiB, and 1 MiB; combined stdout/stderr is capped at 256 KiB and the default call timeout is 180 seconds. Hook stdin is capped at 1 MiB. Required context is never silently truncated. The local agent executable is discovered and capability-checked when approval starts; catch-up/status do not probe or invoke it. Unsupported capability, timeout, invalid structured output, or agent failure is reported with a stable diagnostic.
+
+Maintenance exit codes are:
+
+| Code | Meaning |
+|---:|---|
+| 0 | Status/catch-up found no blocking work, or setup/disable/skip completed. |
+| 1 | Invalid command/options/job ID, or setup refused an unsupported/foreign hook integration. |
+| 2 | Required snapshot/context coverage or cap failure. |
+| 3 | A job is waiting for user approval. |
+| 4 | Approval/binding is stale, the baseline object is missing, or a rebuild is required. |
+| 5 | Output ownership conflict; live user bytes are preserved. |
+| 6 | Agent unavailable or failed, including timeout and invalid response. |
+| 7 | Corrupt maintenance state or incomplete recovery. |
+
+Stable diagnostics include `maintenance.approval-required`, `maintenance.stale-binding`, `maintenance.source-conflict`, `maintenance.agent-unavailable`, `maintenance.agent-failed`, and `maintenance.rebuild-required`.
 
 ## Output streams and exit codes
 

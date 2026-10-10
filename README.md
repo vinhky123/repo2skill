@@ -43,6 +43,25 @@ Start a local project lifecycle with:
 
 Accept only claims you have reviewed. `review list` and `generate` report the IDs needed by the review command. Export updates manifest-owned spans and preserves hand-written bytes outside them; conflicts stop the export for manual review.
 
+## Commit maintenance quickstart
+
+The optional local maintenance workflow follows committed Git changes and queues bounded update jobs for an installed headless agent. From a Git repository, initialize and enable it, then establish the first baseline explicitly:
+
+```powershell
+repo2skill init
+repo2skill maintain setup
+repo2skill maintain catch-up --rebuild
+repo2skill maintain status
+repo2skill maintain approve <job-id>
+repo2skill maintain status
+```
+
+Catch-up reads the committed `HEAD`; dirty and untracked working-tree edits are not model input. It queues an approval-gated job and never advances the applied baseline itself. A successful verified apply advances the baseline. `maintain status` shows the observed hook cursor separately from that baseline. The P0 `check` command remains read-only. Supported hooks observe commit, merge, checkout, and rewrite events, but hooks cannot observe every repository change, so run `maintain catch-up` after missed or unsupported events.
+
+By default, review the exact job and approve it before the agent call. Approval directly authorizes the validated bounded apply; there is no second draft-review approval. `maintain setup --auto-approve` opts into a private revocable grant for newly observed eligible jobs only. To stop workers, run `maintain disable`; it keeps queue/history and output files while removing only unchanged hooks owned by repo2skill. An existing unowned `SKILL.md` or `repo2skill-provenance.json` at the configured Skill output path is reported as a conflict before the agent is probed or invoked and remains unchanged. Other files in that directory are preserved. A project-owned `AGENTS.md` block can be added while preserving bytes outside its markers.
+
+Maintenance records live under `<stateDir>/maintenance/` with schema 1.0, separate from P0 runs and manifests. The schema guide covers reopening old P0 1.0 state and recovery. Current local limits are 256 committed files, 2 MiB per file, and 16 MiB total source context; an exceeded required-context cap asks for operator recovery rather than silently truncating. Captured hashes, locators, support IDs, authorization references, and ownership checks establish provenance and binding, not semantic truth of model-written prose. The adapter requests bounded structured output and read-only operation; it does not claim complete isolation from local authentication or instruction loading. See the [maintenance CLI contract](docs/engineering/cli-contract.md#maintain) for exit codes and diagnostics.
+
 ## Verification status
 
 The current local verification host is Windows/Python 3.13. The CI workflow is configured for Windows, Linux, and macOS on Python 3.11 and 3.13; those six matrix results remain pending until the workflow runs. Version `0.1.0` has not been published to a package index.

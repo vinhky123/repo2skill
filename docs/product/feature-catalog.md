@@ -6,7 +6,7 @@ repo2skill là **generator tri thức repository có truy vết**, chạy local-
 
 Phase gồm `P0 — local no-AI alpha`, `P1 — optional Codex + pilot beta`, `P2 — demand-gated later`, và `Excluded — ngoài định hướng đã chốt`. Priority gồm `Must`, `Should`, `Could`, `Won't`. P0 phải hữu ích khi không có model; P1 chỉ mở sau khi P0 đạt acceptance kỹ thuật; P2 cần bằng chứng nhu cầu từ pilot. “Đủ mọi chức năng” trong tài liệu này nghĩa là inventory đầy đủ trong phạm vi sản phẩm đã chốt, không phải lời hứa xây mọi tính năng có thể tưởng tượng.
 
-Phạm vi bảo trì skill sau commit đang được đề xuất riêng trong [thiết kế ngày 2026-10-09](../superpowers/specs/2026-10-09-commit-skill-maintenance-design.md); chưa gán hoặc đánh số lại feature ID trong catalog.
+Luồng bảo trì skill sau commit được đặc tả riêng trong [thiết kế ngày 2026-10-09](../superpowers/specs/2026-10-09-commit-skill-maintenance-design.md) và được ghi nhận trong [CLI contract](../engineering/cli-contract.md); đây là luồng local riêng, không thay đổi feature ID của catalog P0.
 
 Ba chiều nguồn phải độc lập. `Fact.derivation` là `observed | deterministic-derived | heuristic | template`; `Claim.kind` là `observed | inferred | human_policy`; `Claim.origin` là `deterministic | llm | human`. `origin: llm` không biến inference thành observation; `origin: human` không tự biến nội dung thành policy. Template luôn là nguồn không quan sát trực tiếp.
 

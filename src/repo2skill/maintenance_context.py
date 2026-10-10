@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import unicodedata
 
 from . import SCHEMA_VERSION, __version__
 from .claims import derive_claims
@@ -331,16 +332,32 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
     if total > MAX_CONTEXT_TOTAL_BYTES:
         raise ValueError("saved source context exceeds byte cap")
     prior_run = store.read_run(state.currentRunId) if state.currentRunId else None
-    if prior_run is None:
-        raise ValueError("a verified P0 run is required to establish repository identity")
-    repository_id = prior_run.snapshot.repositoryId
+    budget = GitReadBudget(timeout_seconds=30.0, max_output_bytes=MAX_CONTEXT_TOTAL_BYTES * 3)
+    if prior_run is not None:
+        repository_id = prior_run.snapshot.repositoryId
+        prior_claims, prior_facts, prior_evidence = prior_run.claims, prior_run.facts, prior_run.evidence
+    else:
+        # Explicit bootstrap has no P0 run yet. Derive the same stable repository
+        # identity from Git metadata; source bytes below still come only from the
+        # named committed tree.
+        top = Path(_git(store.root, ("rev-parse", "--path-format=absolute", "--show-toplevel"), 4096, budget).decode("utf-8").strip())
+        common = Path(_git(store.root, ("rev-parse", "--path-format=absolute", "--git-common-dir"), 4096, budget).decode("utf-8").strip())
+        common_text = os.path.abspath(common).replace("\\", "/")
+        if os.name == "nt":
+            common_text = os.path.normcase(common_text)
+        common_text = unicodedata.normalize("NFC", common_text)
+        scan_root = store.root.relative_to(top).as_posix() or "."
+        repository_id = canonical_record_id("repo", {
+            "kind": "git", "commonDir": common_text,
+            "scanRoot": unicodedata.normalize("NFC", scan_root),
+        })
+        prior_claims, prior_facts, prior_evidence = (), (), ()
     snapshot_id = canonical_record_id("snapshot", {
         "repository": repository_id, "maintenanceJob": job.jobId,
         "targetCommit": job.targetCommit, "sourceContextHash": job.sourceContextHash,
         "policyRevision": job.policyRevision,
         "extractorRevisions": dict(sorted(maintenance_extractor_versions().items())),
     })
-    budget = GitReadBudget(timeout_seconds=30.0, max_output_bytes=MAX_CONTEXT_TOTAL_BYTES * 3)
     current_head = _git(store.root, ("rev-parse", "--verify", "HEAD^{commit}"), 256, budget).strip().decode("ascii")
     if current_head != job.targetCommit:
         raise ValueError("current committed HEAD differs from maintenance target")
@@ -376,8 +393,6 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
         require_complete_inventory(inventory)
         controls = _control_observations(paths, read_blob, project.scanPolicy)
         identity = RepositoryIdentity(repository_id, root, "head", job.targetCommit, None, False, {})
-        prior_evidence = prior_run.evidence
-        prior_facts = prior_run.facts
         with ExtractionSession(
             root=root, snapshot_id=snapshot_id, inventory=inventory, policy=project.scanPolicy,
             repository_id=repository_id, prior_evidence=prior_evidence, prior_facts=prior_facts,
@@ -400,12 +415,12 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
             "targetCommit": job.targetCommit,
         })
         return MaintenanceContext(
-            job, snapshot, batch.facts, batch.evidence, prior_run.claims,
+            job, snapshot, batch.facts, batch.evidence, prior_claims,
             changed_diff, job.sourceContextHash, batch.reads,
             tuple((*inventory.diagnostics, *batch.diagnostics)),
             tuple((*inventory.coverage, *batch.coverage)), inventory,
             project.scanPolicy, project.claimPolicy, project.targets,
-            prior_run.facts, prior_run.evidence,
+            prior_facts, prior_evidence,
         )
     finally:
         temp_context.cleanup()

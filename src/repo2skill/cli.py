@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import uuid
 from typing import Sequence
@@ -914,7 +915,14 @@ def _command_doctor(args: argparse.Namespace):
 
 
 def _command_maintain(args: argparse.Namespace):
-    _project, store = _store_context(args)
+    _project, store = _store_context(args, required=args.maintain_command not in {"status", "catch-up"})
+    if store is None:
+        message = ("initialize this repository with `repo2skill init`, then run `maintain setup` and "
+                   "`maintain catch-up --rebuild` to establish an approval-gated baseline")
+        return {"observedEventCursor": None, "appliedBaseline": None, "jobs": [],
+                "bootstrapRequired": True, "targetCommit": None}, (
+            _finding("maintenance.rebuild-required", "stale", message, exit_code=4),
+        ), (), ["run repo2skill init", "run repo2skill maintain setup", "run repo2skill maintain catch-up --rebuild"]
     assert store is not None
     maintenance = MaintenanceStore(store.root, store)
     if args.maintain_command in {"approve", "skip", "retry"} and not re.fullmatch(
@@ -961,6 +969,12 @@ def _command_maintain(args: argparse.Namespace):
         from .maintenance_approval import _matches_current, _policy_revision, auto_approval_binding
         jobs = []
         findings = []
+        if state.appliedBaseline is None and not state.jobs:
+            findings.append(_finding(
+                "maintenance.rebuild-required", "stale",
+                "no verified applied baseline exists; run maintain catch-up --rebuild and approve its job",
+                exit_code=4,
+            ))
         for job_id, lifecycle in state.jobs.items():
             job = maintenance.read_job(job_id)
             if job is None:
@@ -1058,15 +1072,76 @@ def _command_maintain(args: argparse.Namespace):
             maintenance.replace_state(replace(state, jobs=jobs))
         return {"jobId": args.job_id, "status": "skipped", "appliedBaseline": state.appliedBaseline}, (), (), []
     if args.maintain_command == "catch-up":
+        from .maintenance_git import (
+            GitReadBudget, MaintenanceGitError, _resolve_commit, _proves_ancestor,
+            _git, bootstrap_commit, compare_commits, enqueue_event,
+        )
+        from .maintenance_models import GitEvent
+        from .ids import canonical_record_id
         state = maintenance.read_state()
-        if any(item.status == "pending" for item in state.jobs.values()):
-            return {"appliedBaseline": state.appliedBaseline, "jobs": len(state.jobs)}, (
-                _finding("maintenance.approval-required", "pending", "maintenance jobs are waiting for approval", exit_code=3),
-            ), (), []
-        return {"appliedBaseline": state.appliedBaseline, "rebuildRequested": args.rebuild}, (
-            _finding("maintenance.rebuild-required", "stale",
-                     "catch-up processing is not available in this build; no baseline was advanced", exit_code=4),
-        ), (), ["run maintain status"]
+        budget = GitReadBudget()
+        try:
+            target = _git(store.root, ("rev-parse", "--verify", "HEAD^{commit}"), 256, budget).decode("ascii").strip()
+            target = _resolve_commit(store.root, target, budget)
+            if state.appliedBaseline is None and not args.rebuild:
+                return {"appliedBaseline": None, "targetCommit": target, "jobs": []}, (
+                    _finding("maintenance.rebuild-required", "stale",
+                             "no applied baseline exists; pass --rebuild to inventory this committed tree",
+                             exit_code=4),
+                ), (), ["run maintain catch-up --rebuild"]
+            rebuilding = args.rebuild
+            if state.appliedBaseline is not None and not rebuilding:
+                if not _proves_ancestor(store.root, state.appliedBaseline, target, budget):
+                    return {"appliedBaseline": state.appliedBaseline, "targetCommit": target,
+                            "rebuildRequired": True, "jobs": []}, (
+                        _finding("maintenance.rebuild-required", "stale",
+                                 "the observed commit does not descend from the verified baseline; use --rebuild",
+                                 exit_code=4),
+                    ), (), ["run maintain catch-up --rebuild"]
+                impact = compare_commits(store.root, state.appliedBaseline, target, budget=budget)
+            elif rebuilding:
+                impact = bootstrap_commit(store.root, target, budget=budget)
+                impact = replace(impact, baselineCommit=state.appliedBaseline)
+            else:
+                impact = compare_commits(store.root, state.appliedBaseline, target, budget=budget)
+        except (MaintenanceGitError, OSError, subprocess.SubprocessError) as error:
+            return {"appliedBaseline": state.appliedBaseline, "rebuildRequired": True, "jobs": []}, (
+                _finding("maintenance.rebuild-required", "stale",
+                         f"committed snapshot could not be proven or covered: {error}", exit_code=4),
+            ), (), ["restore the baseline commit or run maintain catch-up --rebuild"]
+        event_data = {"kind": "manual-catch-up", "targetCommit": target,
+                      "baselineCommit": state.appliedBaseline, "rebuild": rebuilding}
+        event = GitEvent(canonical_record_id("git-event", event_data), "manual-catch-up",
+                         "manual:" + canonical_record_id("event-cursor", event_data), target)
+        job = enqueue_event(store, event, impact, budget=budget,
+                            allow_unreachable_target=rebuilding)
+        current = maintenance.read_state()
+        deferred = next((item for item in current.deferredEvents if item.eventId == event.eventId), None)
+        if deferred is not None and any(token in (deferred.reasonCode or "") for token in ("cap", "timeout")):
+            return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                    "rebuildRequested": rebuilding, "coverageFailure": deferred.reasonCode}, (
+                _finding("maintenance.coverage-required", "incomplete",
+                         "required committed context exceeds a read cap or time budget; no job was published",
+                         details={"reasonCode": deferred.reasonCode}, exit_code=2),
+            ), (), ["reduce the repository context or retry maintain catch-up"]
+        if job is None:
+            if any(item.status == "pending" for item in current.jobs.values()):
+                pending = [{"jobId": key, "targetCommit": (maintenance.read_job(key).targetCommit)}
+                           for key, item in current.jobs.items() if item.status == "pending"]
+                return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                        "jobs": pending, "rebuildRequested": rebuilding}, (
+                    _finding("maintenance.approval-required", "pending",
+                             "maintenance work is waiting for approval", exit_code=3),
+                ), (), []
+            return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                    "jobs": [], "rebuildRequested": rebuilding}, (), (), []
+        return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                "jobs": [{"jobId": job.jobId, "targetCommit": job.targetCommit,
+                          "impactScopes": job.impactScopes, "status": current.jobs[job.jobId].status}],
+                "rebuildRequested": rebuilding}, (
+            _finding("maintenance.approval-required", "pending",
+                     "review this exact committed-tree job, then approve its job ID", details={"jobId": job.jobId}, exit_code=3),
+        ), (), [f"run maintain approve {job.jobId}"]
     raise InvocationError("unknown maintenance command")
 
 

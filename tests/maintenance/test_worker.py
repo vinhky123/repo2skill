@@ -166,6 +166,7 @@ def test_hidden_auto_worker_waits_for_busy_lease_then_drains_current_job(tmp_pat
             raise LockBusyError("held")
         yield
     calls = []
+    refreshes = []
     def fake_run_one(ledger, selected, **_kwargs):
         calls.append((selected, ledger.state_dir))
         with ledger.mutation():
@@ -177,6 +178,8 @@ def test_hidden_auto_worker_waits_for_busy_lease_then_drains_current_job(tmp_pat
 
     monkeypatch.setattr(maintenance_worker, "_worker_lease", fake_lease)
     monkeypatch.setattr(maintenance_worker, "_run_one", fake_run_one)
+    monkeypatch.setattr("repo2skill.maintenance_git.refresh_queued_successor",
+                        lambda ledger: refreshes.append(ledger.state_dir))
     sleeps = []
     result = maintenance_worker.run_worker(store, auto_drain=True, wait_budget_seconds=1,
                                           sleep=lambda seconds: sleeps.append(seconds),
@@ -186,6 +189,7 @@ def test_hidden_auto_worker_waits_for_busy_lease_then_drains_current_job(tmp_pat
     assert len(lease_calls) == 3
     assert sleeps == [0.01]
     assert calls == [(job_id, store.state_dir)]
+    assert refreshes == [store.state_dir]
     assert len(maint.read_state().jobs) == 1
 
 

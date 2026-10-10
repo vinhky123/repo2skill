@@ -23,14 +23,17 @@ with `maintain catch-up` and `maintain status` commands; it never reports an unf
 clients that hide hook output still leave durable status available to `maintain status`; OS notifications are outside
 this MVP. A pending notification record is committed with each job; repeat delivery uses the same stable job ID and is
 idempotent. `check` remains read-only. Initial creation or adoption of a skill needs an explicit bootstrap job and the
-same approval policy. Existing unowned or manually edited files are preserved and reported as conflicts; they are never
-silently assumed to be repo2skill-owned.
+same approval policy. Existing unowned `SKILL.md` or `repo2skill-provenance.json` at configured Skill output paths are
+reported as conflicts before the agent is probed or invoked; their bytes and unrelated directory files are preserved.
+Manually edited owned files are also reported as conflicts. No existing file is silently assumed to be repo2skill-owned.
 
 ## Scope and non-goals
 
 The first supported surface is local Git hooks plus a durable local worker and CLI commands `maintain setup`, `maintain
 status`, `maintain approve JOB_ID`, `maintain skip JOB_ID`, `maintain retry JOB_ID`, `maintain catch-up`, and `maintain
-disable`. These are proposed future commands. Approving a job starts that exact job's AI call and apply flow directly.
+disable`. These commands are implemented locally; the current grammar, diagnostics, limits, and operating sequence are
+maintained in the [CLI contract](../../engineering/cli-contract.md#maintain). Approving a job starts that exact job's AI
+call and apply flow directly.
 `retry` is only for an explicitly retried failed/unknown attempt and never means approval of a different job. Setup
 installs only into an ordinary repository-local `.git/hooks` directory when this is not a linked worktree and each
 target hook is absent or already repo2skill-owned. If `core.hooksPath` is configured, the directory is shared, the
@@ -243,9 +246,9 @@ resolves both the Git queue and P0 export journal safely. Run cross-platform CI 
 is required for unit acceptance; the separately authorized smoke result is reported as capability evidence, not product
 correctness.
 
-The P0 contracts remain authoritative for existing commands. This proposal supersedes prior P1
-facts-only/no-agent-access limitations only for the future `maintain` path described here. It does not claim any
-maintenance feature is implemented.
+The P0 contracts remain authoritative for existing commands. This design supersedes prior P1
+facts-only/no-agent-access limitations only for the `maintain` path described here. Task 10 remains the final local
+acceptance and packaging gate; see the CLI contract for current implementation limits and status.
 
 ## References
 

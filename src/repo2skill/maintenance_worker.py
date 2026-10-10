@@ -397,6 +397,8 @@ def run_worker(
                 result = _run_one(store, selected, explicit_retry=False, probe=probe, invoke=invoke)
                 if result.status not in {"applied", "noop"}:
                     return result
+                from .maintenance_git import refresh_queued_successor
+                refresh_queued_successor(store)
         except LockBusyError:
             if not auto_drain:
                 return WorkerResult("busy", job_id, "another maintenance worker currently holds the OS lease")

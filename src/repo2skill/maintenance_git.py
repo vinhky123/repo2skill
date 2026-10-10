@@ -205,6 +205,20 @@ def _resolve_commit(root: Path, commit: str, budget: GitReadBudget | None = None
     return result
 
 
+def _proves_ancestor(root: Path, baseline: str, target: str, budget: GitReadBudget) -> bool:
+    """Prove reachability with a bounded Git ancestry query; a diff is not proof."""
+    if baseline == target:
+        _resolve_commit(root, target, budget)
+        return True
+    try:
+        _git(root, ("merge-base", "--is-ancestor", baseline, target), 256, budget)
+    except MaintenanceGitError as error:
+        if error.code == "maintenance.git-object-missing":
+            return False
+        raise
+    return True
+
+
 def _deferred_state(
     state: MaintenanceState, event: GitEvent, reason_code: str,
 ) -> MaintenanceState:
@@ -604,135 +618,323 @@ def _affected_scopes(impact: CommitImpact, run: RunLedger | None) -> tuple[str, 
     return tuple(sorted(scopes))
 
 
+
+def _defer_event(store: LedgerStore, maint: MaintenanceStore, captured: MaintenanceState,
+                 event: GitEvent, reason_code: str) -> None:
+    with store.mutation():
+        current = maint.read_state()
+        if current == captured:
+            maint.replace_state(_deferred_state(current, event, reason_code))
+        else:
+            # Do not move an observed cursor backward after another callback won.
+            deferred = _deferred_state(current, event, reason_code)
+            maint.replace_state(replace(deferred, observedEventCursor=current.observedEventCursor))
+
 def enqueue_event(
     store: LedgerStore, event: GitEvent, impact: CommitImpact | None,
     reason_code: str | None = None, *, budget: GitReadBudget | None = None,
+    supersede_job_ids: Sequence[str] | None = None,
+    allow_unreachable_target: bool = False,
 ) -> MaintenanceJob | None:
     """Atomically persist the committed context, immutable job, and event cursor."""
     budget = budget or GitReadBudget()
     maint = MaintenanceStore(store.root, store)
     with store.mutation():
         state = maint.read_state()
-        if state.observedEventCursor == event.cursor:
-            return None
-        if impact is None:
-            maint.replace_state(_deferred_state(
-                state, event, reason_code or event.reasonCode or "maintenance.impact-unavailable",
-            ))
-            return None
-        if impact.targetCommit != event.targetCommit:
-            reason_code = "maintenance.event-impact-mismatch"
-        if impact.baselineCommit != state.appliedBaseline:
-            reason_code = "maintenance.baseline-mismatch"
-        if reason_code:
-            maint.replace_state(_deferred_state(state, event, reason_code))
-            return None
-        project = store.read_project()
-        project_state = store.read_state()
-        if project is None or project_state is None:
-            raise ValueError("initialized P0 project is required to enqueue committed impact")
-        run = _run_for_store(store)
-        exact_outputs, output_prefixes = _project_output_paths(store, project, project_state)
-        impact = _filter_project_outputs(impact, exact_outputs, output_prefixes)
-        # Apply the saved P0 eligibility policy to changed paths before job
-        # selection so excluded names never enter the model-facing job binding.
-        from .inventory import _final_exclusion, _generated_or_security, _normalize_exclude
-        from pathspec import GitIgnoreSpec
-        configured_exclusions = [store.state_dir.relative_to(store.root).as_posix(), "AGENTS.md"]
-        configured_exclusions.extend(target.livePath for target in project.targets)
-        exclude_spec = GitIgnoreSpec.from_lines(
-            (_normalize_exclude(item) for item in project.scanPolicy.exclude), backend="simple",
-        )
-        statuses = impact.changeStatuses or tuple(("M", path) for path in impact.paths)
-        statuses = tuple((status, path) for status, path in statuses
-                         if _final_exclusion(path, False, tuple(configured_exclusions), exclude_spec) is None
-                         and _generated_or_security(path, False) is None)
-        eligible_paths = tuple(sorted({path for _status, path in statuses}))
-        impact = replace(impact, paths=eligible_paths,
-                         renames=tuple(pair for pair in impact.renames if all(path in eligible_paths for path in pair)),
-                         scopes=_classify(eligible_paths, statuses)[0],
-                         requiredFullScan=impact.requiredFullScan or any(status == "D" for status, _path in statuses),
-                         changeStatuses=statuses)
-        if not impact.paths and impact.baselineCommit is not None:
-            maint.replace_state(replace(state, observedEventCursor=event.cursor))
-            return None
-        scopes = _affected_scopes(impact, run)
-        if not scopes:
-            # A previously unobserved input or selector gap cannot prove that
-            # changed committed source is irrelevant. Preserve it for review.
-            scopes = impact.scopes or ("full",)
-        from .maintenance_source_fragment import maintenance_extractor_versions
-        extractor_revisions = maintenance_extractor_versions()
-        from .ids import effective_policy_revision
-        policy_revision = effective_policy_revision(
-            project.scanPolicy, project.claimPolicy, project.targets, generation_options={},
-        )
-        if impact.requiredFullScan or "full" in scopes:
-            selected_paths = set(bootstrap_commit(store.root, event.targetCommit, budget=budget).paths)
-        else:
-            selected_paths = set(impact.paths)
-            if run is not None:
-                # Preserve the complete previous dependency support so retained
-                # claims can be rebound to the target commit's saved context.
-                for read in run.reads:
-                    if read.selector.type == "file":
-                        selected_paths.add(read.selector.value)
-                    selected_paths.update(read.matchPaths)
-                    if read.selector.type == "negative":
-                        absent_path = read.selector.value.split(":", 1)[-1]
-                        if absent_path in impact.paths:
-                            selected_paths.add(absent_path)
-        selected_paths = {
-            path for path in selected_paths
-            if not _is_project_output(path, exact_outputs, output_prefixes)
-        }
-        # Committed Git entries remain eligible even when .gitignore matches
-        # them. Apply P0's final boundaries before materialization and caps.
-        selected_paths = {
-            path for path in selected_paths
-            if _final_exclusion(path, False, tuple(configured_exclusions), exclude_spec) is None
-            and _generated_or_security(path, False) is None
-        }
+    if state.observedEventCursor == event.cursor:
+        return None
+    if impact is None:
+        _defer_event(store, maint, state, event, reason_code or event.reasonCode or "maintenance.impact-unavailable")
+        return None
+    if impact.targetCommit != event.targetCommit:
+        reason_code = "maintenance.event-impact-mismatch"
+    if impact.baselineCommit != state.appliedBaseline:
+        reason_code = "maintenance.baseline-mismatch"
+    if reason_code:
+        _defer_event(store, maint, state, event, reason_code)
+        return None
+    if state.appliedBaseline is not None and not allow_unreachable_target:
         try:
-            with tempfile.TemporaryDirectory(prefix="repo2skill-context-") as temp_dir:
-                temporary = Path(temp_dir)
-                manifest = materialize_commit(
-                    store.root, event.targetCommit, tuple(sorted(selected_paths)), temporary,
-                    policy_revision=policy_revision, extractor_revisions=extractor_revisions,
-                    budget=budget,
-                )
-                manifest_bytes = canonical_json_bytes({
-                    "schemaVersion": "1.0", "manifest": manifest,
-                }) + b"\n"
-                source_hash = manifest.contextHash
-                manifest_id = canonical_record_id("source-context", {"contextHash": source_hash})
-                store.write_immutable_bytes(f"maintenance/contexts/{manifest_id}.json", manifest_bytes)
+            if not _proves_ancestor(store.root, state.appliedBaseline, event.targetCommit, budget):
+                _defer_event(store, maint, state, event, "maintenance.rebuild-required")
+                return None
         except MaintenanceGitError as error:
-            maint.replace_state(_deferred_state(state, event, error.code))
+            _defer_event(store, maint, state, event, "maintenance.rebuild-required")
             return None
-        changed_paths = impact.paths
-        job_id = canonical_record_id("maintenance-job", {
-            "baselineCommit": state.appliedBaseline, "targetCommit": event.targetCommit,
-            "eventIds": [event.eventId], "changedPaths": changed_paths,
-            "impactScopes": scopes, "diffHash": impact.diffHash,
-            "sourceContextHash": source_hash,
-        })
-        job = MaintenanceJob(
-            job_id, state.appliedBaseline, event.targetCommit, (event.eventId,),
-            changed_paths, scopes, impact.diffHash, source_hash, policy_revision,
-            state.policy.targetKinds, project_state.activeManifestSetId,
-            _expected_output_hashes(store, target_kinds=state.policy.targetKinds),
+    predecessors: list[str] = []
+    for candidate, lifecycle in state.jobs.items():
+        if supersede_job_ids is not None and candidate not in supersede_job_ids:
+            continue
+        if (lifecycle.status not in {"pending", "approved"} or lifecycle.activeAttemptId is not None):
+            continue
+        prior = maint.read_job(candidate)
+        if prior is None or (supersede_job_ids is None and prior.baselineCommit != state.appliedBaseline):
+            continue
+        try:
+            if _proves_ancestor(store.root, prior.targetCommit, event.targetCommit, budget):
+                predecessors.append(candidate)
+        except MaintenanceGitError:
+            # Unprovable history cannot authorize supersession.
+            continue
+    if supersede_job_ids is not None and set(predecessors) != set(supersede_job_ids):
+        _defer_event(store, maint, state, event, "maintenance.stale-binding")
+        return None
+    if predecessors:
+        try:
+            impact = (bootstrap_commit(store.root, event.targetCommit, budget=budget)
+                      if state.appliedBaseline is None else
+                      compare_commits(store.root, state.appliedBaseline, event.targetCommit, budget=budget))
+            impact = replace(impact, baselineCommit=state.appliedBaseline)
+        except MaintenanceGitError as error:
+            _defer_event(store, maint, state, event, error.code)
+            return None
+    project = store.read_project()
+    project_state = store.read_state()
+    if project is None or project_state is None:
+        raise ValueError("initialized P0 project is required to enqueue committed impact")
+    run = _run_for_store(store)
+    exact_outputs, output_prefixes = _project_output_paths(store, project, project_state)
+    impact = _filter_project_outputs(impact, exact_outputs, output_prefixes)
+    # Apply the saved P0 eligibility policy to changed paths before job
+    # selection so excluded names never enter the model-facing job binding.
+    from .inventory import _final_exclusion, _generated_or_security, _normalize_exclude
+    from pathspec import GitIgnoreSpec
+    configured_exclusions = [store.state_dir.relative_to(store.root).as_posix(), "AGENTS.md"]
+    configured_exclusions.extend(target.livePath for target in project.targets)
+    exclude_spec = GitIgnoreSpec.from_lines(
+        (_normalize_exclude(item) for item in project.scanPolicy.exclude), backend="simple",
+    )
+    statuses = impact.changeStatuses or tuple(("M", path) for path in impact.paths)
+    statuses = tuple((status, path) for status, path in statuses
+                     if _final_exclusion(path, False, tuple(configured_exclusions), exclude_spec) is None
+                     and _generated_or_security(path, False) is None)
+    eligible_paths = tuple(sorted({path for _status, path in statuses}))
+    impact = replace(impact, paths=eligible_paths,
+                     renames=tuple(pair for pair in impact.renames if all(path in eligible_paths for path in pair)),
+                     scopes=_classify(eligible_paths, statuses)[0],
+                     requiredFullScan=impact.requiredFullScan or any(status == "D" for status, _path in statuses),
+                     changeStatuses=statuses)
+    if not impact.paths and impact.baselineCommit is not None:
+        with store.mutation():
+            current = maint.read_state()
+            if current != state:
+                deferred = _deferred_state(current, event, "maintenance.stale-binding")
+                maint.replace_state(replace(deferred, observedEventCursor=current.observedEventCursor))
+            else:
+                maint.replace_state(replace(state, observedEventCursor=event.cursor))
+        return None
+    scopes = _affected_scopes(impact, run)
+    if not scopes:
+        # A previously unobserved input or selector gap cannot prove that
+        # changed committed source is irrelevant. Preserve it for review.
+        scopes = impact.scopes or ("full",)
+    from .maintenance_source_fragment import maintenance_extractor_versions
+    extractor_revisions = maintenance_extractor_versions()
+    from .ids import effective_policy_revision
+    policy_revision = effective_policy_revision(
+        project.scanPolicy, project.claimPolicy, project.targets, generation_options={},
+    )
+    if impact.requiredFullScan or "full" in scopes:
+        selected_paths = set(bootstrap_commit(store.root, event.targetCommit, budget=budget).paths)
+    else:
+        selected_paths = set(impact.paths)
+        if run is not None:
+            # Preserve the complete previous dependency support so retained
+            # claims can be rebound to the target commit's saved context.
+            for read in run.reads:
+                if read.selector.type == "file":
+                    selected_paths.add(read.selector.value)
+                selected_paths.update(read.matchPaths)
+                if read.selector.type == "negative":
+                    absent_path = read.selector.value.split(":", 1)[-1]
+                    if absent_path in impact.paths:
+                        selected_paths.add(absent_path)
+    selected_paths = {
+        path for path in selected_paths
+        if not _is_project_output(path, exact_outputs, output_prefixes)
+    }
+    # Committed Git entries remain eligible even when .gitignore matches
+    # them. Apply P0's final boundaries before materialization and caps.
+    selected_paths = {
+        path for path in selected_paths
+        if _final_exclusion(path, False, tuple(configured_exclusions), exclude_spec) is None
+        and _generated_or_security(path, False) is None
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="repo2skill-context-") as temp_dir:
+            temporary = Path(temp_dir)
+            manifest = materialize_commit(
+                store.root, event.targetCommit, tuple(sorted(selected_paths)), temporary,
+                policy_revision=policy_revision, extractor_revisions=extractor_revisions,
+                budget=budget,
+            )
+            manifest_bytes = canonical_json_bytes({
+                "schemaVersion": "1.0", "manifest": manifest,
+            }) + b"\n"
+            source_hash = manifest.contextHash
+            manifest_id = canonical_record_id("source-context", {"contextHash": source_hash})
+            context_path = f"maintenance/contexts/{manifest_id}.json"
+            with store.mutation():
+                existing_context = store.read_immutable_bytes(context_path)
+                if existing_context is None:
+                    store.write_immutable_bytes(context_path, manifest_bytes)
+                elif existing_context != manifest_bytes:
+                    raise ValueError("committed source context ID already exists with different bytes")
+    except MaintenanceGitError as error:
+        _defer_event(store, maint, state, event, error.code)
+        return None
+    changed_paths = impact.paths
+    predecessor_event_ids: list[str] = []
+    for predecessor_id in predecessors:
+        predecessor_event_ids.extend(maint.read_job(predecessor_id).eventIds)
+    event_ids = tuple(dict.fromkeys((*predecessor_event_ids, event.eventId)))
+    job_id = canonical_record_id("maintenance-job", {
+        "baselineCommit": state.appliedBaseline, "targetCommit": event.targetCommit,
+        "eventIds": list(event_ids), "changedPaths": changed_paths,
+        "impactScopes": scopes, "diffHash": impact.diffHash,
+        "sourceContextHash": source_hash,
+    })
+    job = MaintenanceJob(
+        job_id, state.appliedBaseline, event.targetCommit, event_ids,
+        changed_paths, scopes, impact.diffHash, source_hash, policy_revision,
+        state.policy.targetKinds, project_state.activeManifestSetId,
+        _expected_output_hashes(store, target_kinds=state.policy.targetKinds),
+    )
+    jobs = dict(state.jobs)
+    for predecessor_id in predecessors:
+        jobs[predecessor_id] = replace(
+            jobs[predecessor_id], status="stale", approvalSource=None,
+            approvalBindingHash=None,
         )
+    queued_grant = state.policy.grantRevision
+    if predecessors:
+        grants = {state.jobs[item].queuedGrantRevision for item in predecessors}
+        queued_grant = next(iter(grants)) if len(grants) == 1 else None
+        if queued_grant != state.policy.grantRevision:
+            queued_grant = None
+        if state.policy.approval == "auto" and queued_grant is not None:
+            from .maintenance_approval import _matches_current
+            if not _matches_current(store, state):
+                queued_grant = None
+    jobs[job_id] = MaintenanceLifecycle(
+        "pending", None, None, "pending", None, None, None,
+        queuedGrantRevision=queued_grant,
+    )
+    next_state = replace(
+        state,
+        observedEventCursor=event.cursor,
+        deferredEvents=tuple(item for item in state.deferredEvents if item.eventId != event.eventId),
+        jobs=jobs,
+    )
+    with store.mutation():
+        current = maint.read_state()
+        current_output_hashes = _expected_output_hashes(store, target_kinds=state.policy.targetKinds)
+        if (current != state or store.read_state() != project_state or store.read_project() != project
+                or current_output_hashes != dict(job.expectedOutputHashes)):
+            deferred = _deferred_state(current, event, "maintenance.stale-binding")
+            maint.replace_state(replace(deferred, observedEventCursor=current.observedEventCursor))
+            return None
+        maint.publish_job(job, next_state, supersedes=tuple(predecessors))
+    return job
+
+
+def refresh_queued_successor(store: LedgerStore) -> MaintenanceJob | None:
+    """Rebind never-attempted queued work after a verified apply advances baseline."""
+    maint = MaintenanceStore(store.root, store)
+    state = maint.read_state()
+    baseline = state.appliedBaseline
+    if baseline is None:
+        return None
+    candidates: list[tuple[str, MaintenanceJob]] = []
+    for job_id, lifecycle in state.jobs.items():
+        if lifecycle.status not in {"pending", "approved"} or lifecycle.activeAttemptId is not None:
+            continue
+        job = maint.read_job(job_id)
+        if job is None or job.baselineCommit == baseline:
+            continue
+        candidates.append((job_id, job))
+    if not candidates:
+        return None
+    budget = GitReadBudget()
+    reachable: list[tuple[str, MaintenanceJob]] = []
+    try:
+        for pair in candidates:
+            if _proves_ancestor(store.root, baseline, pair[1].targetCommit, budget):
+                reachable.append(pair)
+    except MaintenanceGitError:
+        reachable = []
+    if not reachable:
+        _mark_unrefreshable_successors(store, tuple(item[0] for item in candidates))
+        return None
+    latest = reachable[-1]
+    for candidate in reachable:
+        try:
+            if _proves_ancestor(store.root, latest[1].targetCommit, candidate[1].targetCommit, budget):
+                latest = candidate
+        except MaintenanceGitError:
+            _mark_unrefreshable_successors(store, tuple(item[0] for item in candidates))
+            return None
+    for _job_id, candidate_job in reachable:
+        try:
+            if not (_proves_ancestor(store.root, candidate_job.targetCommit, latest[1].targetCommit, budget)
+                    or _proves_ancestor(store.root, latest[1].targetCommit, candidate_job.targetCommit, budget)):
+                _mark_unrefreshable_successors(store, tuple(item[0] for item in candidates))
+                return None
+        except MaintenanceGitError:
+            _mark_unrefreshable_successors(store, tuple(item[0] for item in candidates))
+            return None
+    predecessors = []
+    for job_id, job in reachable:
+        try:
+            if _proves_ancestor(store.root, job.targetCommit, latest[1].targetCommit, budget):
+                predecessors.append(job_id)
+        except MaintenanceGitError:
+            continue
+    if not predecessors:
+        return None
+    unreachable_ids = tuple(job_id for job_id, _job in candidates if job_id not in {item[0] for item in reachable})
+    if unreachable_ids:
+        _mark_unrefreshable_successors(store, unreachable_ids)
+    if latest[1].targetCommit == baseline:
+        _mark_unrefreshable_successors(store, tuple(predecessors))
+        return None
+    try:
+        impact = compare_commits(store.root, baseline, latest[1].targetCommit, budget=budget)
+    except MaintenanceGitError:
+        _mark_unrefreshable_successors(store, tuple(predecessors))
+        return None
+    event_data = {"kind": "post-apply-refresh", "baseline": baseline,
+                  "target": latest[1].targetCommit, "predecessors": sorted(predecessors)}
+    event_id = canonical_record_id("git-event", event_data)
+    cursor = "refresh:" + hashlib.sha256(canonical_json_bytes(event_data)).hexdigest()
+    event = GitEvent(event_id, "post-apply-refresh", cursor, latest[1].targetCommit)
+    successor = enqueue_event(store, event, impact, budget=budget, supersede_job_ids=tuple(predecessors))
+    if successor is None:
+        refreshed = maint.read_state()
+        existing_successor = any(
+            (candidate := maint.read_job(job_id)) is not None
+            and candidate.baselineCommit == baseline
+            and candidate.targetCommit == latest[1].targetCommit
+            and set(latest[1].eventIds).issubset(candidate.eventIds)
+            for job_id in refreshed.jobs
+            if refreshed.jobs[job_id].status in {"pending", "approved"}
+        )
+        if not existing_successor:
+            _mark_unrefreshable_successors(store, tuple(predecessors))
+    return successor
+
+
+def _mark_unrefreshable_successors(store: LedgerStore, job_ids: tuple[str, ...]) -> None:
+    maint = MaintenanceStore(store.root, store)
+    with store.mutation():
+        state = maint.read_state()
         jobs = dict(state.jobs)
-        jobs[job_id] = MaintenanceLifecycle(
-            "pending", None, None, "pending", None, None, None,
-            queuedGrantRevision=state.policy.grantRevision,
-        )
-        next_state = replace(
-            state,
-            observedEventCursor=event.cursor,
-            deferredEvents=tuple(item for item in state.deferredEvents if item.eventId != event.eventId),
-            jobs=jobs,
-        )
-        maint.publish_job(job, next_state)
-        return job
+        changed = False
+        for job_id in job_ids:
+            lifecycle = jobs.get(job_id)
+            if lifecycle is not None and lifecycle.status in {"pending", "approved"} and lifecycle.activeAttemptId is None:
+                jobs[job_id] = replace(lifecycle, status="stale", approvalSource=None,
+                                       approvalBindingHash=None, failureCode="maintenance.rebuild-required")
+                changed = True
+        if changed:
+            maint.replace_state(replace(state, jobs=jobs))
