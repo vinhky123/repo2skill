@@ -55,7 +55,7 @@ class MaintenanceContext:
     priorEvidence: tuple[Evidence, ...] = ()
 
 
-def build_agent_request(context: MaintenanceContext, snapshot_root: Path):
+def build_agent_request(context: MaintenanceContext, snapshot_root: Path, *, source_root: Path):
     """Frame the complete bounded committed context as an exact structured stdin prompt."""
     import base64
     from .maintenance_agent import AgentRequest, PROMPT_MAX_BYTES, SCHEMA_MAX_BYTES, request_hash
@@ -96,7 +96,7 @@ def build_agent_request(context: MaintenanceContext, snapshot_root: Path):
     if len(schema_bytes) > SCHEMA_MAX_BYTES:
         raise ValueError("maintenance agent schema exceeds 128 KiB")
     return AgentRequest(context.job.jobId, Path(snapshot_root), prompt_bytes, schema_bytes,
-                        request_hash(context.job.jobId, prompt_bytes, schema_bytes))
+                        request_hash(context.job.jobId, prompt_bytes, schema_bytes), Path(source_root))
 
 
 @dataclass(frozen=True, slots=True)

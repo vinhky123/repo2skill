@@ -41,7 +41,7 @@ def test_invoke_agent_uses_bounded_structured_stdin_schema_output_and_clean_cwd(
     snapshot.mkdir()
     request = AgentRequest("job", snapshot, b"exact prompt\x00", b'{"type":"object"}', "")
     request = AgentRequest(request.jobId, request.snapshotRoot, request.promptBytes, request.schemaBytes,
-                           "sha256:" + hashlib.sha256(b"job\0" + request.promptBytes + b"\0" + request.schemaBytes).hexdigest())
+                           "sha256:" + hashlib.sha256(b"job\0" + request.promptBytes + b"\0" + request.schemaBytes).hexdigest(), tmp_path)
 
     response = invoke_agent(probe_agent(executable), request, 2)
 
@@ -54,6 +54,38 @@ def test_invoke_agent_uses_bounded_structured_stdin_schema_output_and_clean_cwd(
     assert not (Path(record["cwd"]) / "AGENTS.md").exists()
     assert response.status == "ok"
     assert response.outputBytes == b'{"jobId":"job","snapshotId":"snap","operations":[]}'
+
+
+def test_invocation_refuses_temp_base_inside_target_source_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+    from repo2skill.maintenance_agent import request_hash
+    source_root = tmp_path / "target-repo"
+    temp_root = source_root / "tmp"
+    snapshot = tmp_path / "snapshot"
+    temp_root.mkdir(parents=True)
+    snapshot.mkdir()
+    executable = _fake_cli(tmp_path / "codex.py", tmp_path / "invocation.json")
+    capability = probe_agent(executable)
+    request = AgentRequest("job", snapshot, b"prompt", b"{}", request_hash("job", b"prompt", b"{}"), sourceRoot=source_root)
+    monkeypatch.setenv("TMP", str(temp_root))
+    monkeypatch.setenv("TEMP", str(temp_root))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    response = invoke_agent(capability, request, 2)
+    assert response.status == "unavailable"
+    assert "outside" in (response.diagnostic or "")
+    assert not (tmp_path / "invocation.json").exists()
+
+
+def test_invoke_requires_verified_source_root_before_creating_temp_workspace(tmp_path: Path) -> None:
+    from repo2skill.maintenance_agent import request_hash
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    executable = _fake_cli(tmp_path / "codex.py", tmp_path / "invocation.json")
+    request = AgentRequest("job", snapshot, b"prompt", b"{}", request_hash("job", b"prompt", b"{}"))
+    response = invoke_agent(probe_agent(executable), request, 2)
+    assert response.status == "invalid-request"
+    assert "source root" in (response.diagnostic or "")
+    assert not (tmp_path / "invocation.json").exists()
 
 
 def test_validate_operations_accepts_an_exactly_supported_operation_and_noop() -> None:
@@ -102,6 +134,23 @@ def test_validate_operations_rejects_entire_invalid_transaction(mutation: str) -
         validate_operations(SimpleNamespace(status="ok", outputBytes=output, diagnostic=None), context)
 
 
+def test_update_and_delete_for_same_semantic_claim_are_one_invalid_transaction() -> None:
+    from types import SimpleNamespace
+    context = SimpleNamespace(
+        job=SimpleNamespace(jobId="job"), snapshot=SimpleNamespace(snapshotId="snap"),
+        facts=(SimpleNamespace(factId="fact_a", snapshotId="snap", scope="global", factType="source.fragment.v1", evidenceIds=("evidence_a",)),),
+        evidence=(SimpleNamespace(evidenceId="evidence_a", snapshotId="snap"),),
+        priorClaims=(SimpleNamespace(claimId="claim_a", claimRevision=1, scope="global", semanticKey="source.fragment.v1:test"),),
+    )
+    update = {"op":"update", "semanticKey":"source.fragment.v1:test", "scope":"global",
+        "renderedText":"Updated wording.", "factIds":["fact_a"], "evidenceIds":["evidence_a"], "claimRef":"claim_a@1"}
+    delete = {"op":"delete", "semanticKey":"source.fragment.v1:test", "scope":"global",
+        "renderedText":None, "factIds":[], "evidenceIds":[], "claimRef":"claim_a@1"}
+    response = SimpleNamespace(status="ok", outputBytes=json.dumps({"jobId":"job", "snapshotId":"snap", "operations":[update, delete]}).encode(), diagnostic=None)
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_operations(response, context)
+
+
 @pytest.mark.parametrize(("mode", "expected"), [("timeout", "timeout"), ("nonzero", "nonzero-exit"),
                                                    ("missing-output", "missing-output"), ("output-cap", "output-cap")])
 def test_invocation_failures_are_bounded_and_typed(tmp_path: Path, mode: str, expected: str) -> None:
@@ -112,7 +161,7 @@ def test_invocation_failures_are_bounded_and_typed(tmp_path: Path, mode: str, ex
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     prompt, schema = b"p", b"{}"
-    request = AgentRequest("job", snapshot, prompt, schema, request_hash("job", prompt, schema))
+    request = AgentRequest("job", snapshot, prompt, schema, request_hash("job", prompt, schema), tmp_path)
     # Keep the cap test fast while exercising the same bounded output path.
     if mode == "output-cap":
         import repo2skill.maintenance_agent as agent
@@ -142,7 +191,7 @@ def test_over_cap_request_is_rejected_before_cli_invocation(tmp_path: Path, monk
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     monkeypatch.setattr(agent, "PROMPT_MAX_BYTES", 2)
-    request = AgentRequest("job", snapshot, b"oversize", b"{}", agent.request_hash("job", b"oversize", b"{}"))
+    request = AgentRequest("job", snapshot, b"oversize", b"{}", agent.request_hash("job", b"oversize", b"{}"), tmp_path)
     response = invoke_agent(probe_agent(executable), request, 1)
     assert response.status == "input-cap"
     assert not (tmp_path / "calls.json").exists()
@@ -156,12 +205,13 @@ def test_build_agent_request_frames_bounded_committed_context(tmp_path: Path) ->
         sourceContextHash="sha256:" + "a" * 64, changedDiff=b"diff\x00bytes",
         facts=(), evidence=(), priorClaims=(),
     )
-    request = build_agent_request(context, tmp_path)
+    request = build_agent_request(context, tmp_path, source_root=tmp_path)
     prompt = json.loads(request.promptBytes)
     assert prompt["jobId"] == "job"
     assert prompt["snapshotId"] == "snap"
     assert prompt["changedDiffBase64"] == "ZGlmZgBieXRlcw=="
     assert request.snapshotRoot == tmp_path
+    assert request.sourceRoot == tmp_path
     assert len(request.promptBytes) <= 1024 * 1024
     assert len(request.schemaBytes) <= 128 * 1024
     assert request.requestHash.startswith("sha256:")
@@ -228,9 +278,21 @@ def test_invoking_crash_recovers_as_unknown_and_retry_appends_child(tmp_path: Pa
     begin_invocation(ledger, job_id, first.attemptId)
     with ledger.mutation():
         ledger.write_immutable_bytes(f"maintenance/attempts/{first.attemptId}/response.bin", b"orphaned completed response")
+        prepared_bytes = ledger.read_immutable_bytes(f"maintenance/attempts/{first.attemptId}/prepared.json")
+        ledger.write_immutable(f"maintenance/attempts/{first.attemptId}/unknown.json", json.loads(prepared_bytes.decode("utf-8")))
     recovered = recover_attempt(ledger, job_id)
     assert recovered.phase == "unknown"
     assert maintenance.read_state().jobs[job_id].status == "failed"
+    assert maintenance.read_state().runningJobId is None
+    unknown_path = state_dir / "maintenance" / "attempts" / first.attemptId / "unknown.json"
+    original_unknown = json.loads(unknown_path.read_text(encoding="utf-8"))
+    for field, forged_value in (("jobId", "other-job_0123456789abcdef01234567"), ("requestHash", "sha256:" + "8" * 64),
+                               ("approvalBindingHash", "sha256:" + "9" * 64),
+                               ("retryOfAttemptId", "maintenance-attempt_0123456789abcdef01234567")):
+        unknown_path.write_text(json.dumps({**original_unknown, field: forged_value}), encoding="utf-8")
+        with pytest.raises(ValueError, match="attempt"):
+            recover_attempt(ledger, job_id)
+        unknown_path.write_text(json.dumps(original_unknown), encoding="utf-8")
     with pytest.raises(ValueError, match="explicit retry"):
         prepare_attempt(ledger, job_id, "sha256:" + "4" * 64)
 
@@ -246,12 +308,26 @@ def test_invoking_crash_recovers_as_unknown_and_retry_appends_child(tmp_path: Pa
     begin_invocation(ledger, job_id, second.attemptId)
     saved = persist_response(ledger, job_id, second.attemptId, status="ok", output_bytes=b"exact response", diagnostic="stderr")
     assert saved.phase == "responded"
+    metadata_path = state_dir / "maintenance" / "attempts" / second.attemptId / "responded.json"
+    original_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for field, forged_value in (("jobId", "other-job_0123456789abcdef01234567"), ("requestHash", "sha256:" + "8" * 64),
+                                ("approvalBindingHash", "sha256:" + "9" * 64),
+                                ("retryOfAttemptId", "maintenance-attempt_0123456789abcdef01234567"), ("status", "invented"), ("status", ["ok"]),
+                                ("exitCode", "zero"), ("diagnostic", {"unexpected": True}),
+                                ("outputLength", 999), ("outputHash", "sha256:" + "b" * 64)):
+        forged_metadata = {**original_metadata, field: forged_value}
+        metadata_path.write_text(json.dumps(forged_metadata), encoding="utf-8")
+        with pytest.raises(ValueError, match="attempt|response"):
+            read_response(ledger, second.attemptId)
+        metadata_path.write_text(json.dumps(original_metadata), encoding="utf-8")
     response = read_response(ledger, second.attemptId)
     assert response.status == "ok"
     assert response.outputBytes == b"exact response"
     assert response.diagnostic == "stderr"
     fail_attempt(ledger, job_id, second.attemptId, "maintenance.agent-validation-failed")
     assert maintenance.read_state().jobs[job_id].status == "failed"
-    (state_dir / "maintenance" / "attempts" / second.attemptId / "response.bin").unlink()
-    with pytest.raises(ValueError, match="missing or has a different length"):
+    response_path = state_dir / "maintenance" / "attempts" / second.attemptId / "response.bin"
+    response_path.unlink()
+    response_path.write_bytes(b"x" * (1024 * 1024 + 1))
+    with pytest.raises(ValueError, match="exceeds byte limit"):
         read_response(ledger, second.attemptId)

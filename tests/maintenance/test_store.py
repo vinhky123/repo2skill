@@ -126,6 +126,19 @@ def test_job_hashes_are_defensively_immutable_across_round_trip(tmp_path: Path) 
         reopened.expectedOutputHashes[path] = changed_hash
 
 
+def test_guarded_immutable_reader_rejects_oversized_file_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_store(tmp_path / "repo")
+    relative = "maintenance/attempts/maintenance-attempt_0123456789abcdef01234567/response.bin"
+    with store.ledger.mutation():
+        store.ledger.write_immutable_bytes(relative, b"x" * 1024)
+    from repo2skill.safe_fs import GuardedFile
+    monkeypatch.setattr(GuardedFile, "read_bounded", lambda *_args: pytest.fail("oversized bytes were read before cap rejection"))
+    with pytest.raises(ValueError, match="exceeds byte limit"):
+        store.ledger.read_immutable_bytes(relative, max_bytes=32)
+
+
 def test_single_pointer_commits_cursor_and_job_together(tmp_path: Path) -> None:
     store = _make_store(tmp_path / "repo")
     job = _job()

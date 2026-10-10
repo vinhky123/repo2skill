@@ -533,8 +533,10 @@ class LedgerStore:
         parts = path.relative_to(self.root).parts
         store_io.write_immutable(self.root, parts[:-1], parts[-1], payload, create=True)
 
-    def read_immutable_bytes(self, relative_path: str) -> bytes | None:
-        """Read an immutable byte artifact through guarded directory handles."""
+    def read_immutable_bytes(self, relative_path: str, *, max_bytes: int | None = None) -> bytes | None:
+        """Read an immutable byte artifact through guarded handles with an optional open-handle cap."""
+        if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0):
+            raise ValueError("max_bytes must be a nonnegative integer or None")
         path = self._store_path(relative_path, create_parents=False)
         if not path.exists():
             if path.is_symlink():
@@ -547,8 +549,11 @@ class LedgerStore:
                 guard.close()
                 guard = guard_next
             with guard.open_file(relative.parts[-1]) as opened:
-                payload = opened.read_bounded(opened.stat_before.st_size)
-                if len(payload) != opened.stat_before.st_size or not opened.stable_after_read():
+                size = opened.stat_before.st_size
+                if max_bytes is not None and size > max_bytes:
+                    raise ValueError(f"immutable artifact exceeds byte limit: {relative_path}")
+                payload = opened.read_bounded(size)
+                if len(payload) != size or not opened.stable_after_read():
                     raise ValueError(f"immutable artifact changed while reading: {relative_path}")
                 return payload
 

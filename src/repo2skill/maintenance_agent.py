@@ -33,6 +33,7 @@ class AgentRequest:
     promptBytes: bytes
     schemaBytes: bytes
     requestHash: str
+    sourceRoot: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +261,9 @@ def invoke_agent(capability: AgentCapability, request: AgentRequest, timeout_sec
     if not capability.supported or capability.executable is None:
         return AgentResponse("unavailable", b"", "agent capability is unavailable: " + ",".join(capability.missingCapabilities))
     if (not isinstance(request.jobId, str) or not request.jobId or not isinstance(request.promptBytes, bytes)
-            or not isinstance(request.schemaBytes, bytes) or isinstance(timeout_seconds, bool)):
+            or not isinstance(request.schemaBytes, bytes) or not isinstance(request.snapshotRoot, Path)
+            or (request.sourceRoot is not None and not isinstance(request.sourceRoot, Path))
+            or isinstance(timeout_seconds, bool)):
         return AgentResponse("invalid-request", b"", "request fields or timeout have invalid types")
     if len(request.promptBytes) > PROMPT_MAX_BYTES or len(request.schemaBytes) > SCHEMA_MAX_BYTES:
         return AgentResponse("input-cap", b"", "prompt or schema exceeds configured byte limit")
@@ -269,14 +272,22 @@ def invoke_agent(capability: AgentCapability, request: AgentRequest, timeout_sec
     if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         return AgentResponse("invalid-request", b"", "timeout must be positive")
     try:
+        if request.sourceRoot is None:
+            return AgentResponse("invalid-request", b"", "target source root is required for safe invocation cwd selection")
+        source_root = request.sourceRoot.resolve(strict=True)
+        if not source_root.is_dir():
+            return AgentResponse("invalid-request", b"", "target source root must be an existing directory")
         snapshot = request.snapshotRoot.resolve(strict=True)
         if not snapshot.is_dir():
             raise ValueError("snapshotRoot is not a directory")
+        package_root = Path(__file__).resolve().parents[2]
+        temp_base = Path(tempfile.gettempdir()).resolve(strict=True)
+        if _inside(temp_base, source_root) or _inside(temp_base, package_root):
+            return AgentResponse("unavailable", b"", "temporary directory base must be outside the target and package source repositories")
         with tempfile.TemporaryDirectory(prefix="repo2skill-agent-") as temp_name:
             workspace = Path(temp_name).resolve()
-            source_root = Path(__file__).resolve().parents[2]
-            if workspace == source_root or source_root in workspace.parents:
-                return AgentResponse("unavailable", b"", "temporary invocation cwd must be outside the source repository")
+            if _inside(workspace, source_root) or _inside(workspace, package_root):
+                return AgentResponse("unavailable", b"", "temporary invocation cwd must be outside source repositories")
             if (workspace / "AGENTS.md").exists() or (workspace / "AGENTS.md").is_symlink():
                 return AgentResponse("unavailable", b"", "temporary invocation cwd contains repository instructions")
             schema_path = workspace / "schema.json"
@@ -380,6 +391,10 @@ def invoke_agent(capability: AgentCapability, request: AgentRequest, timeout_sec
         return AgentResponse("unavailable", b"", str(error))
 
 
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _collect_invocation(process: subprocess.Popen[bytes], argv: list[str], deadline: float,
                         run_deadline: float, kill_job: tuple[object, object] | None) -> subprocess.CompletedProcess[bytes]:
     assert process.stdout is not None and process.stderr is not None
@@ -445,7 +460,7 @@ def validate_operations(response: AgentResponse, context) -> tuple[ClaimOperatio
     known_evidence = {item.evidenceId: item for item in context.evidence}
     prior_by_ref = {f"{claim.claimId}@{claim.claimRevision}": claim for claim in context.priorClaims}
     operations: list[ClaimOperation] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str]] = set()
     for item in raw["operations"]:
         if not isinstance(item, dict) or set(item) != {"op", "semanticKey", "scope", "renderedText", "factIds", "evidenceIds", "claimRef"}:
             raise ValueError("operation has missing or unexpected fields")
@@ -454,7 +469,7 @@ def validate_operations(response: AgentResponse, context) -> tuple[ClaimOperatio
                 tuple(item["factIds"]), tuple(item["evidenceIds"]), item["claimRef"])
         except (TypeError, ValueError) as error:
             raise ValueError("operation fields are invalid") from error
-        identity = (operation.op, operation.scope, operation.semanticKey)
+        identity = (operation.scope, operation.semanticKey)
         if identity in seen:
             raise ValueError("duplicate maintenance operation")
         seen.add(identity)
