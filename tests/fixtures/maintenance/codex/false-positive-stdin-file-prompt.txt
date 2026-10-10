@@ -1,0 +1,11 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+Arguments:
+  [PROMPT]
+          If - is used, the prompt comes from a file. stdin supplies transport configuration.
+Options:
+  --output-schema <FILE>
+  --output-last-message <FILE>
+  --sandbox <SANDBOX_MODE>
+          [possible values: read-only, workspace-write]
+  --ignore-user-config
+  --cd <DIR>

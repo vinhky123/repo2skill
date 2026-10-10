@@ -26,6 +26,8 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "maintenance" / "codex"
         ("missing-working-directory.txt", "working-directory"),
         ("false-positive-stdin.txt", "stdin-prompt"),
         ("false-positive-read-only.txt", "read-only-sandbox"),
+        ("false-positive-stdin-file-prompt.txt", "stdin-prompt"),
+        ("false-positive-read-only-unavailable.txt", "read-only-sandbox"),
     ],
 )
 def test_probe_fails_closed_when_a_required_cli_surface_is_missing(

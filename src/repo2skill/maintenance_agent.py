@@ -135,14 +135,23 @@ def _option_blocks(options_text: str) -> dict[str, str]:
 
 def _supports_stdin_prompt(help_text: str) -> bool:
     prompt_block = _argument_block(help_text, "PROMPT")
-    if not prompt_block or "stdin" not in prompt_block.casefold():
+    if not prompt_block:
         return False
     text = prompt_block.casefold()
-    accepts_dash = re.search(
-        r"\b(?:if|when)\s+(?:the\s+)?`?-`?\s+(?:is\s+)?(?:used|provided)\b", text
+    stdin_source = (
+        r"(?:the\s+)?(?:instructions|prompt)\s+"
+        r"(?:are|is)\s+read\s+from\s+stdin"
     )
-    accepts_omitted = re.search(r"\b(?:omitted|not provided)\b", text)
-    return bool(accepts_dash or accepts_omitted)
+    accepts_omitted = re.search(
+        rf"\bif\s+not provided as an argument"
+        rf"(?:\s*\(\s*or\s+if\s+`?-`?\s+is\s+used\s*\))?,"
+        rf"\s*{stdin_source}\b",
+        text,
+    )
+    accepts_dash = re.search(
+        rf"\bif\s+`?-`?\s+is\s+used,\s*{stdin_source}\b", text
+    )
+    return bool(accepts_omitted or accepts_dash)
 
 
 def _argument_block(help_text: str, argument: str) -> str:
@@ -163,12 +172,13 @@ def _argument_block(help_text: str, argument: str) -> str:
 def _supports_read_only_sandbox(sandbox_help: str) -> bool:
     if not sandbox_help:
         return False
-    values = re.search(r"possible values\s*:\s*\[?([^\]\n]+)", sandbox_help)
+    values = re.search(r"\[possible values\s*:\s*([^\]]+)\]", sandbox_help)
     if values is None:
         return False
-    return "read-only" in {
-        value.casefold() for value in re.findall(r"[a-z][a-z0-9_-]*", values.group(1))
-    }
+    choices = [choice.strip().casefold() for choice in values.group(1).split(",")]
+    return all(re.fullmatch(r"[a-z][a-z0-9_-]*", choice) for choice in choices) and (
+        "read-only" in choices
+    )
 
 
 def _resolve_executable(executable: Path | None) -> Path | None:
