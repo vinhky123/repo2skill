@@ -162,6 +162,14 @@ def _recover_after_applied_pointer(store: LedgerStore, job_id: str) -> WorkerRes
     return WorkerResult(result.status, job_id, "recovered apply after its maintenance pointer committed")
 
 
+def _recover_apply_after_error(store: LedgerStore, job_id: str) -> WorkerResult | None:
+    """Prefer durable apply recovery over failing a responded attempt."""
+    result = _recover_apply_first(store, job_id)
+    if result is None:
+        return _recover_after_applied_pointer(store, job_id)
+    return result
+
+
 def _run_one(
     store: LedgerStore, job_id: str, *, explicit_retry: bool,
     probe: Callable | None = None, invoke: Callable | None = None,
@@ -313,19 +321,19 @@ def _run_one(
             return WorkerResult(result.status, job_id, "maintenance apply was verified")
         return WorkerResult(result.status, job_id, "maintenance export remains incomplete; run maintain catch-up")
     except OwnershipConflictError as error:
-        recovered = _recover_after_applied_pointer(store, job_id)
+        recovered = _recover_apply_after_error(store, job_id)
         if recovered is not None:
             return recovered
         fail_attempt(store, job_id, attempt.attemptId, "maintenance.source-conflict")
         return WorkerResult("conflict", job_id, str(error))
     except StaleApprovalError as error:
-        recovered = _recover_after_applied_pointer(store, job_id)
+        recovered = _recover_apply_after_error(store, job_id)
         if recovered is not None:
             return recovered
         fail_attempt(store, job_id, attempt.attemptId, "maintenance.stale-binding")
         return WorkerResult("stale", job_id, str(error))
     except (OSError, ValueError, RuntimeError) as error:
-        recovered = _recover_after_applied_pointer(store, job_id)
+        recovered = _recover_apply_after_error(store, job_id)
         if recovered is not None:
             return recovered
         fail_attempt(store, job_id, attempt.attemptId, "maintenance.agent-failed")

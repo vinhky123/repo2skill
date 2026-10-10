@@ -92,7 +92,6 @@ def _active_targets(store: LedgerStore, bundle: MaintenanceRunBundle):
 
 
 def _guarded_live_projection(store: LedgerStore, journal: ExportJournal, manifests) -> dict[str, str | None]:
-    from .ownership import manifest_set_id_for_export
     projected = {file.path: file.exactHash for manifest in manifests.values() for file in manifest.files}
     for operation in journal.operations:
         if operation.action == "replace":
@@ -112,13 +111,11 @@ def _check_projection(store: LedgerStore, journal: ApplyJournal) -> None:
             raise ValueError(f"maintenance intended output differs from live bytes: {path}")
 
 
-def _finalize(store: LedgerStore, job: MaintenanceJob, intent: ApplyJournal, guard: CommittedSourceGuard) -> str:
-    from .maintenance_approval import verify_approval_binding
+def _verify_active_apply(store: LedgerStore, intent: ApplyJournal):
     from .ownership import _active_manifests
 
     project_state = store.read_state()
-    project = store.read_project()
-    if project_state is None or project is None:
+    if project_state is None:
         raise ValueError("initialized project state is required to finalize maintenance")
     if (project_state.currentRunId != intent.intendedRunId
             or project_state.activeStageRevision != intent.intendedStageRevision
@@ -129,20 +126,28 @@ def _finalize(store: LedgerStore, job: MaintenanceJob, intent: ApplyJournal, gua
     if manifest_set is None or manifest_set.manifestSetId != intent.intendedManifestSetId:
         raise ValueError("active manifest set does not match the durable apply intent")
     _check_projection(store, intent)
+    return project_state, manifest_set, manifests
+
+
+def _finalize(store: LedgerStore, job: MaintenanceJob, intent: ApplyJournal, guard: CommittedSourceGuard) -> str:
+    from .maintenance_approval import verify_approval_binding
     maintenance = MaintenanceStore(store.root, store)
-    current = maintenance.read_state()
-    lifecycle = current.jobs.get(job.jobId)
-    if lifecycle is None:
-        raise ValueError("maintenance lifecycle disappeared during apply")
-    if lifecycle.status == "applied":
-        if current.appliedBaseline != job.targetCommit:
-            raise ValueError("applied lifecycle has a different baseline")
-        completed = replace(intent, status="applied", completedAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
-        _persist_apply_journal(store, completed)
-        return "applied"
-    recheck_committed_source(store, guard)
-    verify_approval_binding(store, job, lifecycle)
     with store.mutation():
+        current = maintenance.read_state()
+        lifecycle = current.jobs.get(job.jobId)
+        if lifecycle is None:
+            raise ValueError("maintenance lifecycle disappeared during apply")
+        if lifecycle.status == "applied":
+            if current.appliedBaseline != job.targetCommit:
+                raise ValueError("applied lifecycle has a different baseline")
+            _verify_active_apply(store, intent)
+            completed = replace(intent, status="applied", completedAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
+            _persist_apply_journal(store, completed)
+            return "applied"
+        # Recheck authorization/source while holding the same ledger lock as the baseline pointer.
+        recheck_committed_source(store, guard)
+        verify_approval_binding(store, job, lifecycle)
+        _verify_active_apply(store, intent)
         current = maintenance.read_state()
         lifecycle = current.jobs.get(job.jobId)
         if lifecycle is None:
@@ -279,8 +284,7 @@ def recover_apply(store: LedgerStore, job_id: str, guard: CommittedSourceGuard) 
                 or state.activeExportId != intent.exportId
                 or state.activeManifestSetId != intent.intendedManifestSetId):
             raise ValueError("applied baseline pointers differ from durable apply intent")
-        _active, _manifests = _active_manifests(store, state)
-        _check_projection(store, intent)
+        _verify_active_apply(store, intent)
         completed = replace(intent, status="applied", completedAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
         _persist_apply_journal(store, completed)
         return ApplyResult("applied", job_id, intent.intendedRunId, intent.exportId,
@@ -352,7 +356,6 @@ def recover_apply(store: LedgerStore, job_id: str, guard: CommittedSourceGuard) 
     if journal.runId != intent.intendedRunId or journal.manifestSetId not in {None, intent.intendedManifestSetId}:
         raise ValueError("export journal fingerprints differ from apply intent")
     if state.activeExportId == intent.exportId and state.activeManifestSetId == intent.intendedManifestSetId:
-        from .maintenance_context import recheck_committed_source
         recheck_committed_source(store, guard)
         _check_projection(store, intent)
         updated = replace(intent, status="exported")

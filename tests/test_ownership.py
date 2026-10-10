@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.ledger import LedgerStore
 from repo2skill.models import ProjectDocument, ProjectState
@@ -33,3 +35,28 @@ def test_inspect_target_ownership_is_read_only_without_state_directory(tmp_path:
     store = LedgerStore(tmp_path, tmp_path / ".repo2skill")
     assert inspect_target_ownership((), store=store) == ()
     assert not store.state_dir.exists()
+
+
+def test_export_without_committed_source_guard_keeps_live_freshness_check(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.ownership as ownership_module
+    from tests.test_export_recovery import _scenario
+
+    store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
+    calls = []
+
+    def reject_stale(*_args, **_kwargs):
+        calls.append(True)
+        raise RuntimeError("default live freshness check")
+
+    monkeypatch.setattr(ownership_module, "_recheck", reject_stale)
+    with store.mutation(), pytest.raises(RuntimeError, match="default live freshness check"):
+        ownership_module.export_staged(
+            "run_0123456789abcdef01234567", (targets[0].targetId,), {}, store=store,
+            current_identity=identity, current_root_label="repo",
+            current_policy_revision=policy_revision,
+            current_extractor_versions={}, excluded_paths=exclusions,
+        )
+
+    assert calls == [True]
+    assert store.list_export_journals() == ()
+    assert not (tmp_path / "AGENTS.md").exists()

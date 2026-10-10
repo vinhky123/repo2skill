@@ -176,6 +176,57 @@ def test_resume_completes_prepared_journal_after_all_live_writes(tmp_path: Path,
     assert store.list_export_journals()[0].status == "committed"
 
 
+def test_guarded_resume_stops_after_partial_live_write_when_source_moves(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_context as maintenance_context
+    import repo2skill.ownership as ownership_module
+
+    store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
+    original_replace = ownership_module.replace_live_file
+    writes = []
+
+    def write_then_crash(*args, **kwargs):
+        result = original_replace(*args, **kwargs)
+        writes.append(args[1])
+        raise OSError("simulated interruption after one live replacement")
+
+    monkeypatch.setattr(ownership_module, "replace_live_file", write_then_crash)
+    guard_failures = []
+
+    def source_guard(_store, _guard):
+        if guard_failures:
+            raise ValueError("committed HEAD moved")
+
+    monkeypatch.setattr(maintenance_context, "recheck_committed_source", source_guard)
+    with store.mutation():
+        result = export_staged(
+            RUN_ID, (targets[0].targetId,), {}, store=store,
+            current_identity=identity, current_root_label="repo",
+            current_policy_revision=policy_revision,
+            current_extractor_versions={}, excluded_paths=exclusions,
+            source_guard=object(),
+        )
+    assert result.status == "incomplete"
+    assert len(writes) == 1
+    journal = store.list_export_journals()[0]
+    assert journal.status == "incomplete"
+    written_path = writes[0]
+    written_bytes = (tmp_path / written_path).read_bytes()
+
+    guard_failures.append(True)
+    with store.mutation(), pytest.raises(ValueError, match="committed HEAD moved"):
+        resume_export(
+            journal.exportId, {}, store=store, current_identity=identity,
+            current_root_label="repo", current_policy_revision=policy_revision,
+            current_extractor_versions={}, excluded_paths=exclusions,
+            source_guard=object(),
+        )
+
+    assert (tmp_path / written_path).read_bytes() == written_bytes
+    state = store.read_state()
+    assert state is not None and state.activeExportId is None and state.activeManifestSetId is None
+    assert store.read_export_journal(f"exports/{journal.exportId}.json").status == "incomplete"
+
+
 def test_resume_reuses_immutable_manifest_written_before_crash(tmp_path: Path, monkeypatch) -> None:
     store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
     original_write = store.write_immutable

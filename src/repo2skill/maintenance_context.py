@@ -658,6 +658,8 @@ def recheck_committed_source(store, guard: CommittedSourceGuard) -> None:
     if job is None or job.targetCommit != guard.targetCommit or job.sourceContextHash != guard.sourceContextHash:
         raise ValueError("committed source guard no longer matches immutable job")
     def check_locked() -> None:
+        if not MaintenanceStore(store.root, store).read_state().enabled:
+            raise ValueError("maintenance is disabled")
         lifecycle = verify_approval_binding(store, job)
         if lifecycle.approvalBindingHash is None:
             raise ValueError("maintenance approval binding is missing")

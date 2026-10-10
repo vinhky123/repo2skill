@@ -7,8 +7,6 @@ from pathlib import Path
 
 import pytest
 
-import pytest
-
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.dependencies import build_snapshot
 from repo2skill.identity import capture_repository
