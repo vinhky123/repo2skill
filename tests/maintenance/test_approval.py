@@ -279,6 +279,34 @@ def test_disable_reports_private_grant_revocation_failure(tmp_path: Path, monkey
     assert state.policy.approval == "ask"
 
 
+def test_disable_reports_orphan_active_grant_failure_when_state_is_ask(tmp_path: Path, monkeypatch) -> None:
+    from repo2skill import maintenance_approval
+    from repo2skill.maintenance_approval import configure_auto_approval, read_auto_grant
+    from repo2skill.maintenance_hooks import remove_owned_hooks
+
+    store, maint = _store(tmp_path / "repo")
+    configure_auto_approval(store)
+    active_grant = read_auto_grant(store)
+    with store.mutation():
+        state = maint.read_state()
+        maint.replace_state(dataclasses.replace(
+            state, enabled=True,
+            policy=MaintenancePolicy("ask", state.policy.grantRevision, state.policy.targetKinds),
+        ))
+    assert read_auto_grant(store) == active_grant and active_grant["status"] == "active"
+    monkeypatch.setattr(maintenance_approval, "_write_grant",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("fixture failure")))
+
+    result = remove_owned_hooks(store.root, store)
+
+    assert not result.installed
+    assert "private auto grant revocation failed" in result.message
+    state = maint.read_state()
+    assert state.enabled is False
+    assert state.policy.approval == "ask"
+    assert read_auto_grant(store)["status"] == "active"
+
+
 def test_state_only_auto_does_not_authorize_worker(tmp_path: Path) -> None:
     from repo2skill.maintenance_worker import run_worker
 

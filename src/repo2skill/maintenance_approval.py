@@ -308,9 +308,11 @@ def revoke_auto_approval(store: LedgerStore, *, enabled: bool = False):
         state = maint.read_state()
         revision = state.policy.grantRevision + (1 if state.policy.approval == "auto" else 0)
         revocation_error: OSError | None = None
+        private_grant_present = False
         try:
             path = _grant_path(store, allow_shared=True)
             if path.exists() or path.is_symlink():
+                private_grant_present = True
                 grant = _read_grant(store)
                 if grant is None:
                     raise ValueError("private auto grant exists but is unreadable or malformed")
@@ -320,7 +322,7 @@ def revoke_auto_approval(store: LedgerStore, *, enabled: bool = False):
                     revoked["grantRevision"] = revision
                     _write_grant(store, revoked, allow_shared=True)
         except (OSError, ValueError) as error:
-            if state.policy.approval == "auto":
+            if state.policy.approval == "auto" or private_grant_present:
                 revocation_error = OSError("private auto grant revocation could not be confirmed")
                 revocation_error.__cause__ = error
         updated = replace(state, enabled=enabled,

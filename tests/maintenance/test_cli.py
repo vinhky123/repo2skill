@@ -32,6 +32,7 @@ def _repo(root: Path) -> tuple[LedgerStore, MaintenanceStore]:
 
 def _pending(ledger: LedgerStore, maint: MaintenanceStore, *, stale: bool = False) -> None:
     project = ledger.read_project()
+    current_state = maint.read_state()
     policy_revision = "old-policy"
     if not stale and project is not None:
         from repo2skill.ids import effective_policy_revision
@@ -39,7 +40,7 @@ def _pending(ledger: LedgerStore, maint: MaintenanceStore, *, stale: bool = Fals
                                                     generation_options={})
     job = MaintenanceJob(JOB_ID, None, "b" * 40, ("git-event_0123456789abcdef01234567",),
                          ("src/app.py",), ("python",), "sha256:" + "1" * 64,
-                         "sha256:" + "2" * 64, policy_revision, ("skill",), None, {})
+                         "sha256:" + "2" * 64, policy_revision, current_state.policy.targetKinds, None, {})
     with ledger.mutation():
         maint.write_job(job)
         state = maint.read_state()
@@ -79,6 +80,65 @@ def test_default_status_requires_approval(tmp_path: Path, capsys) -> None:
     assert payload["result"]["jobs"][0]["status"] == "pending"
     assert payload["result"]["policyRevision"]
     assert stderr == ""
+
+
+def test_status_does_not_request_user_approval_for_current_auto_grant(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_approval import auto_approval_binding, configure_auto_approval
+
+    ledger, maint = _repo(tmp_path / "repo")
+    _pending(ledger, maint)
+    auto_state = configure_auto_approval(ledger)
+    with ledger.mutation():
+        state = maint.read_state()
+        jobs = dict(state.jobs)
+        jobs[JOB_ID] = dataclasses.replace(jobs[JOB_ID], queuedGrantRevision=auto_state.policy.grantRevision)
+        maint.replace_state(dataclasses.replace(state, jobs=jobs))
+    state = maint.read_state()
+    assert auto_approval_binding(ledger, maint.read_job(JOB_ID), state.jobs[JOB_ID]) is not None
+
+    code, payload, _ = _invoke(tmp_path / "repo", capsys, "status")
+
+    assert code == 0
+    assert payload["findings"] == []
+    assert payload["result"]["policy"]["autoGrantActive"] is True
+    assert payload["result"]["jobs"][0]["status"] == "pending"
+
+
+def test_status_requires_user_approval_for_job_queued_before_auto_grant(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_approval import auto_approval_binding, configure_auto_approval
+
+    ledger, maint = _repo(tmp_path / "repo")
+    _pending(ledger, maint)
+    configure_auto_approval(ledger)
+    state = maint.read_state()
+    assert state.jobs[JOB_ID].queuedGrantRevision < state.policy.grantRevision
+    assert auto_approval_binding(ledger, maint.read_job(JOB_ID), state.jobs[JOB_ID]) is None
+
+    code, payload, _ = _invoke(tmp_path / "repo", capsys, "status")
+
+    assert code == 3
+    assert payload["findings"][0]["code"] == "maintenance.approval-required"
+
+
+def test_status_requires_user_approval_when_private_auto_grant_is_invalid(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_approval import configure_auto_approval
+
+    ledger, maint = _repo(tmp_path / "repo")
+    _pending(ledger, maint)
+    auto_state = configure_auto_approval(ledger)
+    with ledger.mutation():
+        state = maint.read_state()
+        jobs = dict(state.jobs)
+        jobs[JOB_ID] = dataclasses.replace(jobs[JOB_ID], queuedGrantRevision=auto_state.policy.grantRevision)
+        maint.replace_state(dataclasses.replace(state, jobs=jobs))
+    grant_path = ledger.root / ".git" / "repo2skill" / "maintenance" / "auto-grant.json"
+    grant_path.write_text("{invalid", encoding="utf-8")
+
+    code, payload, _ = _invoke(tmp_path / "repo", capsys, "status")
+
+    assert code == 3
+    assert payload["findings"][0]["code"] == "maintenance.approval-required"
+    assert payload["result"]["policy"]["autoGrantActive"] is False
 
 
 def test_corrupt_maintenance_state_exits_seven(tmp_path: Path, capsys) -> None:
@@ -207,3 +267,47 @@ def test_new_target_after_skip_can_create_a_new_pending_job(tmp_path: Path, caps
     assert code == 3
     assert payload["result"]["jobs"][-1]["jobId"] == new_id
     assert maint.read_state().jobs[JOB_ID].status == "skipped"
+
+
+def test_real_enqueue_deduplicates_skipped_event_and_reports_later_commit(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_git import compare_commits, enqueue_event
+    from repo2skill.maintenance_models import GitEvent
+
+    root = tmp_path / "repo"
+    store, maint = _repo(root)
+    (root / ".git" / "info" / "exclude").write_text(".repo2skill/\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "--allow-empty", "-m", "baseline"], check=True, capture_output=True)
+    baseline = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    with store.mutation():
+        maint.replace_state(dataclasses.replace(maint.read_state(), appliedBaseline=baseline))
+    (root / "src").mkdir()
+    (root / "src" / "app.py").write_text("first = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-m", "first source change"], check=True, capture_output=True)
+    first_target = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+    first_event = GitEvent("git-event_222222222222222222222222", "post-commit", "cursor-skip-first", first_target)
+    first_job = enqueue_event(store, first_event, compare_commits(root, baseline, first_target))
+    assert first_job is not None
+
+    code, payload, _ = _invoke(root, capsys, "skip", first_job.jobId)
+    assert code == 0 and payload["result"]["status"] == "skipped"
+    assert enqueue_event(store, first_event, compare_commits(root, baseline, first_target)) is None
+
+    (root / "src" / "app.py").write_text("first = True\nsecond = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-m", "second source change"], check=True, capture_output=True)
+    second_target = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                                   capture_output=True, text=True).stdout.strip()
+    second_event = GitEvent("git-event_333333333333333333333333", "post-commit", "cursor-skip-second", second_target)
+    second_job = enqueue_event(store, second_event, compare_commits(root, baseline, second_target))
+
+    code, status, _ = _invoke(root, capsys, "status")
+    assert second_job is not None and second_job.jobId != first_job.jobId
+    assert code == 3
+    jobs = {job["jobId"]: job["status"] for job in status["result"]["jobs"]}
+    assert jobs == {first_job.jobId: "skipped", second_job.jobId: "pending"}

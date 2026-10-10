@@ -958,7 +958,7 @@ def _command_maintain(args: argparse.Namespace):
                 "policy": maintenance.read_state().policy}, (), (), []
     if args.maintain_command == "status":
         state = maintenance.read_state()
-        from .maintenance_approval import _matches_current, _policy_revision
+        from .maintenance_approval import _matches_current, _policy_revision, auto_approval_binding
         jobs = []
         findings = []
         for job_id, lifecycle in state.jobs.items():
@@ -971,7 +971,11 @@ def _command_maintain(args: argparse.Namespace):
                          "approvalState": lifecycle.status,
                          "baselineCommit": job.baselineCommit,
                          "targetKinds": job.targetKinds})
-            if lifecycle.status == "pending":
+            auto_eligible = (
+                lifecycle.status == "pending" and state.policy.approval == "auto"
+                and auto_approval_binding(store, job, lifecycle) is not None
+            )
+            if lifecycle.status == "pending" and not auto_eligible:
                 findings.append(_finding("maintenance.approval-required", "pending",
                                          "a maintenance job is waiting for approval", details={"jobId": job_id}, exit_code=3))
             elif lifecycle.status == "stale":

@@ -128,8 +128,12 @@ def run_worker(
                 current_lifecycle = current.jobs.get(selected)
                 if not current.enabled:
                     return WorkerResult("disabled", selected, "maintenance was disabled before the worker could start")
-                if current_lifecycle is None or current_lifecycle.status != "approved" or current_lifecycle.approvalBindingHash != lifecycle.approvalBindingHash:
+                if current_lifecycle is None or current_lifecycle.status != "approved":
                     return WorkerResult("stale", selected, "job approval changed before worker start")
+                try:
+                    verify_approval_binding(store, job, current_lifecycle)
+                except StaleApprovalError as error:
+                    return WorkerResult("stale", selected, str(error))
             # Task 7/8 supplies the runner. Never represent unavailable work as applied.
             return WorkerResult(
                 "agent-unavailable", selected,

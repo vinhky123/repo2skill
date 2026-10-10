@@ -44,12 +44,13 @@ def _approved_job(store: LedgerStore) -> str:
     ).stdout.strip()
     project = store.read_project()
     assert project is not None
+    target_kinds = maint.read_state().policy.targetKinds
     job = MaintenanceJob(
         "maintenance-job_0123456789abcdef01234567", None, target_commit,
         ("git-event_0123456789abcdef01234567",), ("src.py",), ("skill",),
         "sha256:" + "1" * 64, "sha256:" + "2" * 64,
         effective_policy_revision(project.scanPolicy, project.claimPolicy, project.targets, generation_options={}),
-        ("skill",), None, {},
+        target_kinds, None, {},
     )
     lifecycle = MaintenanceLifecycle("pending", None, None, "pending", None, None, None,
                                     queuedGrantRevision=0)
@@ -99,3 +100,40 @@ def test_disabled_worker_does_not_claim_approved_job(tmp_path: Path) -> None:
 
     assert result.status == "disabled"
     assert maint.read_state().jobs[job_id].status == "approved"
+
+
+def test_worker_revalidates_auto_grant_under_final_mutation_lock(tmp_path: Path, monkeypatch) -> None:
+    from repo2skill import maintenance_approval, maintenance_worker
+    from repo2skill.maintenance_approval import configure_auto_approval
+
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    maint = MaintenanceStore(root, store)
+    auto_state = configure_auto_approval(store)
+    with store.mutation():
+        state = maint.read_state()
+        current = state.jobs[job_id]
+        jobs = dict(state.jobs)
+        jobs[job_id] = dataclasses.replace(
+            current, status="pending", approvalSource=None, approvalBindingHash=None,
+            queuedGrantRevision=auto_state.policy.grantRevision,
+        )
+        maint.replace_state(dataclasses.replace(state, jobs=jobs))
+
+    original_fingerprint_check = maintenance_worker.verify_job_fingerprints
+    transitions = []
+
+    def revoke_after_initial_validation(ledger, job):
+        original_fingerprint_check(ledger, job)
+        transitions.append(maint.read_state().jobs[job_id].approvalSource)
+        maintenance_approval.revoke_auto_approval(ledger, enabled=True)
+
+    monkeypatch.setattr(maintenance_worker, "verify_job_fingerprints", revoke_after_initial_validation)
+
+    result = maintenance_worker.run_worker(store, foreground=True, job_id=job_id)
+
+    assert transitions == ["auto"]
+    assert result.status == "stale"
+    assert "approval binding" in result.message or "policy" in result.message
+    assert maint.read_state().enabled is True
+    assert maint.read_state().policy.approval == "ask"
