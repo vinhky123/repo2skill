@@ -70,7 +70,12 @@ def run_git_bounded(
         *arguments,
     ]
     environment = os.environ.copy()
-    environment.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+    environment.update({
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_EXTERNAL_DIFF": "",
+    })
     try:
         process = subprocess.Popen(
             argv,
