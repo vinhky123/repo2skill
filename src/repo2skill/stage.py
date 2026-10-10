@@ -336,6 +336,7 @@ def stage_run(
     current_extractor_versions: Mapping[str, str],
     excluded_paths: Sequence[str],
     selected_specs: Sequence[TargetSpec],
+    source_guard=None,
 ) -> StagedRun:
     """Publish initial revision 1 and activate it with one state pointer replacement."""
     store._require_mutation()
@@ -352,7 +353,9 @@ def stage_run(
     required_exclusions = {state_path, *(spec.livePath for spec in project.targets)}
     if not required_exclusions.issubset(set(excluded_paths)):
         raise ValueError("excluded_paths must include stateDir and every configured target")
-    if store.read_run(run.runId) is not None or store.immutable_path_exists(f"runs/{run.runId}.json"):
+    prior_run = store.read_run(run.runId)
+    run_exists = prior_run is not None or store.immutable_path_exists(f"runs/{run.runId}.json")
+    if run_exists and (source_guard is None or prior_run != run):
         raise FileExistsError(f"new run already exists: {run.runId}")
     if run.runId == state.currentRunId:
         raise ValueError("initial staging requires a new run ID")
@@ -369,19 +372,32 @@ def stage_run(
     if run.stagedTargets != expected_staged_targets:
         raise ValueError("run stagedTargets do not match the initial render projection")
     stage_path = f"staging/{run.runId}/r1"
-    if store.immutable_path_exists(stage_path):
-        raise FileExistsError(f"immutable stage revision already exists: {stage_path}")
-
-    store.write_immutable_bytes(f"runs/{run.runId}.json", canonical_json_bytes(run) + b"\n")
-    staged = publish_stage_revision(
-        bundle, run, store=store, selected_specs=selected_specs, stage_revision=1
-    )
-    result = recheck_dependencies(
-        run, current_identity, current_policy_revision, current_extractor_versions,
-        root=store.root, current_root_label=current_root_label, excluded_paths=excluded_paths,
-    )
-    if result.status != "fresh":
-        raise ActivationFreshnessError(result)
+    stage_exists = store.immutable_path_exists(stage_path)
+    if stage_exists:
+        if source_guard is None:
+            raise FileExistsError(f"immutable stage revision already exists: {stage_path}")
+        existing_descriptor = read_stage_descriptor(store, run.runId, 1)
+        if canonical_json_bytes(existing_descriptor) != canonical_json_bytes(descriptor):
+            raise FileExistsError(f"immutable stage revision differs from intended stage: {stage_path}")
+        stage_root = store.state_dir / "staging" / run.runId / "r1"
+        staged = StagedRun(run.runId, stage_root,
+                           {key: {path: entry["sha256"] for path, entry in value["accepted"].items()}
+                            for key, value in descriptor["targets"].items()}, 1,
+                           {key: {path: entry["sha256"] for path, entry in value["preview"].items()}
+                            for key, value in descriptor["targets"].items()})
+    else:
+        if not run_exists:
+            store.write_immutable_bytes(f"runs/{run.runId}.json", canonical_json_bytes(run) + b"\n")
+        staged = publish_stage_revision(
+            bundle, run, store=store, selected_specs=selected_specs, stage_revision=1
+        )
+    if source_guard is None:
+        result = recheck_dependencies(
+            run, current_identity, current_policy_revision, current_extractor_versions,
+            root=store.root, current_root_label=current_root_label, excluded_paths=excluded_paths,
+        )
+        if result.status != "fresh":
+            raise ActivationFreshnessError(result)
     accepted_revisions = dict(state.acceptedClaimRevisions)
     current_claim_ids = {claim.claimId for claim in run.claims}
     for claim_id in current_claim_ids:
@@ -390,6 +406,9 @@ def stage_run(
         claim.claimId: claim.claimRevision
         for claim in run.claims if claim.proposalStatus == "accepted"
     })
+    if source_guard is not None:
+        from .maintenance_context import recheck_committed_source
+        recheck_committed_source(store, source_guard)
     store.replace_state(ProjectState(
         state.schemaVersion, state.toolVersion, state.projectId, run.runId, 1,
         state.reviewEvents, accepted_revisions,

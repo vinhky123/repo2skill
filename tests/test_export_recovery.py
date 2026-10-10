@@ -96,6 +96,38 @@ def test_export_publishes_one_selected_target_and_commits_manifest_pointer(tmp_p
     assert store.list_export_journals()[0].status == "committed"
 
 
+def test_prepared_export_callback_runs_before_journal_and_live_writes(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_context as maintenance_context
+    from repo2skill.maintenance_models import CommittedSourceGuard
+    from repo2skill.ownership import manifest_set_id_for_export
+
+    store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
+    guard_calls = []
+    monkeypatch.setattr(maintenance_context, "recheck_committed_source", lambda *_args: guard_calls.append(True))
+    calls = []
+
+    def prepared(journal):
+        calls.append(journal)
+        assert store.read_export_journal(f"exports/{journal.exportId}.json") is None
+        assert not (tmp_path / "AGENTS.md").exists()
+
+    guard = CommittedSourceGuard(
+        "maintenance-job_0123456789abcdef01234567", "0" * 40, "sha256:" + "1" * 64,
+        "policy", "application-auth_0123456789abcdef01234567",
+    )
+    with store.mutation():
+        result = export_staged(
+            RUN_ID, (targets[0].targetId,), {}, store=store,
+            current_identity=identity, current_root_label="repo",
+            current_policy_revision=policy_revision, current_extractor_versions={},
+            excluded_paths=exclusions, source_guard=guard, on_prepared_export=prepared,
+        )
+    assert result.status == "complete"
+    assert len(calls) == 1
+    assert len(guard_calls) >= 2
+    assert manifest_set_id_for_export(result.exportId) == store.read_state().activeManifestSetId
+
+
 def test_unresolved_export_journal_blocks_new_exports(tmp_path: Path) -> None:
     store, _project, identity, policy_revision, exclusions, targets, _run, _bundle = _scenario(tmp_path)
     # The first export finishes normally; a committed journal does not block a later export.

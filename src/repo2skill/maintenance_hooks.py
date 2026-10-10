@@ -289,7 +289,7 @@ def process_hook(
             from .maintenance_approval import auto_approval_binding
             auto_eligible = auto_approval_binding(store, job, lifecycle) is not None
         if auto_eligible:
-            launch_worker(root)
+            launch_worker(root, state_dir=store.state_dir)
         affected = ", ".join(job.targetKinds) or "repository"
         changed = ", ".join(job.changedPaths[:5])
         if len(job.changedPaths) > 5:
@@ -311,10 +311,17 @@ def process_hook(
         return HookProcessResult("diagnostic", message=message)
 
 
-def launch_worker(root: Path, *, python: Path | None = None) -> subprocess.Popen:
+def launch_worker(root: Path, *, state_dir: Path | None = None, python: Path | None = None) -> subprocess.Popen:
     """Start the isolated installed module hidden on Windows."""
+    root = Path(root).absolute()
+    state_dir = Path(state_dir).absolute() if state_dir is not None else root / ".repo2skill"
+    try:
+        state_dir.relative_to(root)
+    except ValueError as error:
+        raise ValueError("maintenance state directory must be inside project root") from error
     interpreter = python or Path(sys.executable)
-    command = [str(interpreter), "-I", "-m", "repo2skill.maintenance_worker", "--root", str(root)]
+    command = [str(interpreter), "-I", "-m", "repo2skill.maintenance_worker", "--root", str(root),
+               "--state-dir", str(state_dir)]
     options: dict[str, object] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if os.name == "nt":
         options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)

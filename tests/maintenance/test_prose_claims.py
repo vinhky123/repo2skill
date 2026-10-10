@@ -264,6 +264,14 @@ def test_build_committed_context_uses_target_commit_even_with_dirty_worktree(tmp
     approve_job(store, job.jobId)
     source.write_text("print('uncommitted secret')\n", encoding="utf-8")
     context = build_committed_context(store, job)
+    from repo2skill.maintenance_context import build_agent_request
+    rebuilt_context = build_committed_context(store, job)
+    first_request = build_agent_request(context, tmp_path / "snapshot-one", source_root=root)
+    second_request = build_agent_request(rebuilt_context, tmp_path / "snapshot-two", source_root=root)
+    assert rebuilt_context.snapshot.snapshotId == context.snapshot.snapshotId
+    assert (first_request.requestHash, first_request.promptBytes, first_request.schemaBytes) == (
+        second_request.requestHash, second_request.promptBytes, second_request.schemaBytes,
+    )
     fragments = [fact for fact in context.facts if fact.factType == "source.fragment.v1"]
     assert fragments
     assert any("committed target" in fact.value["text"] for fact in fragments)

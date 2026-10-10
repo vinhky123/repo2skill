@@ -1,7 +1,7 @@
 """Owned-output inspection, export journaling, and crash recovery."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import difflib
@@ -41,6 +41,11 @@ _MAX_LIVE_BYTES = 2 * 1024 * 1024
 
 def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def manifest_set_id_for_export(export_id: str) -> str:
+    """Return the P0 manifest-set ID for an export, shared by apply recovery."""
+    return "manifestset_" + hashlib.sha256(export_id.encode()).hexdigest()[:24]
 
 
 def _timestamp() -> str:
@@ -599,7 +604,7 @@ def _commit_manifests(
             (prior_reference.recordRevision + 1) if prior_reference else 1,
             target_id, manifest_id, journal.exportId, relative,
         )
-    manifest_set_id = "manifestset_" + hashlib.sha256(journal.exportId.encode()).hexdigest()[:24]
+    manifest_set_id = manifest_set_id_for_export(journal.exportId)
     manifest_set = ManifestSet("1.0", __version__, manifest_set_id, journal.exportId,
                                 references, journal.createdAt)
     _write_immutable_record(store, f"manifests/{journal.exportId}/{manifest_set_id}.json", manifest_set)
@@ -660,6 +665,7 @@ def _export_fresh(
     store: LedgerStore, current_identity: RepositoryIdentity, current_root_label: str,
     current_policy_revision: str, current_extractor_versions: Mapping[str, str],
     excluded_paths: Sequence[str], delete_empty_owned_blocks: bool,
+    source_guard=None, on_prepared_export: Callable[[ExportJournal], None] | None = None,
 ) -> ExportResult:
     store.require_no_unresolved_export()
     project, state, run, descriptor, specs, manifests, previous_set = _validate_export_context(
@@ -686,9 +692,18 @@ def _export_fresh(
     journal = _create_export_journal(
         export_id, run, state.activeStageRevision, planned, mkdirs, store
     )
-    _recheck(run, store, current_identity, current_root_label, current_policy_revision,
-             current_extractor_versions, excluded_paths)
+    if source_guard is None:
+        _recheck(run, store, current_identity, current_root_label, current_policy_revision,
+                 current_extractor_versions, excluded_paths)
+    else:
+        from .maintenance_context import recheck_committed_source
+        recheck_committed_source(store, source_guard)
+    if on_prepared_export is not None:
+        on_prepared_export(journal)
     store.write_export_journal(journal)
+    if source_guard is not None:
+        from .maintenance_context import recheck_committed_source
+        recheck_committed_source(store, source_guard)
     journal = _perform_journal(store, journal)
     if journal.status != "prepared" or any(op.status != "complete" for op in journal.operations):
         return _result(journal)
@@ -703,6 +718,7 @@ def export_staged(
     store: LedgerStore, current_identity: RepositoryIdentity, current_root_label: str,
     current_policy_revision: str, current_extractor_versions: Mapping[str, str],
     excluded_paths: Sequence[RepositoryPath], delete_empty_owned_blocks: bool = False,
+    source_guard=None, on_prepared_export: Callable[[ExportJournal], None] | None = None,
 ) -> ExportResult:
     """Publish selected outputs from the active immutable accepted stage."""
     if not store._mutation_active:
@@ -716,6 +732,7 @@ def export_staged(
         current_extractor_versions=current_extractor_versions,
         excluded_paths=excluded_paths,
         delete_empty_owned_blocks=delete_empty_owned_blocks,
+        source_guard=source_guard, on_prepared_export=on_prepared_export,
     )
 
 
@@ -723,7 +740,7 @@ def resume_export(
     export_id: ExportId, ownership: Mapping[TargetId, OwnershipState], *, store: LedgerStore,
     current_identity: RepositoryIdentity, current_root_label: str,
     current_policy_revision: str, current_extractor_versions: Mapping[str, str],
-    excluded_paths: Sequence[RepositoryPath],
+    excluded_paths: Sequence[RepositoryPath], source_guard=None,
 ) -> ExportResult:
     """Recover one explicitly selected incomplete export journal."""
     if not store._mutation_active:
@@ -735,9 +752,15 @@ def resume_export(
     if state is None:
         raise FileNotFoundError("project state is required")
     if journal.status == "committed":
+        if source_guard is not None:
+            from .maintenance_context import recheck_committed_source
+            recheck_committed_source(store, source_guard)
         return _result(journal)
     store.require_no_unresolved_export(resume_export_id=export_id)
     if state.activeExportId == journal.exportId and state.activeManifestSetId == journal.manifestSetId:
+        if source_guard is not None:
+            from .maintenance_context import recheck_committed_source
+            recheck_committed_source(store, source_guard)
         manifest_set = store.read_manifest_set(f"manifests/{journal.exportId}/{journal.manifestSetId}.json") if journal.manifestSetId else None
         if (manifest_set is None or manifest_set.exportId != journal.exportId
                 or manifest_set.manifestSetId != journal.manifestSetId):
@@ -754,9 +777,16 @@ def resume_export(
     project, state, run, descriptor, specs, manifests, previous_set = _validate_export_context(
         journal.runId, journal.targetIds, ownership, store=store
     )
-    _recheck(run, store, current_identity, current_root_label, current_policy_revision,
-             current_extractor_versions, excluded_paths)
+    if source_guard is None:
+        _recheck(run, store, current_identity, current_root_label, current_policy_revision,
+                 current_extractor_versions, excluded_paths)
+    else:
+        from .maintenance_context import recheck_committed_source
+        recheck_committed_source(store, source_guard)
     _validate_journal_payloads(store, journal)
+    if source_guard is not None:
+        from .maintenance_context import recheck_committed_source
+        recheck_committed_source(store, source_guard)
     journal = _perform_journal(store, journal)
     if journal.status != "prepared" or any(op.status != "complete" for op in journal.operations):
         return _result(journal)

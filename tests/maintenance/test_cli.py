@@ -242,8 +242,44 @@ def test_approve_runs_exact_job_in_foreground_and_reports_unavailable_agent(tmp_
     assert code == 6
     assert payload["command"] == f"maintain approve {JOB_ID}"
     assert payload["result"]["status"] == "agent-unavailable"
-    assert calls == [{"foreground": True, "job_id": JOB_ID}]
+    assert calls == [{"foreground": True, "job_id": JOB_ID, "explicit_retry": False}]
     assert maint.read_state().jobs[JOB_ID].status == "approved"
+
+
+def test_busy_first_approval_reuses_binding_and_second_approve_runs_once(tmp_path: Path, capsys, monkeypatch) -> None:
+    from repo2skill.maintenance_worker import WorkerResult
+    from repo2skill import maintenance_worker
+
+    ledger, maint = _repo(tmp_path / "repo")
+    _pending(ledger, maint)
+    invocation_count = 0
+    worker_calls = 0
+
+    def fake_worker(store, **kwargs):
+        nonlocal invocation_count, worker_calls
+        worker_calls += 1
+        lifecycle = MaintenanceStore(store.root, store).read_state().jobs[JOB_ID]
+        assert kwargs == {"foreground": True, "job_id": JOB_ID, "explicit_retry": False}
+        if worker_calls == 1:
+            assert lifecycle.status == "approved" and lifecycle.activeAttemptId is None
+            return WorkerResult("busy", JOB_ID, "lease busy")
+        assert lifecycle.status == "approved" and lifecycle.activeAttemptId is None
+        invocation_count += 1
+        return WorkerResult("applied", JOB_ID, "applied")
+
+    from repo2skill.maintenance_store import MaintenanceStore
+    monkeypatch.setattr(maintenance_worker, "run_worker", fake_worker)
+    code, _payload, _ = _invoke(tmp_path / "repo", capsys, "approve", JOB_ID)
+    assert code == 4
+    first_binding = maint.read_state().jobs[JOB_ID].approvalBindingHash
+
+    code, payload, _ = _invoke(tmp_path / "repo", capsys, "approve", JOB_ID)
+
+    assert code == 0
+    assert payload["result"]["status"] == "applied"
+    assert worker_calls == 2
+    assert invocation_count == 1
+    assert maint.read_state().jobs[JOB_ID].approvalBindingHash == first_binding
 
 
 def test_new_target_after_skip_can_create_a_new_pending_job(tmp_path: Path, capsys) -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
-from repo2skill.ledger import LedgerStore
+from repo2skill.ledger import LedgerStore, LockBusyError
 from repo2skill.ids import effective_policy_revision
 from repo2skill.maintenance_approval import approve_job
 from repo2skill.maintenance_models import MaintenanceJob, MaintenanceLifecycle, MaintenanceState
@@ -81,12 +81,12 @@ def test_worker_recovers_dead_lease(tmp_path: Path) -> None:
 
     result = run_worker(store, foreground=True)
 
-    assert result.status == "agent-unavailable"
+    assert result.status == "rebuild-required"
     assert result.jobId == "maintenance-job_0123456789abcdef01234567"
-    assert "not applied" in result.message
+    assert "source context" in result.message
     state = MaintenanceStore(root, store).read_state()
     assert state.appliedBaseline is None
-    assert state.jobs[result.jobId].status == "approved"
+    assert state.jobs[result.jobId].status == "failed"
 
 
 def test_disabled_worker_does_not_claim_approved_job(tmp_path: Path) -> None:
@@ -137,3 +137,66 @@ def test_worker_revalidates_auto_grant_under_final_mutation_lock(tmp_path: Path,
     assert "approval binding" in result.message or "policy" in result.message
     assert maint.read_state().enabled is True
     assert maint.read_state().policy.approval == "ask"
+
+
+def test_hidden_auto_worker_waits_for_busy_lease_then_drains_current_job(tmp_path: Path, monkeypatch) -> None:
+    from contextlib import contextmanager
+    from repo2skill import maintenance_worker
+    from repo2skill.maintenance_approval import configure_auto_approval
+    from repo2skill.maintenance_worker import WorkerResult
+
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    maint = MaintenanceStore(root, store)
+    auto_state = configure_auto_approval(store)
+    with store.mutation():
+        state = maint.read_state()
+        lifecycle = state.jobs[job_id]
+        jobs = dict(state.jobs)
+        jobs[job_id] = dataclasses.replace(lifecycle, status="pending", approvalSource=None,
+                                           approvalBindingHash=None,
+                                           queuedGrantRevision=auto_state.policy.grantRevision)
+        maint.replace_state(dataclasses.replace(state, jobs=jobs))
+
+    lease_calls = []
+    @contextmanager
+    def fake_lease(*_args, **_kwargs):
+        lease_calls.append(True)
+        if len(lease_calls) == 1:
+            raise LockBusyError("held")
+        yield
+    calls = []
+    def fake_run_one(ledger, selected, **_kwargs):
+        calls.append((selected, ledger.state_dir))
+        with ledger.mutation():
+            state = maint.read_state()
+            jobs = dict(state.jobs)
+            jobs[selected] = dataclasses.replace(jobs[selected], status="applied")
+            maint.replace_state(dataclasses.replace(state, jobs=jobs, appliedBaseline=maint.read_job(selected).targetCommit))
+        return WorkerResult("applied", selected, "applied")
+
+    monkeypatch.setattr(maintenance_worker, "_worker_lease", fake_lease)
+    monkeypatch.setattr(maintenance_worker, "_run_one", fake_run_one)
+    sleeps = []
+    result = maintenance_worker.run_worker(store, auto_drain=True, wait_budget_seconds=1,
+                                          sleep=lambda seconds: sleeps.append(seconds),
+                                          retry_delay=lambda _attempt: 0.01)
+
+    assert result.status == "idle"
+    assert len(lease_calls) == 3
+    assert sleeps == [0.01]
+    assert calls == [(job_id, store.state_dir)]
+    assert len(maint.read_state().jobs) == 1
+
+
+def test_hidden_ask_worker_never_runs_a_user_approved_job(tmp_path: Path) -> None:
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    calls = []
+
+    result = run_worker(store, auto_drain=True, wait_budget_seconds=0,
+                        invoke=lambda *_args, **_kwargs: calls.append(True))
+
+    assert result.status == "idle"
+    assert calls == []
+    assert MaintenanceStore(root, store).read_state().jobs[job_id].status == "approved"

@@ -93,6 +93,25 @@ class MaintenanceStore:
         payload = canonical_json_bytes({"schemaVersion": "1.0", "job": encode_record(job)}) + b"\n"
         self.ledger.write_maintenance_job_bytes(job.jobId, payload)
 
+    def read_apply_phase(self, job_id: str, phase: str) -> bytes | None:
+        self._validate_job_id(job_id)
+        if phase not in {"intent", "staged", "export-prepared", "exported", "applied", "failed"}:
+            raise ValueError("unsupported apply journal phase")
+        return self.ledger.read_immutable_bytes(f"maintenance/apply/{job_id}/{phase}.json")
+
+    def write_apply_phase(self, job_id: str, phase: str, payload: bytes) -> None:
+        self._validate_job_id(job_id)
+        if phase not in {"intent", "staged", "export-prepared", "exported", "applied", "failed"}:
+            raise ValueError("unsupported apply journal phase")
+        if not isinstance(payload, bytes):
+            raise TypeError("apply journal payload must be bytes")
+        existing = self.read_apply_phase(job_id, phase)
+        if existing is not None:
+            if existing != payload:
+                raise FileExistsError(f"maintenance/apply/{job_id}/{phase}.json")
+            return
+        self.ledger.write_immutable_bytes(f"maintenance/apply/{job_id}/{phase}.json", payload)
+
     def replace_state(self, state: MaintenanceState) -> None:
         """Replace the sole maintenance pointer under LedgerStore's lock."""
         self._require_initialized_project()

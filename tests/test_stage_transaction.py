@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import pytest
+
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.dependencies import build_snapshot
 from repo2skill.identity import capture_repository
@@ -92,6 +94,32 @@ def test_stage_run_publishes_hashed_revision_then_activates_one_pointer(tmp_path
             assert hashlib.sha256(data).hexdigest() in target.exactHashes[path]
     assert not (tmp_path / "AGENTS.md").exists()
     assert not (tmp_path / ".agents").exists()
+
+
+def test_committed_source_guard_rejects_before_stage_pointer_activation(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_context as maintenance_context
+    from repo2skill.maintenance_models import CommittedSourceGuard
+
+    project, run, bundle, identity, revision, exclusions, targets = _scenario(tmp_path)
+    store = _initialize(tmp_path, project)
+    guard = CommittedSourceGuard(
+        "maintenance-job_0123456789abcdef01234567", "0" * 40, "sha256:" + "1" * 64,
+        "policy", "application-auth_0123456789abcdef01234567",
+    )
+    calls = []
+    def reject(*_args):
+        calls.append(True)
+        raise ValueError("moved committed HEAD")
+    monkeypatch.setattr(maintenance_context, "recheck_committed_source", reject)
+
+    with store.mutation(), pytest.raises(ValueError, match="moved committed HEAD"):
+        stage_run(bundle, run, store=store, current_identity=identity,
+                  current_root_label="repo", current_policy_revision=revision,
+                  current_extractor_versions={}, excluded_paths=exclusions,
+                  selected_specs=targets, source_guard=guard)
+
+    assert calls == [True]
+    assert store.read_state().currentRunId == OLD_RUN_ID  # type: ignore[union-attr]
 
 
 def test_stage_run_seeds_accepted_projection_from_initial_render_and_clears_current_nonaccepted_ids(

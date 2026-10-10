@@ -997,29 +997,46 @@ def _command_maintain(args: argparse.Namespace):
                            "autoGrantActive": _matches_current(store, state) if state.policy.approval == "auto" else False},
                 "jobs": jobs}, tuple(findings), (), []
     if args.maintain_command in {"approve", "retry"}:
-        from .maintenance_approval import OwnershipConflictError, StaleApprovalError, approve_job
+        from .maintenance_approval import OwnershipConflictError, StaleApprovalError, approve_job, verify_approval_binding
         job_id = args.job_id
         try:
             state = maintenance.read_state()
             lifecycle = state.jobs.get(job_id)
             if lifecycle is None:
                 raise LookupError("maintenance job does not exist")
-            if args.maintain_command == "retry" and lifecycle.status != "failed":
+            job = maintenance.read_job(job_id)
+            if job is None:
+                raise LookupError("maintenance job does not exist")
+            if args.maintain_command == "retry" and lifecycle.status not in {"failed", "running"}:
                 return None, (_finding("maintenance.retry-not-allowed", "error",
                                        "retry requires an explicitly retried failed attempt", details={"exitCode": 1}),), (), []
-            approved = approve_job(store, job_id, grant_revision=state.policy.grantRevision)
+            if args.maintain_command == "approve" and lifecycle.status == "pending":
+                approved = approve_job(store, job_id, grant_revision=state.policy.grantRevision)
+            elif (args.maintain_command == "approve" and lifecycle.status == "approved"
+                  and lifecycle.activeAttemptId is None):
+                # Approval was already persisted before a busy lease response. Reuse its exact binding.
+                approved = verify_approval_binding(store, job, lifecycle)
+            elif args.maintain_command == "retry" and lifecycle.status == "running":
+                # Let the leased worker resolve the durable attempt before deciding whether a new attempt is needed.
+                approved = lifecycle
+            elif args.maintain_command == "retry" and lifecycle.status == "failed":
+                approved = approve_job(store, job_id, grant_revision=state.policy.grantRevision)
+            else:
+                raise StaleApprovalError("job is not eligible for this command")
         except StaleApprovalError as error:
             return None, (_finding("maintenance.stale-binding", "stale", str(error), details={"exitCode": 4}),), (), []
         except OwnershipConflictError as error:
             return None, (_finding("maintenance.source-conflict", "conflict", str(error), details={"jobId": job_id, "exitCode": 5}),), (), []
         from .maintenance_worker import run_worker
-        result = run_worker(store, foreground=True, job_id=job_id)
+        result = run_worker(store, foreground=True, job_id=job_id,
+                            explicit_retry=args.maintain_command == "retry")
         code_by_status = {"applied": 0, "noop": 0, "agent-unavailable": 6, "agent-failed": 6,
                           "conflict": 5, "stale": 4, "approval-required": 4, "not-found": 1,
-                          "disabled": 4, "busy": 4}
+                          "disabled": 4, "busy": 4, "busy-expired": 4,
+                          "rebuild-required": 4, "incomplete": 7, "unsupported": 6}
         exit_code = code_by_status.get(result.status, 6)
         findings = () if exit_code == 0 else (_finding(
-            {5: "maintenance.source-conflict", 6: "maintenance.agent-unavailable", 4: "maintenance.stale-binding"}.get(exit_code, "maintenance.run-failed"),
+            {5: "maintenance.source-conflict", 6: "maintenance.agent-unavailable", 4: "maintenance.rebuild-required", 7: "maintenance.rebuild-required"}.get(exit_code, "maintenance.run-failed"),
             {5: "conflict", 6: "error", 4: "stale"}.get(exit_code, "error"), result.message,
             details={"jobId": job_id, "exitCode": exit_code},
         ),)

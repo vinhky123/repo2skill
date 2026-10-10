@@ -28,15 +28,15 @@ def _git(root: Path, *args: str) -> bytes:
     return subprocess.run(["git", "-C", str(root), *args], check=True, stdout=subprocess.PIPE).stdout
 
 
-def _repo(root: Path) -> tuple[Path, LedgerStore]:
+def _repo(root: Path, state_dir_name: str = ".repo2skill") -> tuple[Path, LedgerStore]:
     root.mkdir()
     _git(root, "init", "-q")
     _git(root, "config", "user.name", "Fixture")
     _git(root, "config", "user.email", "fixture@example.invalid")
-    state_dir = root / ".repo2skill"
-    state_dir.mkdir()
+    state_dir = root / state_dir_name
+    state_dir.mkdir(parents=True)
     project = ProjectDocument(
-        "1.0", "0.1.0", "project_0123456789abcdef01234567", "fixture", ".repo2skill",
+        "1.0", "0.1.0", "project_0123456789abcdef01234567", "fixture", state_dir_name,
         "worktree", default_scan_policy(), default_claim_policy(), default_targets(root),
     )
     state = ProjectState("1.0", "0.1.0", project.projectId, None, None, (), {}, None, None)
@@ -413,11 +413,42 @@ def test_wrapper_launcher_avoids_repo_shadow_module_and_windows_console(tmp_path
     shadow = tmp_path / "repo2skill.py"
     shadow.write_text("raise RuntimeError('shadow imported')", encoding="utf-8")
     captured = {}
-    monkeypatch.setattr("repo2skill.maintenance_hooks.subprocess.Popen", lambda *a, **kw: captured.update(kw))
+    monkeypatch.setattr("repo2skill.maintenance_hooks.subprocess.Popen", lambda *a, **kw: captured.update(args=a[0], **kw))
     monkeypatch.setattr("repo2skill.maintenance_hooks.os.name", "nt")
     launch_worker(Path("C:/repo"), python=Path("C:/installed/python.exe"))
     assert captured["creationflags"] != 0
     assert captured["creationflags"] & getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0x08000000)
+    assert Path(captured["args"][-1]) == Path("C:/repo/.repo2skill")
+
+
+def test_hidden_worker_launch_preserves_custom_confined_state_dir(tmp_path: Path, monkeypatch) -> None:
+    from repo2skill.maintenance_hooks import launch_worker
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    state_dir = root / ".local-state" / "nested"
+    captured = {}
+    monkeypatch.setattr("repo2skill.maintenance_hooks.subprocess.Popen",
+                        lambda *args, **kwargs: captured.update(command=args[0], **kwargs))
+
+    launch_worker(root, state_dir=state_dir, python=Path("C:/installed/python.exe"))
+
+    assert captured["command"][-2:] == ["--state-dir", str(state_dir.absolute())]
+    with pytest.raises(ValueError, match="inside project root"):
+        launch_worker(root, state_dir=tmp_path / "outside", python=Path("C:/installed/python.exe"))
+
+
+def test_hidden_entrypoint_opens_exact_custom_state_dir(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_worker as worker
+    root, custom_store = _repo(tmp_path / "repo", ".local-state/ledger")
+    captured = []
+    monkeypatch.setattr(sys, "argv", ["maintenance_worker", "--root", str(root),
+                                       "--state-dir", str(custom_store.state_dir)])
+    monkeypatch.setattr(worker, "run_worker", lambda store, **kwargs:
+                        captured.append((store.state_dir, kwargs)) or worker.WorkerResult("idle"))
+
+    assert worker._entrypoint() == 0
+    assert captured == [(custom_store.state_dir, {"foreground": False, "auto_drain": True})]
 
 
 def test_isolated_hook_module_ignores_repo_local_shadow_module(tmp_path: Path) -> None:

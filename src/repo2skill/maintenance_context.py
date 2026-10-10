@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import tempfile
-import uuid
 
 from . import SCHEMA_VERSION, __version__
 from .claims import derive_claims
@@ -337,7 +336,9 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
     repository_id = prior_run.snapshot.repositoryId
     snapshot_id = canonical_record_id("snapshot", {
         "repository": repository_id, "maintenanceJob": job.jobId,
-        "sourceContextHash": job.sourceContextHash, "nonce": str(uuid.uuid4()),
+        "targetCommit": job.targetCommit, "sourceContextHash": job.sourceContextHash,
+        "policyRevision": job.policyRevision,
+        "extractorRevisions": dict(sorted(maintenance_extractor_versions().items())),
     })
     budget = GitReadBudget(timeout_seconds=30.0, max_output_bytes=MAX_CONTEXT_TOTAL_BYTES * 3)
     current_head = _git(store.root, ("rev-parse", "--verify", "HEAD^{commit}"), 256, budget).strip().decode("ascii")

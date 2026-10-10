@@ -191,9 +191,9 @@ def test_policy_change_does_not_approve_pending_job(tmp_path: Path) -> None:
     assert lifecycle.queuedGrantRevision == 0
 
 
-def test_auto_grant_only_dispatches_job_observed_at_current_revision(tmp_path: Path) -> None:
+def test_auto_grant_only_dispatches_job_observed_at_current_revision(tmp_path: Path, monkeypatch) -> None:
     from repo2skill.maintenance_approval import _matches_current, _policy_revision, _read_grant, auto_approval_binding, configure_auto_approval
-    from repo2skill.maintenance_worker import run_worker
+    from repo2skill import maintenance_worker
 
     store, maint = _store(tmp_path / "repo")
     _publish(store, maint)
@@ -213,7 +213,18 @@ def test_auto_grant_only_dispatches_job_observed_at_current_revision(tmp_path: P
     assert current.jobs[JOB_ID].queuedGrantRevision == current.policy.grantRevision
     assert auto_approval_binding(store, current_job, current.jobs[JOB_ID]) is not None
 
-    result = run_worker(store, foreground=True, job_id=JOB_ID)
+    class _SnapshotDirectory:
+        def cleanup(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        maintenance_worker, "_build_context_and_request",
+        lambda *_args: (object(), type("Request", (), {"requestHash": "sha256:" + "0" * 64})(), _SnapshotDirectory()),
+    )
+    result = maintenance_worker.run_worker(
+        store, foreground=True, job_id=JOB_ID,
+        probe=lambda *_args, **_kwargs: type("Capability", (), {"supported": False})(),
+    )
 
     assert result.status == "agent-unavailable"
     lifecycle = maint.read_state().jobs[JOB_ID]
