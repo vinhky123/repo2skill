@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import pytest
 
+import repo2skill.maintenance_context as maintenance_context
 from repo2skill.claims import derive_claims
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.dependencies import build_snapshot
@@ -129,6 +130,54 @@ def test_source_fragment_fact_registers_captured_blob_hash_and_locator(tmp_path:
     assert batch.evidence[0].locator == EvidenceLocator("line-range", [1, 2], 1)
 
 
+@pytest.mark.parametrize(("reader", "expected"), [
+    (lambda _path, _cap: b"too large", "capped"),
+    (lambda _path, _cap: (_ for _ in ()).throw(OSError("fixture read failed")), "io-error"),
+])
+def test_incomplete_source_fragment_read_rejects_context_before_agent_use(
+    tmp_path: Path, reader, expected: str,
+) -> None:
+    raw = b"oversized input"
+    inventory = InventoryResult(
+        tmp_path, (InventoryEntry(PATH, "file", len(raw), None, False, False, None),),
+        "sha256:" + "a" * 64, (), (),
+    )
+    controls = (IgnoreControlObservation(InputSelector("glob", "**/.gitignore", ".", True),
+                                         "no-match", None, (),
+                                         "sha256:" + hashlib.sha256(b"[]").hexdigest(), 0, 0),)
+    policy = replace(default_scan_policy(), maxFileBytes=4)
+    with ExtractionSession(
+        root=tmp_path, snapshot_id="snapshot_aaaaaaaaaaaaaaaaaaaaaaaa", inventory=inventory,
+        policy=policy, repository_id="repo_0123456789abcdef01234567", prior_evidence=(),
+        prior_facts=(), excluded_paths=(), control_observations=controls,
+        committed_reader=reader,
+    ) as session:
+        extractor = SourceFragmentExtractor(session)
+        ctx = session.bind("maintenance.source-fragment", "1", RULE_ID, "1")
+        batch = extractor.extract(ctx, extractor.discover(ctx))
+
+    assert batch.reads[0].outcome == expected
+    with pytest.raises(ValueError, match="maintenance.source-fragment-incomplete"):
+        maintenance_context.require_complete_source_fragments(batch.reads, batch.coverage)
+
+
+def test_committed_inventory_applies_entry_cap_and_reports_required_coverage(tmp_path: Path) -> None:
+    policy = replace(default_scan_policy(), maxInventoryEntries=2)
+    manifest = {"files": [
+        {"path": path, "size": 1, "rawHash": "sha256:" + "a" * 64}
+        for path in ("a.py", "b.py", "c.py")
+    ]}
+
+    inventory = maintenance_context._inventory_from_manifest(tmp_path, manifest, policy, ())
+
+    assert tuple(entry.path for entry in inventory.entries) == ("a.py", "b.py")
+    assert any(item.code == "inventory.entry-cap" for item in inventory.diagnostics)
+    assert any(item.status == "capped" and item.reasonCode == "inventory.entry-cap"
+               for item in inventory.coverage)
+    with pytest.raises(ValueError, match="inventory.entry-cap"):
+        maintenance_context.require_complete_inventory(inventory)
+
+
 def test_changed_blob_creates_new_evidence_revision_from_captured_bytes(tmp_path: Path) -> None:
     repo_id = "repo_0123456789abcdef01234567"
     selector = InputSelector("glob", "**/.gitignore", ".", True)
@@ -224,6 +273,9 @@ def test_build_committed_context_uses_target_commit_even_with_dirty_worktree(tmp
     assert "ignored-force.txt" in fragment_paths
     assert "excluded.bin" not in fragment_paths
     assert "excluded.bin" not in context.changedDiff.decode("utf-8")
+    change_projection = json.loads(context.changedDiff.decode("utf-8"))
+    assert change_projection["projection"] == "committed-change-status"
+    assert change_projection["changeStatuses"] == [["M", "src.py"]]
 
     fragment = next(fact for fact in fragments if fact.value["path"] == "src.py")
     operation = ClaimOperation("add", "maintenance:source-guidance:python", ".",
@@ -238,14 +290,56 @@ def test_build_committed_context_uses_target_commit_even_with_dirty_worktree(tmp
     no_claim_authorization = authorize_claim_revisions(
         job, lifecycle.approvalBindingHash, "sha256:" + "e" * 64, (),
     )
-    carried_context = replace(context, priorClaims=(
-        replace(candidate, lastVerifiedSnapshotId="snapshot_aaaaaaaaaaaaaaaaaaaaaaaa",
-                proposalStatus="accepted"),
-    ))
+    carried_context = replace(
+        context,
+        priorClaims=(replace(candidate, lastVerifiedSnapshotId="snapshot_aaaaaaaaaaaaaaaaaaaaaaaa",
+                              proposalStatus="accepted"),),
+        priorFacts=tuple(replace(item, snapshotId="snapshot_aaaaaaaaaaaaaaaaaaaaaaaa")
+                         for item in context.facts),
+        priorEvidence=tuple(replace(item, snapshotId="snapshot_aaaaaaaaaaaaaaaaaaaaaaaa")
+                            for item in context.evidence),
+    )
     carried_bundle = build_maintenance_run(store, job, carried_context, (), no_claim_authorization)
     carried = next(claim for claim in carried_bundle.run.claims if claim.claimId == candidate.claimId)
     assert carried.lastVerifiedSnapshotId == context.snapshot.snapshotId
     assert all(fact.snapshotId == context.snapshot.snapshotId for fact in carried_bundle.run.facts)
+
+    changed_hash = "sha256:" + hashlib.sha256(b"different committed source bytes").hexdigest()
+    changed_fragment = replace(
+        fragment, factRevision=fragment.factRevision + 1,
+        value={**fragment.value, "text": "different committed source bytes"},
+    )
+    fragment_evidence = next(item for item in context.evidence
+                             if item.evidenceId in fragment.evidenceIds)
+    changed_evidence = replace(fragment_evidence, revision=fragment_evidence.revision + 1,
+                               contentHash=changed_hash)
+    changed_facts = tuple(changed_fragment if item.factId == fragment.factId else item
+                          for item in context.facts)
+    changed_evidence_records = tuple(changed_evidence if item.evidenceId == fragment_evidence.evidenceId else item
+                                     for item in context.evidence)
+    changed_reads = tuple(
+        replace(read, contentHash=changed_hash)
+        if read.extractorId == "maintenance.source-fragment" and read.selector.value == "src.py"
+        else read for read in context.reads
+    )
+    changed_identity = RepositoryIdentity(
+        context.snapshot.repositoryId, context.inventory.root, context.snapshot.gitMode,
+        context.snapshot.commitId, context.snapshot.branch, context.snapshot.dirty,
+        context.snapshot.dirtySummary,
+    )
+    changed_snapshot = build_snapshot(
+        context.snapshot.snapshotId, changed_identity, context.inventory,
+        context.snapshot.extractorVersions, changed_reads,
+        policy_revision=context.snapshot.policyRevision, root_label=context.snapshot.rootLabel,
+    )
+    changed_context = replace(
+        carried_context, snapshot=changed_snapshot, facts=changed_facts,
+        evidence=changed_evidence_records, reads=changed_reads,
+    )
+    changed_bundle = build_maintenance_run(store, job, changed_context, (), no_claim_authorization)
+    assert all(claim.claimId != candidate.claimId for claim in changed_bundle.run.claims)
+    assert any(item.reasonCode == "prior-claim-support-unavailable"
+               for item in changed_bundle.run.coverage)
 
     unsupported = replace(candidate, factIds=("fact_aaaaaaaaaaaaaaaaaaaaaaaa",),
                           evidenceIds=("evidence_aaaaaaaaaaaaaaaaaaaaaaaa",),

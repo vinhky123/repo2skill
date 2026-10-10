@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -19,13 +18,13 @@ from .extractors.base import ExtractionSession
 from .extractors.docs import DocumentationExtractor
 from .extractors.generic import GenericExtractor
 from .extractors.registry import ecosystem_extractors, run_extractors
-from .ids import CanonicalIdContext, canonical_json_bytes, canonical_record_id
+from .ids import canonical_json_bytes, canonical_record_id
 from .inventory import IgnoreControlObservation
 from .maintenance_models import (
     ApplicationAuthorization, ClaimOperation, CommittedSourceGuard, MaintenanceJob,
 )
 from .maintenance_source_fragment import (
-    EXTRACTOR_ID, RULE_ID, SourceFragmentExtractor, maintenance_extractor_versions,
+    EXTRACTOR_ID, SourceFragmentExtractor, maintenance_extractor_versions,
 )
 from .models import (
     Claim, CoverageEntry, Diagnostic, Evidence, ExtractionRead, Fact, InputSelector,
@@ -52,6 +51,8 @@ class MaintenanceContext:
     scanPolicy: object | None = None
     claimPolicy: object | None = None
     configuredTargets: tuple[TargetSpec, ...] = ()
+    priorFacts: tuple[Fact, ...] = ()
+    priorEvidence: tuple[Evidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,12 +118,106 @@ def _inventory_from_manifest(root: Path, manifest: dict[str, object], policy, ex
     entries.sort(key=lambda item: item.path)
     if len({item.path for item in entries}) != len(entries):
         raise ValueError("saved context contains duplicate paths")
+    diagnostics = ()
+    coverage = ()
+    if len(entries) > policy.maxInventoryEntries:
+        omitted = len(entries) - policy.maxInventoryEntries
+        entries = entries[:policy.maxInventoryEntries]
+        diagnostics = (Diagnostic(
+            1, "inventory.entry-cap", "error", "inventory entry cap was reached", None,
+            "inventory", {"limit": policy.maxInventoryEntries, "omittedCount": omitted},
+        ),)
+        coverage = (CoverageEntry(
+            1, InputSelector("negative", "inventory.entry-cap", ".", True),
+            "inventory", "capped", "inventory.entry-cap", ("inventory.entry-cap",),
+        ),)
     projection = [{"path": item.path, "kind": item.kind, "sizeBytes": item.sizeBytes,
                    "contentHash": item.contentHash, "ignored": item.ignored,
                    "generated": item.generated, "symlinkTarget": item.symlinkTarget}
                   for item in entries]
     inventory_hash = _hash(canonical_json_bytes(projection))
-    return InventoryResult(root, tuple(entries), inventory_hash, (), ())
+    return InventoryResult(root, tuple(entries), inventory_hash, diagnostics, coverage)
+
+
+def require_complete_inventory(inventory: InventoryResult) -> None:
+    """Stop before extraction when committed input exceeded P0 inventory coverage."""
+    capped = next((item for item in inventory.coverage
+                   if item.status in {"capped", "failed"} and item.collector == "inventory"), None)
+    if capped is not None:
+        diagnostic = next((item for item in inventory.diagnostics if item.code == capped.reasonCode), None)
+        detail = diagnostic.details if diagnostic is not None else {}
+        raise ValueError(f"{capped.reasonCode}: committed inventory coverage is incomplete ({detail})")
+
+
+def require_complete_source_fragments(reads: Sequence[ExtractionRead],
+                                     coverage: Sequence[CoverageEntry]) -> None:
+    """Reject capped or failed eligible blob reads before maintenance analysis."""
+    failed = tuple(read for read in reads
+                   if read.extractorId == EXTRACTOR_ID and read.outcome != "present")
+    incomplete = tuple(item for item in coverage
+                       if item.collector == EXTRACTOR_ID and item.status in {"capped", "failed"})
+    if failed or incomplete:
+        details = tuple((item.selector.value, item.outcome) for item in failed)
+        reasons = tuple(item.reasonCode for item in incomplete)
+        raise ValueError(
+            "maintenance.source-fragment-incomplete: eligible committed source reads are incomplete "
+            f"(reads={details}, coverage={reasons})"
+        )
+
+
+def _same_fact_support(prior: Fact, current: Fact) -> bool:
+    return (
+        prior.factId == current.factId
+        and prior.factRevision == current.factRevision
+        and prior.factType == current.factType
+        and prior.semanticKey == current.semanticKey
+        and prior.scope == current.scope
+        and prior.value == current.value
+        and prior.derivation == current.derivation
+        and prior.ruleId == current.ruleId
+        and prior.ruleVersion == current.ruleVersion
+        and prior.evidenceIds == current.evidenceIds
+    )
+
+
+def _same_evidence_support(prior: Evidence, current: Evidence) -> bool:
+    return (
+        prior.evidenceId == current.evidenceId
+        and prior.revision == current.revision
+        and prior.path == current.path
+        and prior.contentHash == current.contentHash
+        and prior.semanticKey == current.semanticKey
+        and prior.mediaType == current.mediaType
+        and prior.encoding == current.encoding
+        and prior.locator == current.locator
+        and prior.redactedPreview == current.redactedPreview
+        and prior.availability == current.availability
+    )
+
+
+def _prior_prose_support_unchanged(prior: Claim, context: MaintenanceContext) -> bool:
+    prior_facts = {fact.factId: fact for fact in context.priorFacts}
+    current_facts = {fact.factId: fact for fact in context.facts}
+    prior_evidence = {item.evidenceId: item for item in context.priorEvidence}
+    current_evidence = {item.evidenceId: item for item in context.evidence}
+    if not prior.factIds or not prior.evidenceIds:
+        return False
+    old_fact_records = [prior_facts.get(fact_id) for fact_id in prior.factIds]
+    new_fact_records = [current_facts.get(fact_id) for fact_id in prior.factIds]
+    if any(old is None or new is None for old, new in zip(old_fact_records, new_fact_records)):
+        return False
+    if any(not _same_fact_support(old, new) for old, new in zip(old_fact_records, new_fact_records)):
+        return False
+    old_evidence_ids = tuple(sorted({item for fact in old_fact_records for item in fact.evidenceIds}))
+    new_evidence_ids = tuple(sorted({item for fact in new_fact_records for item in fact.evidenceIds}))
+    if old_evidence_ids != prior.evidenceIds or new_evidence_ids != prior.evidenceIds:
+        return False
+    for evidence_id in prior.evidenceIds:
+        old = prior_evidence.get(evidence_id)
+        new = current_evidence.get(evidence_id)
+        if old is None or new is None or not _same_evidence_support(old, new):
+            return False
+    return True
 
 
 def _control_observations(paths: Sequence[str], reader, policy) -> tuple[IgnoreControlObservation, ...]:
@@ -156,7 +251,7 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
     from .maintenance_approval import verify_approval_binding
     from .maintenance_git import (
         MAX_CONTEXT_FILES, MAX_CONTEXT_TOTAL_BYTES, GitReadBudget,
-        _git, materialize_commit, read_commit_blob,
+        _git, committed_change_statuses, materialize_commit, read_commit_blob,
     )
     from .maintenance_store import MaintenanceStore
     from .models import RepositoryIdentity
@@ -204,6 +299,10 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
     current_head = _git(store.root, ("rev-parse", "--verify", "HEAD^{commit}"), 256, budget).strip().decode("ascii")
     if current_head != job.targetCommit:
         raise ValueError("current committed HEAD differs from maintenance target")
+    change_statuses = committed_change_statuses(
+        store.root, job.baselineCommit, job.targetCommit, job.diffHash, job.changedPaths,
+        budget=budget,
+    )
     for omitted in omitted_paths:
         try:
             read_commit_blob(store.root, job.targetCommit, omitted, MAX_CONTEXT_TOTAL_BYTES, budget=budget)
@@ -229,6 +328,7 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
         exclusions = tuple(sorted({project.stateDir, "AGENTS.md",
                                    *(target.livePath for target in project.targets)}))
         inventory = _inventory_from_manifest(root, manifest, project.scanPolicy, exclusions)
+        require_complete_inventory(inventory)
         controls = _control_observations(paths, read_blob, project.scanPolicy)
         identity = RepositoryIdentity(repository_id, root, "head", job.targetCommit, None, False, {})
         prior_evidence = prior_run.evidence
@@ -242,13 +342,17 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
             extractors = (*ecosystem_extractors(session), GenericExtractor(session),
                           DocumentationExtractor(session), SourceFragmentExtractor(session))
             batch = run_extractors(session, extractors)
+        require_complete_source_fragments(batch.reads, batch.coverage)
         snapshot = build_snapshot(
             snapshot_id, identity, inventory, versions, batch.reads,
             policy_revision=policy_revision, root_label=project.rootLabel,
         )
         changed_diff = canonical_json_bytes({
-            "projection": "committed-change-status", "diffHash": job.diffHash,
-            "changedPaths": list(job.changedPaths), "targetCommit": job.targetCommit,
+            "projection": "bootstrap-inventory" if job.baselineCommit is None else "committed-change-status",
+            "diffHash": job.diffHash,
+            "changedPaths": list(job.changedPaths),
+            "changeStatuses": [[status, path] for status, path in change_statuses],
+            "targetCommit": job.targetCommit,
         })
         return MaintenanceContext(
             job, snapshot, batch.facts, batch.evidence, prior_run.claims,
@@ -256,6 +360,7 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
             tuple((*inventory.diagnostics, *batch.diagnostics)),
             tuple((*inventory.coverage, *batch.coverage)), inventory,
             project.scanPolicy, project.claimPolicy, project.targets,
+            prior_run.facts, prior_run.evidence,
         )
     finally:
         temp_context.cleanup()
@@ -361,6 +466,9 @@ def build_maintenance_run(store, job: MaintenanceJob, context: MaintenanceContex
 
     if context.job != job or context.sourceContextHash != job.sourceContextHash:
         raise ValueError("committed context differs from the immutable job")
+    require_complete_source_fragments(context.reads, context.coverage)
+    if context.inventory is not None:
+        require_complete_inventory(context.inventory)
     if authorization.jobId != job.jobId or authorization.targetKinds != job.targetKinds:
         raise ValueError("application authorization differs from job binding")
     with store.mutation():
@@ -423,7 +531,9 @@ def build_maintenance_run(store, job: MaintenanceJob, context: MaintenanceContex
         for prior in context.priorClaims:
             if prior.claimId in candidates or prior.claimId in deleted or prior.supportMode != "evidence-backed-prose":
                 continue
-            if set(prior.factIds).issubset(current_fact_ids) and set(prior.evidenceIds).issubset(current_evidence_ids):
+            if (set(prior.factIds).issubset(current_fact_ids)
+                    and set(prior.evidenceIds).issubset(current_evidence_ids)
+                    and _prior_prose_support_unchanged(prior, context)):
                 candidates[prior.claimId] = replace(prior, lastVerifiedSnapshotId=context.snapshot.snapshotId,
                                                     proposalStatus="pending")
         unsupported_prior = tuple(

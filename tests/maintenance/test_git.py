@@ -138,6 +138,47 @@ def test_diff_uses_commit_blobs_when_worktree_is_dirty(tmp_path: Path) -> None:
     assert dirty_impact.paths == clean_impact.paths == ("src/app.py",)
 
 
+def test_committed_change_projection_preserves_and_verifies_status_records(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "modify.py").write_text("before\n", encoding="utf-8")
+    (root / "remove.py").write_text("remove\n", encoding="utf-8")
+    (root / "rename-before.py").write_text("rename unchanged\n", encoding="utf-8")
+    baseline = _commit(root, "base")
+    (root / "modify.py").write_text("after\n", encoding="utf-8")
+    (root / "add.py").write_text("new\n", encoding="utf-8")
+    (root / "remove.py").unlink()
+    (root / "rename-before.py").rename(root / "rename-after.py")
+    target = _commit(root, "status changes")
+    impact = compare_commits(root, baseline, target)
+
+    statuses = maintenance_git.committed_change_statuses(
+        root, baseline, target, impact.diffHash, impact.paths,
+    )
+
+    assert set(statuses) == {
+        ("M", "modify.py"), ("A", "add.py"), ("D", "remove.py"),
+        ("R", "rename-before.py"), ("R", "rename-after.py"),
+    }
+    with pytest.raises(MaintenanceGitError, match="diff hash"):
+        maintenance_git.committed_change_statuses(
+            root, baseline, target, "sha256:" + "f" * 64, impact.paths,
+        )
+
+
+def test_bootstrap_change_projection_verifies_inventory_hash_not_projection_hash(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "a.py").write_text("a\n", encoding="utf-8")
+    (root / "b.py").write_text("b\n", encoding="utf-8")
+    target = _commit(root, "bootstrap")
+    impact = bootstrap_commit(root, target)
+
+    statuses = maintenance_git.committed_change_statuses(
+        root, None, target, impact.diffHash, impact.paths,
+    )
+
+    assert statuses == (("A", "a.py"), ("A", "b.py"))
+
+
 def test_nul_paths_preserve_renames_and_newlines(tmp_path: Path) -> None:
     # Newline-containing filenames are legal on POSIX; exercise the exact
     # NUL-framed parser payload on Windows, where the filesystem rejects them.

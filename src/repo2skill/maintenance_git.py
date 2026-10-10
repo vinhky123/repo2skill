@@ -357,6 +357,31 @@ def bootstrap_commit(
     return CommitImpact(None, head, tuple(sorted(paths)), (), _HASH(raw), scopes, True, diagnostics, statuses)
 
 
+def committed_change_statuses(
+    root: Path, baseline: str | None, target: str, expected_diff_hash: str,
+    changed_paths: Sequence[str], *, budget: GitReadBudget | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Rebuild eligible change statuses and verify the immutable Git byte hash.
+
+    Bootstrap jobs bind the exact recursive-tree listing from ``ls-tree``; later
+    jobs bind the exact NUL-framed ``diff-tree --name-status`` output.
+    """
+    impact = (bootstrap_commit(root, target, budget=budget) if baseline is None
+              else compare_commits(root, baseline, target, budget=budget))
+    if impact.diffHash != expected_diff_hash:
+        raise MaintenanceGitError(
+            "maintenance.diff-hash-mismatch",
+            "committed change bytes differ from the immutable job diff hash; rebuild the job",
+        )
+    eligible = set(changed_paths)
+    if not eligible.issubset(set(impact.paths)):
+        raise MaintenanceGitError(
+            "maintenance.diff-path-mismatch",
+            "immutable job paths are not present in the committed change projection",
+        )
+    return tuple((status, path) for status, path in impact.changeStatuses if path in eligible)
+
+
 def read_commit_blob(
     root: Path, commit: str, path: str, max_bytes: int, *,
     budget: GitReadBudget | None = None,
