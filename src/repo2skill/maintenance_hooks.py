@@ -9,19 +9,20 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Callable, Sequence
 
 from .git_read import GitReadError, run_git_bounded
 from .ledger import LedgerStore
 from .maintenance_git import (
-    GitReadBudget, MaintenanceGitError, bootstrap_commit, compare_commits,
-    enqueue_event, parse_hook_event,
+    GitReadBudget, MaintenanceGitError, MAX_HOOK_STDIN_BYTES, bootstrap_commit,
+    compare_commits, enqueue_event, parse_hook_event,
 )
-from .maintenance_models import MaintenancePolicy
 from .maintenance_store import MaintenanceStore
 
 
 HOOK_NAMES = ("post-commit", "post-merge", "post-checkout", "post-rewrite")
+HOOK_STDIN_TIMEOUT_SECONDS = 2.0
 _MARKER = b"# repo2skill-managed-hook-v1\n"
 
 
@@ -58,6 +59,8 @@ def _local_hooks_directory(root: Path) -> tuple[Path | None, str | None]:
         if not common_dir.is_absolute():
             common_dir = root / common_dir
         common_dir = common_dir.resolve()
+        worktrees = _git(root, ("worktree", "list", "--porcelain", "-z"))
+        worktree_count = sum(record.startswith(b"worktree ") for record in worktrees.split(b"\0"))
         configured = subprocess.run(
             ["git", "-C", str(root), "config", "--get", "core.hooksPath"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2, check=False,
@@ -66,6 +69,8 @@ def _local_hooks_directory(root: Path) -> tuple[Path | None, str | None]:
         return None, "could not safely inspect the repository Git configuration"
     if top != root.resolve() or git_dir != (root / ".git").resolve() or common_dir != git_dir:
         return None, "linked worktrees and shared Git directories require manual hook integration"
+    if worktree_count != 1:
+        return None, "repository hooks are shared with linked worktrees; use manual hook integration"
     if configured.returncode == 0:
         return None, "core.hooksPath is configured; use --manual-hooks or integrate observation manually"
     if configured.returncode != 1:
@@ -99,7 +104,12 @@ def _wrapper_bytes(hook_name: str, python: Path | None = None) -> bytes:
         "#!/bin/sh\n"
         + _MARKER.decode("ascii")
         + "# This wrapper observes committed Git state and always returns success.\n"
-        + f"exec {executable} -I -m repo2skill.maintenance_hooks {shlex.quote(hook_name)} \"$@\"\n"
+        + f"if {executable} -I -m repo2skill.maintenance_hooks {shlex.quote(hook_name)} \"$@\"; then\n"
+        + "    :\n"
+        + "else\n"
+        + "    printf '%s\\n' 'repo2skill hook launch failed; run maintain catch-up and maintain status' >&2\n"
+        + "fi\n"
+        + "exit 0\n"
     )
     return script.encode("utf-8")
 
@@ -149,7 +159,7 @@ def install_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
     expected = {name: _wrapper_bytes(name) for name in HOOK_NAMES}
     for name, payload in expected.items():
         path = hooks / name
-        if path.exists():
+        if path.exists() or path.is_symlink():
             try:
                 if path.is_symlink() or not path.is_file():
                     return HookInstallResult(False, True, message=f"existing {name} hook is redirected or not a regular file")
@@ -162,7 +172,7 @@ def install_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
     try:
         for name, payload in expected.items():
             path = hooks / name
-            if not path.exists():
+            if not path.exists() and not path.is_symlink():
                 _write_absent(path, payload)
                 created.append(path)
         _set_enabled(store, True)
@@ -182,15 +192,20 @@ def remove_owned_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
     root = Path(root).absolute()
     if store.root != root:
         return HookInstallResult(False, True, message="store and repository roots differ")
+    try:
+        _set_enabled(store, False)
+    except (OSError, ValueError, RuntimeError) as error:
+        return HookInstallResult(
+            False, True, message=f"maintenance disable could not be persisted ({type(error).__name__}); hooks were left unchanged",
+        )
     hooks, refusal = _local_hooks_directory(root)
     if hooks is None:
-        _set_enabled(store, False)
-        return HookInstallResult(False, True, message=refusal or "manual hook integration is required")
+        return HookInstallResult(True, True, message=f"maintenance disabled; {refusal or 'manual hook integration is required'}")
     removed: list[str] = []
     foreign: list[str] = []
     for name in HOOK_NAMES:
         path = hooks / name
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             continue
         try:
             if not path.is_symlink() and path.is_file() and path.read_bytes() == _wrapper_bytes(name):
@@ -200,8 +215,7 @@ def remove_owned_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
                 foreign.append(name)
         except OSError:
             foreign.append(name)
-    _set_enabled(store, False)
-    message = "owned maintenance hooks removed"
+    message = "maintenance disabled; owned maintenance hooks removed"
     if foreign:
         message += "; manual integration remains for: " + ", ".join(foreign)
     return HookInstallResult(True, bool(foreign), tuple(removed), message)
@@ -209,7 +223,7 @@ def remove_owned_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
 
 def process_hook(
     root: Path, hook_name: str, stdin: bytes, argv: Sequence[str], *, store: LedgerStore,
-    output: Callable[[str], object] | None = None,
+    output: Callable[[str], object] | None = None, defer_reason_code: str | None = None,
 ) -> HookProcessResult:
     """Observe one completed event; never invokes an agent or blocks Git."""
     emit = output or (lambda message: sys.stdout.write(message + "\n"))
@@ -221,7 +235,15 @@ def process_hook(
             emit(message)
             return HookProcessResult("disabled", message=message)
         budget = GitReadBudget()
-        event = parse_hook_event(hook_name, stdin, argv, root=root, budget=budget)
+        event = parse_hook_event(
+            hook_name, stdin, argv, root=root, budget=budget,
+            defer_reason_code=defer_reason_code,
+        )
+        if event.reasonCode is not None:
+            enqueue_event(store, event, None, event.reasonCode, budget=budget)
+            message = f"analysis queued for bounded catch-up ({event.reasonCode}); run maintain catch-up, then maintain status"
+            emit(message)
+            return HookProcessResult("deferred", message=message)
         baseline = state.appliedBaseline
         try:
             impact = bootstrap_commit(root, event.targetCommit, budget=budget) if baseline is None else compare_commits(
@@ -234,6 +256,12 @@ def process_hook(
             emit(message)
             return HookProcessResult("deferred", message=message)
         if job is None:
+            state_after = maintenance.read_state()
+            deferred = next((item for item in state_after.deferredEvents if item.eventId == event.eventId), None)
+            if deferred is not None:
+                message = f"analysis queued for bounded catch-up ({deferred.reasonCode}); run maintain catch-up, then maintain status"
+                emit(message)
+                return HookProcessResult("deferred", message=message)
             message = "maintenance event recorded; no new relevant job was queued"
             emit(message)
             return HookProcessResult("observed", message=message)
@@ -273,8 +301,43 @@ def _entrypoint() -> int:
     root = Path.cwd().absolute()
     store = LedgerStore(root, root / ".repo2skill")
     # Git hooks run with the repository root as cwd and supply their native argv.
-    result = process_hook(root, hook_name, sys.stdin.buffer.read(), sys.argv[2:], store=store)
-    return 0 if result.status in {"pending", "observed", "deferred", "disabled", "diagnostic"} else 0
+    stdin = b""
+    defer_reason = None
+    if hook_name == "post-rewrite":
+        stdin, defer_reason = _read_hook_stdin(sys.stdin.buffer)
+    process_hook(
+        root, hook_name, stdin, sys.argv[2:], store=store,
+        defer_reason_code=defer_reason,
+    )
+    return 0
+
+
+def _read_hook_stdin(stream, *, max_bytes: int = MAX_HOOK_STDIN_BYTES,
+                     timeout_seconds: float = HOOK_STDIN_TIMEOUT_SECONDS) -> tuple[bytes, str | None]:
+    """Read rewrite input on a daemon thread with byte and wall-clock bounds."""
+    result: list[bytes] = []
+    errors: list[BaseException] = []
+
+    def read_limited() -> None:
+        try:
+            value = stream.read(max_bytes + 1)
+            if not isinstance(value, bytes):
+                raise TypeError("hook stdin must be bytes")
+            result.append(value)
+        except BaseException as error:
+            errors.append(error)
+
+    reader = threading.Thread(target=read_limited, name="repo2skill-hook-stdin", daemon=True)
+    reader.start()
+    reader.join(timeout_seconds)
+    if reader.is_alive():
+        return b"", "maintenance.hook-input-timeout"
+    if errors:
+        return b"", "maintenance.hook-input-unavailable"
+    payload = result[0]
+    if len(payload) > max_bytes:
+        return payload[:max_bytes + 1], "maintenance.hook-input-cap"
+    return payload, None
 
 
 if __name__ == "__main__":

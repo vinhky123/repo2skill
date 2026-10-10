@@ -31,6 +31,8 @@ MAX_CONTEXT_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_FILES = 256
 DEFAULT_BUDGET_SECONDS = 10.0
 DEFAULT_BUDGET_OUTPUT_BYTES = 32 * 1024 * 1024
+MAX_HOOK_STDIN_BYTES = 1024 * 1024
+MAX_POST_REWRITE_RECORDS = 4096
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _HASH = lambda raw: "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -108,7 +110,7 @@ class SnapshotManifest:
 
 def parse_hook_event(
     hook_name: str, stdin: bytes, argv: Sequence[str], *, root: Path,
-    budget: GitReadBudget | None = None,
+    budget: GitReadBudget | None = None, defer_reason_code: str | None = None,
 ) -> GitEvent:
     """Parse a supported post-event hook using only its arguments and committed refs."""
     supported = {"post-commit", "post-merge", "post-checkout", "post-rewrite"}
@@ -116,6 +118,18 @@ def parse_hook_event(
         raise MaintenanceGitError("maintenance.hook-unsupported", "unsupported Git hook name")
     root = Path(root).absolute()
     current = _git(root, ("rev-parse", "--verify", "HEAD^{commit}"), 256, budget).strip().decode("ascii", "strict")
+    def deferred(reason_code: str) -> GitEvent:
+        data = {
+            "hook": hook_name, "argv": list(argv), "stdinHash": _HASH(stdin[:MAX_HOOK_STDIN_BYTES]),
+            "targetCommit": current, "deferredReason": reason_code,
+        }
+        cursor = "sha256:" + hashlib.sha256(canonical_json_bytes(data)).hexdigest()
+        return GitEvent(canonical_record_id("git-event", data), hook_name, cursor, current, reason_code)
+
+    if defer_reason_code:
+        return deferred(defer_reason_code)
+    if len(stdin) > MAX_HOOK_STDIN_BYTES:
+        return deferred("maintenance.hook-input-cap")
     if hook_name == "post-commit":
         if argv or stdin:
             raise MaintenanceGitError("maintenance.hook-arguments-invalid", "post-commit does not accept arguments or stdin")
@@ -136,6 +150,9 @@ def parse_hook_event(
     else:
         if len(argv) != 1 or argv[0] not in {"rebase", "am"} or not stdin:
             raise MaintenanceGitError("maintenance.hook-arguments-invalid", "post-rewrite requires the rebase/am command and stdin")
+        record_count = stdin.count(b"\n") + (1 if stdin and not stdin.endswith(b"\n") else 0)
+        if record_count > MAX_POST_REWRITE_RECORDS:
+            return deferred("maintenance.hook-record-cap")
         records = [line.split() for line in stdin.splitlines() if line.strip()]
         if not records or any(len(record) != 2 for record in records):
             raise MaintenanceGitError("maintenance.hook-arguments-invalid", "post-rewrite stdin is malformed")

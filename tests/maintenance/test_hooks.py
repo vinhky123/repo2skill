@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -91,6 +93,23 @@ def test_setup_refuses_configured_or_shared_hooks_directory(tmp_path: Path) -> N
     assert (linked / ".git" / "config").read_bytes() == linked_config
 
 
+def test_main_checkout_refuses_hooks_shared_with_linked_worktrees(tmp_path: Path) -> None:
+    root, store = _repo(tmp_path / "main")
+    _commit(root)
+    linked = tmp_path / "linked"
+    _git(root, "worktree", "add", "-q", str(linked), "HEAD")
+    config_before = (root / ".git" / "config").read_bytes()
+    hooks_before = {item.name: item.read_bytes() for item in _hook_dir(root).iterdir() if item.is_file()}
+
+    result = install_hooks(root, store)
+
+    assert result.installed is False
+    assert result.manualIntegrationRequired is True
+    assert "linked" in result.message or "shared" in result.message
+    assert (root / ".git" / "config").read_bytes() == config_before
+    assert {item.name: item.read_bytes() for item in _hook_dir(root).iterdir() if item.is_file()} == hooks_before
+
+
 def test_setup_installs_only_absent_local_hooks(tmp_path: Path) -> None:
     root, store = _repo(tmp_path / "repo")
     result = install_hooks(root, store)
@@ -152,6 +171,21 @@ def test_disable_removes_only_owned_hook(tmp_path: Path) -> None:
     assert MaintenanceStore(root, store).read_state().enabled is False
 
 
+def test_disable_state_failure_preserves_owned_hooks(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_hooks as hooks
+
+    root, store = _repo(tmp_path / "repo")
+    install_hooks(root, store)
+    before = {name: (_hook_dir(root) / name).read_bytes() for name in HOOK_NAMES}
+    monkeypatch.setattr(hooks, "_set_enabled", lambda *a, **kw: (_ for _ in ()).throw(OSError("ledger unavailable")))
+
+    result = hooks.remove_owned_hooks(root, store)
+
+    assert result.installed is False
+    assert result.manualIntegrationRequired is True
+    assert {name: (_hook_dir(root) / name).read_bytes() for name in HOOK_NAMES} == before
+
+
 def test_manual_setup_enables_without_touching_hook_files(tmp_path: Path, capsys) -> None:
     root, store = _repo(tmp_path / "repo")
     before = {path.name: path.read_bytes() for path in _hook_dir(root).iterdir() if path.is_file()}
@@ -205,6 +239,100 @@ def test_hook_budget_failure_prints_catch_up_not_completed_diff(tmp_path: Path, 
     assert MaintenanceStore(root, store).read_state().deferredEvents[-1].reasonCode == "maintenance.git-timeout"
 
 
+def test_late_context_cap_failure_prints_catch_up_notice(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_git as git_api
+
+    root, store = _repo(tmp_path / "repo")
+    baseline = _commit(root)
+    with store.mutation():
+        maint = MaintenanceStore(root, store)
+        maint.replace_state(dataclasses.replace(maint.read_state(), appliedBaseline=baseline, enabled=True))
+    _commit(root, "other.py")
+    monkeypatch.setattr(
+        git_api, "materialize_commit",
+        lambda *a, **kw: (_ for _ in ()).throw(MaintenanceGitError("maintenance.git-output-cap", "cap")),
+    )
+    output = []
+
+    result = process_hook(root, "post-commit", b"", (), store=store, output=output.append)
+
+    assert result.status == "deferred"
+    assert "maintain catch-up" in output[0] and "maintain status" in output[0]
+    assert MaintenanceStore(root, store).read_state().deferredEvents[-1].reasonCode == "maintenance.git-output-cap"
+
+
+def test_hook_stdin_read_is_byte_and_time_bounded(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_hooks as hooks
+
+    root, store = _repo(tmp_path / "repo")
+    _commit(root)
+    with store.mutation():
+        maint = MaintenanceStore(root, store)
+        maint.replace_state(dataclasses.replace(maint.read_state(), enabled=True))
+    release = threading.Event()
+    observed_sizes = []
+
+    class BlockingInput:
+        def read(self, size=-1):
+            observed_sizes.append(size)
+            release.wait(0.5)
+            return b""
+
+    started = time.monotonic()
+    payload, reason = hooks._read_hook_stdin(BlockingInput(), timeout_seconds=0.01)
+    elapsed = time.monotonic() - started
+    release.set()
+
+    assert payload == b""
+    assert reason == "maintenance.hook-input-timeout"
+    assert observed_sizes and observed_sizes[0] > 0
+    assert observed_sizes[0] <= hooks.MAX_HOOK_STDIN_BYTES + 1
+    assert elapsed < 0.25
+    output = []
+    result = process_hook(
+        root, "post-rewrite", payload, ("rebase",), store=store, output=output.append,
+        defer_reason_code=reason,
+    )
+    assert result.status == "deferred"
+    assert "maintain catch-up" in output[0]
+    assert MaintenanceStore(root, store).read_state().deferredEvents[-1].reasonCode == reason
+
+
+def test_hook_stdin_byte_cap_is_deferred_with_catch_up_notice(tmp_path: Path) -> None:
+    import repo2skill.maintenance_hooks as hooks
+
+    root, store = _repo(tmp_path / "repo")
+    target = _commit(root)
+    with store.mutation():
+        maint = MaintenanceStore(root, store)
+        maint.replace_state(dataclasses.replace(maint.read_state(), enabled=True))
+    output = []
+
+    result = process_hook(
+        root, "post-rewrite", b"x" * (hooks.MAX_HOOK_STDIN_BYTES + 1), ("rebase",),
+        store=store, output=output.append,
+    )
+
+    state = MaintenanceStore(root, store).read_state()
+    assert result.status == "deferred"
+    assert state.deferredEvents[-1].targetCommit == target
+    assert state.deferredEvents[-1].reasonCode == "maintenance.hook-input-cap"
+    assert "maintain catch-up" in output[0] and "maintain status" in output[0]
+
+
+def test_post_rewrite_record_count_is_bounded(tmp_path: Path) -> None:
+    from repo2skill.maintenance_git import parse_hook_event
+
+    root, _store = _repo(tmp_path / "repo")
+    current = _commit(root)
+    records = (b"a" * 40 + b" " + b"b" * 40 + b"\n") * 4097
+
+    event = parse_hook_event("post-rewrite", records, ("rebase",), root=root)
+
+    assert event.reasonCode == "maintenance.hook-record-cap"
+    assert event.targetCommit == current
+
+
 def test_post_checkout_wrapper_returns_success_after_diagnostic(tmp_path: Path, monkeypatch) -> None:
     import types
     import repo2skill.maintenance_hooks as hooks
@@ -217,6 +345,39 @@ def test_post_checkout_wrapper_returns_success_after_diagnostic(tmp_path: Path, 
     monkeypatch.setattr(hooks, "process_hook", lambda *a, **kw: hooks.HookProcessResult("diagnostic", message="bounded failure"))
 
     assert hooks._entrypoint() == 0
+
+
+def test_wrapper_launch_failure_is_diagnostic_but_returns_success(tmp_path: Path) -> None:
+    from repo2skill.maintenance_hooks import _wrapper_bytes
+
+    bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    wrapper = tmp_path / "post-commit"
+    wrapper.write_bytes(_wrapper_bytes("post-commit", tmp_path / "missing python.exe"))
+
+    result = subprocess.run(
+        [str(bash), str(wrapper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=5, check=False,
+    )
+
+    assert result.returncode == 0
+    assert b"maintain catch-up" in result.stderr + result.stdout
+    assert b"maintain status" in result.stderr + result.stdout
+
+
+def test_dangling_foreign_hook_is_reported_during_disable(tmp_path: Path, monkeypatch) -> None:
+    import repo2skill.maintenance_hooks as hooks
+
+    root, store = _repo(tmp_path / "repo")
+    dangling = _hook_dir(root) / "post-commit"
+    original_exists = Path.exists
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(Path, "exists", lambda self: False if self == dangling else original_exists(self))
+    monkeypatch.setattr(Path, "is_symlink", lambda self: True if self == dangling else original_is_symlink(self))
+
+    result = hooks.remove_owned_hooks(root, store)
+
+    assert result.manualIntegrationRequired is True
+    assert "post-commit" in result.message
 
 
 def test_wrapper_launcher_avoids_repo_shadow_module_and_windows_console(tmp_path: Path, monkeypatch) -> None:
