@@ -55,6 +55,50 @@ class MaintenanceContext:
     priorEvidence: tuple[Evidence, ...] = ()
 
 
+def build_agent_request(context: MaintenanceContext, snapshot_root: Path):
+    """Frame the complete bounded committed context as an exact structured stdin prompt."""
+    import base64
+    from .maintenance_agent import AgentRequest, PROMPT_MAX_BYTES, SCHEMA_MAX_BYTES, request_hash
+
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["jobId", "snapshotId", "operations"],
+        "properties": {
+            "jobId": {"type": "string"}, "snapshotId": {"type": "string"},
+            "operations": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["op", "semanticKey", "scope", "renderedText", "factIds", "evidenceIds", "claimRef"],
+                "properties": {
+                    "op": {"enum": ["add", "update", "delete"]},
+                    "semanticKey": {"type": "string"}, "scope": {"type": "string"},
+                    "renderedText": {"type": ["string", "null"]},
+                    "factIds": {"type": "array", "items": {"type": "string"}},
+                    "evidenceIds": {"type": "array", "items": {"type": "string"}},
+                    "claimRef": {"type": ["string", "null"]},
+                },
+            }},
+        },
+    }
+    schema_bytes = canonical_json_bytes(schema)
+    prompt = {
+        "task": "Propose only evidence-backed maintenance claim operations. Use exact fact/evidence IDs and scope from this committed context.",
+        "jobId": context.job.jobId,
+        "snapshotId": context.snapshot.snapshotId,
+        "sourceContextHash": context.sourceContextHash,
+        "changedDiffBase64": base64.b64encode(context.changedDiff).decode("ascii"),
+        "facts": context.facts,
+        "evidence": context.evidence,
+        "priorClaims": context.priorClaims,
+    }
+    prompt_bytes = canonical_json_bytes(prompt)
+    if len(prompt_bytes) > PROMPT_MAX_BYTES:
+        raise ValueError("maintenance agent prompt exceeds 1 MiB; context must be rebuilt within configured bounds")
+    if len(schema_bytes) > SCHEMA_MAX_BYTES:
+        raise ValueError("maintenance agent schema exceeds 128 KiB")
+    return AgentRequest(context.job.jobId, Path(snapshot_root), prompt_bytes, schema_bytes,
+                        request_hash(context.job.jobId, prompt_bytes, schema_bytes))
+
+
 @dataclass(frozen=True, slots=True)
 class MaintenanceRunBundle:
     run: RunLedger

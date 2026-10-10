@@ -11,3 +11,5 @@ Options:
           [possible values: read-only, workspace-write, danger-full-access]
   --ignore-user-config  Do not load the user config file
   -C, --cd <DIR>  Set the working directory
+  --ephemeral  Run without persisting session files
+  --skip-git-repo-check  Allow execution outside a Git repository

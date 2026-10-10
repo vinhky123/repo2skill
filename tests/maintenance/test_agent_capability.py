@@ -24,6 +24,8 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "maintenance" / "codex"
         ("missing-read-only.txt", "read-only-sandbox"),
         ("missing-user-config.txt", "user-config"),
         ("missing-working-directory.txt", "working-directory"),
+        ("missing-ephemeral.txt", "ephemeral"),
+        ("missing-skip-git-repo-check.txt", "skip-git-repo-check"),
         ("false-positive-stdin.txt", "stdin-prompt"),
         ("false-positive-read-only.txt", "read-only-sandbox"),
         ("false-positive-stdin-file-prompt.txt", "stdin-prompt"),
@@ -74,12 +76,12 @@ def test_probe_discovers_codex_on_path_or_reports_unavailable(
     from repo2skill import maintenance_agent
 
     executable, _ = _fake_codex(tmp_path, FIXTURES / "complete-help.txt")
-    monkeypatch.setattr(maintenance_agent.shutil, "which", lambda _name: str(executable))
+    monkeypatch.setattr(maintenance_agent.shutil, "which", lambda _name, path=None: str(executable))
     discovered = probe_agent(None)
     assert discovered.executable == executable
     assert discovered.supported is True
 
-    monkeypatch.setattr(maintenance_agent.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(maintenance_agent.shutil, "which", lambda _name, path=None: None)
     unavailable = probe_agent(None)
     assert unavailable.supported is False
     assert unavailable.executable is None

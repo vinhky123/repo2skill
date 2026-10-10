@@ -1,17 +1,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from typing import Literal
+
+from .maintenance_models import ClaimOperation
+
+
+PROMPT_MAX_BYTES = 1024 * 1024
+SCHEMA_MAX_BYTES = 128 * 1024
+OUTPUT_MAX_BYTES = 1024 * 1024
+INVOCATION_MAX_PIPE_BYTES = 256 * 1024
+INVOCATION_CLEANUP_RESERVE_SECONDS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRequest:
+    jobId: str
+    snapshotRoot: Path
+    promptBytes: bytes
+    schemaBytes: bytes
+    requestHash: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentResponse:
+    status: str
+    outputBytes: bytes
+    diagnostic: str | None
+    exitCode: int | None = None
 
 
 PROBE_TIMEOUT_SECONDS = 5.0
@@ -63,13 +92,13 @@ class _ProbeFailure(RuntimeError):
         super().__init__(reason)
 
 
-def probe_agent(executable: Path | None) -> AgentCapability:
+def probe_agent(executable: Path | None, *, source_root: Path | None = None) -> AgentCapability:
     """Check local Codex CLI help for the explicit maintenance invocation surface.
 
     This only inspects ``--version`` and ``exec --help``. It does not authenticate,
     select a model, contact a provider, or prove sandbox behavior.
     """
-    resolved = _resolve_executable(executable)
+    resolved = _resolve_executable(executable, source_root=source_root)
     if resolved is None:
         return AgentCapability(None, None, False, ("executable",))
 
@@ -99,6 +128,8 @@ def probe_agent(executable: Path | None) -> AgentCapability:
         ("output-last-message", "output-file"),
         ("ignore-user-config", "user-config"),
         ("cd", "working-directory"),
+        ("ephemeral", "ephemeral"),
+        ("skip-git-repo-check", "skip-git-repo-check"),
     ):
         if flag not in option_blocks:
             missing.append(capability)
@@ -181,15 +212,281 @@ def _supports_read_only_sandbox(sandbox_help: str) -> bool:
     )
 
 
-def _resolve_executable(executable: Path | None) -> Path | None:
+def _resolve_executable(executable: Path | None, *, source_root: Path | None = None) -> Path | None:
     if executable is None:
-        found = shutil.which("codex")
-        return Path(found).resolve() if found else None
+        excluded_roots = {Path(__file__).resolve().parents[2]}
+        requested_root = Path.cwd() if source_root is None else Path(source_root)
+        try:
+            excluded_roots.add(requested_root.resolve(strict=True))
+        except OSError:
+            return None
+        safe_entries: list[str] = []
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry:
+                continue
+            candidate = Path(entry)
+            if not candidate.is_absolute():
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if any(resolved == root or root in resolved.parents for root in excluded_roots):
+                continue
+            safe_entries.append(str(resolved))
+        found = shutil.which("codex", path=os.pathsep.join(safe_entries))
+        if not found:
+            return None
+        try:
+            resolved = Path(found).resolve(strict=True)
+        except OSError:
+            return None
+        if any(resolved == root or root in resolved.parents for root in excluded_roots):
+            return None
+        return resolved if resolved.is_file() else None
     try:
         path = executable.expanduser().resolve(strict=True)
     except OSError:
         return None
     return path if path.is_file() else None
+
+
+def request_hash(job_id: str, prompt_bytes: bytes, schema_bytes: bytes) -> str:
+    return "sha256:" + hashlib.sha256(job_id.encode("utf-8") + b"\0" + prompt_bytes + b"\0" + schema_bytes).hexdigest()
+
+
+def invoke_agent(capability: AgentCapability, request: AgentRequest, timeout_seconds: float) -> AgentResponse:
+    """Run the probed read-only CLI surface with bounded stdin, pipes, and output file."""
+    if not capability.supported or capability.executable is None:
+        return AgentResponse("unavailable", b"", "agent capability is unavailable: " + ",".join(capability.missingCapabilities))
+    if (not isinstance(request.jobId, str) or not request.jobId or not isinstance(request.promptBytes, bytes)
+            or not isinstance(request.schemaBytes, bytes) or isinstance(timeout_seconds, bool)):
+        return AgentResponse("invalid-request", b"", "request fields or timeout have invalid types")
+    if len(request.promptBytes) > PROMPT_MAX_BYTES or len(request.schemaBytes) > SCHEMA_MAX_BYTES:
+        return AgentResponse("input-cap", b"", "prompt or schema exceeds configured byte limit")
+    if request.requestHash != request_hash(request.jobId, request.promptBytes, request.schemaBytes):
+        return AgentResponse("invalid-request", b"", "request hash does not match job, prompt, and schema bytes")
+    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        return AgentResponse("invalid-request", b"", "timeout must be positive")
+    try:
+        snapshot = request.snapshotRoot.resolve(strict=True)
+        if not snapshot.is_dir():
+            raise ValueError("snapshotRoot is not a directory")
+        with tempfile.TemporaryDirectory(prefix="repo2skill-agent-") as temp_name:
+            workspace = Path(temp_name).resolve()
+            source_root = Path(__file__).resolve().parents[2]
+            if workspace == source_root or source_root in workspace.parents:
+                return AgentResponse("unavailable", b"", "temporary invocation cwd must be outside the source repository")
+            if (workspace / "AGENTS.md").exists() or (workspace / "AGENTS.md").is_symlink():
+                return AgentResponse("unavailable", b"", "temporary invocation cwd contains repository instructions")
+            schema_path = workspace / "schema.json"
+            output_path = workspace / "response.json"
+            with schema_path.open("xb") as stream:
+                stream.write(request.schemaBytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            argv = _command(capability.executable, (
+                "exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
+                "--ignore-user-config", "--cd", str(workspace), "--output-schema", str(schema_path),
+                "--output-last-message", str(output_path), "-",
+            ))
+            deadline = time.monotonic() + float(timeout_seconds)
+            reserve = min(INVOCATION_CLEANUP_RESERVE_SECONDS, float(timeout_seconds) / 4)
+            run_deadline = deadline - reserve
+            environment = os.environ.copy()
+            process_options: dict[str, object] = {}
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_options["start_new_session"] = True
+            try:
+                process = subprocess.Popen(argv, cwd=workspace, shell=False, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment, **process_options)
+            except OSError as error:
+                return AgentResponse("unavailable", b"", f"agent could not be started: {error}")
+            assert process.stdin is not None
+            kill_job = _create_windows_kill_job(process)
+            output_overflow = threading.Event()
+            watcher_stop = threading.Event()
+            def watch_output() -> None:
+                while not watcher_stop.wait(0.02):
+                    try:
+                        info = output_path.lstat()
+                        if not stat.S_ISREG(info.st_mode) or info.st_size > OUTPUT_MAX_BYTES:
+                            output_overflow.set()
+                            process.kill()
+                            return
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        output_overflow.set()
+                        process.kill()
+                        return
+            watcher = threading.Thread(target=watch_output, daemon=True)
+            watcher.start()
+            write_error: list[BaseException] = []
+            def write_prompt() -> None:
+                try:
+                    process.stdin.write(request.promptBytes)
+                    process.stdin.close()
+                except (BrokenPipeError, OSError) as error:
+                    write_error.append(error)
+            writer = threading.Thread(target=write_prompt, daemon=True)
+            writer.start()
+            try:
+                result = _collect_invocation(process, argv, deadline, run_deadline, kill_job)
+            except _ProbeFailure as error:
+                watcher_stop.set()
+                watcher.join(timeout=max(0.01, deadline - time.monotonic()))
+                writer.join(timeout=max(0.01, deadline - time.monotonic()))
+                return AgentResponse(error.reason, b"", f"agent invocation failed: {error.reason}")
+            finally:
+                watcher_stop.set()
+                watcher.join(timeout=max(0.01, deadline - time.monotonic()))
+                writer.join(timeout=max(0.01, deadline - time.monotonic()))
+                _close_windows_kill_job(kill_job)
+            if output_overflow.is_set():
+                return AgentResponse("output-cap", b"", "structured output file exceeded byte limit or was redirected")
+            if write_error:
+                return AgentResponse("input-error", b"", "could not send the complete prompt to the agent")
+            if result.returncode != 0:
+                return AgentResponse("nonzero-exit", b"", f"agent exited with status {result.returncode}", result.returncode)
+            try:
+                before = output_path.lstat()
+                if not stat.S_ISREG(before.st_mode) or before.st_size > OUTPUT_MAX_BYTES:
+                    return AgentResponse("output-cap", b"", "structured output is not a bounded regular file")
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(output_path, flags)
+                with os.fdopen(descriptor, "rb") as stream:
+                    opened_before = os.fstat(stream.fileno())
+                    output = stream.read(OUTPUT_MAX_BYTES + 1)
+                    opened_after = os.fstat(stream.fileno())
+                after = output_path.lstat()
+                stable = (opened_before.st_dev, opened_before.st_ino, opened_before.st_size, opened_before.st_mtime_ns) == (
+                    opened_after.st_dev, opened_after.st_ino, opened_after.st_size, opened_after.st_mtime_ns)
+                same_file = (before.st_dev, before.st_ino) == (opened_before.st_dev, opened_before.st_ino)
+                if (len(output) > OUTPUT_MAX_BYTES or not stat.S_ISREG(opened_before.st_mode)
+                        or not stat.S_ISREG(after.st_mode) or not stable or not same_file
+                        or before.st_size != after.st_size):
+                    return AgentResponse("output-cap", b"", "structured output changed or exceeded byte limit")
+            except FileNotFoundError:
+                return AgentResponse("missing-output", b"", "agent did not create the structured output file")
+            except OSError as error:
+                return AgentResponse("output-invalid", b"", f"could not safely read structured output: {error}")
+            diagnostic_bytes = result.stderr[:8192]
+            diagnostic = diagnostic_bytes.decode("utf-8", errors="ignore") or None
+            return AgentResponse("ok", output, diagnostic, result.returncode)
+    except (OSError, ValueError) as error:
+        return AgentResponse("unavailable", b"", str(error))
+
+
+def _collect_invocation(process: subprocess.Popen[bytes], argv: list[str], deadline: float,
+                        run_deadline: float, kill_job: tuple[object, object] | None) -> subprocess.CompletedProcess[bytes]:
+    assert process.stdout is not None and process.stderr is not None
+    capture = _Capture(INVOCATION_MAX_PIPE_BYTES, process)
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    def drain(stream: object, destination: list[bytes]) -> None:
+        read = getattr(stream, "read")
+        while True:
+            chunk = read(_READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            accepted = capture.accept(chunk)
+            if accepted:
+                destination.append(accepted)
+            if capture.exceeded:
+                return
+    readers = (threading.Thread(target=drain, args=(process.stdout, stdout_chunks), daemon=True),
+               threading.Thread(target=drain, args=(process.stderr, stderr_chunks), daemon=True))
+    for reader in readers: reader.start()
+    try:
+        returncode = process.wait(timeout=max(0.0, run_deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        _terminate_process_tree(process, deadline, kill_job)
+        _join_readers(readers, deadline)
+        raise _ProbeFailure("timeout") from error
+    _join_readers(readers, run_deadline)
+    if any(reader.is_alive() for reader in readers):
+        _terminate_process_tree(process, deadline, kill_job)
+        _join_readers(readers, deadline)
+        raise _ProbeFailure("pipe-cleanup")
+    if capture.exceeded:
+        raise _ProbeFailure("output-cap")
+    return subprocess.CompletedProcess(argv, returncode, b"".join(stdout_chunks), b"".join(stderr_chunks))
+
+
+def validate_operations(response: AgentResponse, context) -> tuple[ClaimOperation, ...]:
+    """Validate a complete response transaction against one committed context."""
+    if response.status != "ok":
+        raise ValueError(f"agent response is not successful: {response.status}")
+    if len(response.outputBytes) > OUTPUT_MAX_BYTES:
+        raise ValueError("agent response exceeds byte limit")
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+    try:
+        raw = json.loads(response.outputBytes.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            object_pairs_hook=unique_object)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("agent response is not complete valid JSON") from error
+    if not isinstance(raw, dict) or set(raw) != {"jobId", "snapshotId", "operations"}:
+        raise ValueError("agent response envelope has unexpected fields")
+    if raw["jobId"] != context.job.jobId or raw["snapshotId"] != context.snapshot.snapshotId:
+        raise ValueError("agent response job or snapshot binding does not match")
+    if not isinstance(raw["operations"], list):
+        raise ValueError("agent operations must be an array")
+    known_facts = {fact.factId: fact for fact in context.facts}
+    known_evidence = {item.evidenceId: item for item in context.evidence}
+    prior_by_ref = {f"{claim.claimId}@{claim.claimRevision}": claim for claim in context.priorClaims}
+    operations: list[ClaimOperation] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw["operations"]:
+        if not isinstance(item, dict) or set(item) != {"op", "semanticKey", "scope", "renderedText", "factIds", "evidenceIds", "claimRef"}:
+            raise ValueError("operation has missing or unexpected fields")
+        try:
+            operation = ClaimOperation(item["op"], item["semanticKey"], item["scope"], item["renderedText"],
+                tuple(item["factIds"]), tuple(item["evidenceIds"]), item["claimRef"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("operation fields are invalid") from error
+        identity = (operation.op, operation.scope, operation.semanticKey)
+        if identity in seen:
+            raise ValueError("duplicate maintenance operation")
+        seen.add(identity)
+        if operation.op in {"add", "update"}:
+            if not operation.factIds or tuple(sorted(set(operation.factIds))) != operation.factIds:
+                raise ValueError("operation fact IDs must be sorted, unique, and nonempty")
+            facts = [known_facts.get(fact_id) for fact_id in operation.factIds]
+            if any(fact is None or fact.snapshotId != context.snapshot.snapshotId or fact.scope != operation.scope or fact.factType != "source.fragment.v1" for fact in facts):
+                raise ValueError("operation references a fact outside the committed snapshot")
+            expected_evidence = tuple(sorted({evidence_id for fact in facts for evidence_id in fact.evidenceIds}))
+            if operation.evidenceIds != expected_evidence or any(evidence_id not in known_evidence or known_evidence[evidence_id].snapshotId != context.snapshot.snapshotId for evidence_id in expected_evidence):
+                raise ValueError("operation evidence does not exactly support its facts")
+            if not operation.renderedText or not operation.renderedText.strip():
+                raise ValueError("operation text must be nonempty")
+            if operation.op == "add" and operation.claimRef is not None:
+                raise ValueError("add operation cannot reference a prior claim")
+            if operation.op == "update":
+                if operation.claimRef not in prior_by_ref:
+                    raise ValueError("update operation references an unknown prior claim")
+                prior = prior_by_ref[operation.claimRef]
+                if prior.scope != operation.scope or prior.semanticKey != operation.semanticKey:
+                    raise ValueError("update operation binding does not match the prior claim")
+        else:
+            if operation.renderedText is not None or operation.factIds or operation.evidenceIds:
+                raise ValueError("delete operation must not include generated text or support")
+            if operation.claimRef not in prior_by_ref:
+                raise ValueError("delete operation references an unknown prior claim")
+            prior = prior_by_ref[operation.claimRef]
+            if prior.scope != operation.scope or prior.semanticKey != operation.semanticKey:
+                raise ValueError("delete operation binding does not match the prior claim")
+        operations.append(operation)
+    return tuple(operations)
 
 
 def _command(executable: Path, arguments: tuple[str, ...]) -> list[str]:
