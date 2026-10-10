@@ -513,13 +513,19 @@ def _project_output_paths(
     return exact, prefixes
 
 
+def _is_project_output(path: str, exact: set[str], prefixes: set[str]) -> bool:
+    return path in exact or any(
+        path == prefix or path.startswith(prefix + "/") for prefix in prefixes
+    )
+
+
 def _filter_project_outputs(
     impact: CommitImpact, exact: set[str], prefixes: set[str],
 ) -> CommitImpact:
     statuses = impact.changeStatuses or tuple(("M", path) for path in impact.paths)
     filtered_statuses = tuple(
         (status, path) for status, path in statuses
-        if path not in exact and not any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+        if not _is_project_output(path, exact, prefixes)
     )
     paths = tuple(sorted({path for _status, path in filtered_statuses}))
     renames = tuple(
@@ -618,6 +624,10 @@ def enqueue_event(
                         absent_path = read.selector.value.split(":", 1)[-1]
                         if absent_path in impact.paths:
                             selected_paths.add(absent_path)
+        selected_paths = {
+            path for path in selected_paths
+            if not _is_project_output(path, exact_outputs, output_prefixes)
+        }
         try:
             with tempfile.TemporaryDirectory(prefix="repo2skill-context-") as temp_dir:
                 temporary = Path(temp_dir)

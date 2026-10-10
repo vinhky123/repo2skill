@@ -398,3 +398,27 @@ def test_enqueue_persists_context_before_publishing_job_and_cursor(tmp_path: Pat
     assert committed is not None
     assert committed["observedEventCursor"] == event.cursor
     assert job.jobId in committed["jobs"]
+
+def test_full_scan_context_excludes_owned_outputs_but_keeps_agents_source(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / "main.py").write_text("pass\n", encoding="utf-8")
+    (root / "AGENTS.md").write_text("generated instructions\n", encoding="utf-8")
+    skill_dir = root / ".agents" / "skills" / root.name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("generated skill\n", encoding="utf-8")
+    (root / ".agents" / "unrelated.py").write_text("source\n", encoding="utf-8")
+    target = _commit(root, "bootstrap source and outputs")
+    store = _store(root)
+    event = GitEvent("git-event_555555555555555555555555", "post-commit", "cursor-full", target)
+
+    job = enqueue_event(store, event, bootstrap_commit(root, target))
+
+    assert job is not None
+    manifest_id = canonical_record_id("source-context", {"contextHash": job.sourceContextHash})
+    saved = store.read_immutable_bytes(f"maintenance/contexts/{manifest_id}.json")
+    assert saved is not None
+    manifest = json.loads(saved)["manifest"]
+    paths = {entry["path"] for entry in manifest["files"]}
+    assert paths == {"src/main.py", ".agents/unrelated.py"}
+    assert set(manifest["omittedPaths"]) == set()
