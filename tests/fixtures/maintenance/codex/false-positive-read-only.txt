@@ -1,0 +1,12 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+Arguments:
+  [PROMPT]
+          Initial instructions; if - is used, instructions are read from stdin.
+Options:
+  --output-schema <FILE>
+  --output-last-message <FILE>
+  --sandbox <SANDBOX_MODE>
+          Possible values: workspace-write, danger-full-access.
+          The read-only mode is described in the security guide.
+  --ignore-user-config
+  --cd <DIR>

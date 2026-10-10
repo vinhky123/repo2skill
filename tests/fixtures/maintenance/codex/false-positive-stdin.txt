@@ -1,0 +1,13 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+Arguments:
+  [PROMPT]
+          The prompt supplied as an argument.
+Options:
+  --transport <MODE>
+          Reads stdin for transport configuration.
+  --output-schema <FILE>
+  --output-last-message <FILE>
+  --sandbox <SANDBOX_MODE>
+          [possible values: read-only, workspace-write]
+  --ignore-user-config
+  --cd <DIR>

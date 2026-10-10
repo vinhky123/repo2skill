@@ -1,6 +1,11 @@
 Usage: codex exec [OPTIONS] [PROMPT]
+Arguments:
+  [PROMPT]
+          Initial instructions for the agent.
+Options:
   --output-schema <FILE>
   --output-last-message <FILE>
-  --sandbox <SANDBOX_MODE> possible values: read-only, workspace-write
+  --sandbox <SANDBOX_MODE>
+          [possible values: read-only, workspace-write]
   --ignore-user-config
   --cd <DIR>

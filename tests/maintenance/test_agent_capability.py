@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import pytest
 
 from repo2skill.maintenance_agent import probe_agent
@@ -19,6 +24,8 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "maintenance" / "codex"
         ("missing-read-only.txt", "read-only-sandbox"),
         ("missing-user-config.txt", "user-config"),
         ("missing-working-directory.txt", "working-directory"),
+        ("false-positive-stdin.txt", "stdin-prompt"),
+        ("false-positive-read-only.txt", "read-only-sandbox"),
     ],
 )
 def test_probe_fails_closed_when_a_required_cli_surface_is_missing(
@@ -96,18 +103,59 @@ def test_probe_fails_closed_for_bounded_inspection_failures(
     assert any(failure in reason for reason in result.missingCapabilities)
 
 
+def test_probe_bounds_pipe_cleanup_and_terminates_descendant_holding_help_pipes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from repo2skill import maintenance_agent
+
+    pid_path = tmp_path / "descendant.pid"
+    executable, _ = _fake_codex(
+        tmp_path,
+        FIXTURES / "complete-help.txt",
+        failure="descendant",
+        child_pid_path=pid_path,
+    )
+    monkeypatch.setattr(maintenance_agent, "PROBE_TIMEOUT_SECONDS", 0.8)
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(probe_agent, executable)
+    try:
+        try:
+            result = future.result(timeout=2)
+        except TimeoutError:
+            pytest.fail("probe did not return within the test bound")
+        child_pid = int(pid_path.read_text(encoding="ascii"))
+        assert time.monotonic() - started < 1.5
+        assert result.supported is False
+        assert any("pipe" in reason for reason in result.missingCapabilities), result
+        assert not _test_process_is_alive(child_pid)
+    finally:
+        if pid_path.exists():
+            _kill_test_process(int(pid_path.read_text(encoding="ascii")))
+        executor.shutdown(wait=True)
+
+
 def _fake_codex(
-    tmp_path: Path, help_fixture: Path, *, failure: str | None = None
+    tmp_path: Path,
+    help_fixture: Path,
+    *,
+    failure: str | None = None,
+    child_pid_path: Path | None = None,
 ) -> tuple[Path, Path]:
     executable = tmp_path / "codex.py"
     log_path = tmp_path / "calls.jsonl"
     executable.write_text(
         "from __future__ import annotations\n"
-        "import json, os, pathlib, sys, time\n"
+        "import json, os, pathlib, subprocess, sys, time\n"
         "args = sys.argv[1:]\n"
         "record = {'argv': args, 'cwd': os.getcwd(), 'stdin': sys.stdin.read()}\n"
         f"pathlib.Path({str(log_path)!r}).open('a', encoding='utf-8').write(json.dumps(record) + '\\n')\n"
         f"failure = {failure!r}\n"
+        f"child_pid_path = {str(child_pid_path)!r}\n"
+        "if failure == 'descendant' and args == ['exec', '--help']:\n"
+        "    time.sleep(0.1)\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "    pathlib.Path(child_pid_path).write_text(str(child.pid), encoding='ascii')\n"
         "if failure == 'timeout': time.sleep(1)\n"
         "if failure == 'output-cap': print('x' * 4096)\n"
         "elif args == ['--version']:\n"
@@ -118,3 +166,37 @@ def _fake_codex(
         encoding="utf-8",
     )
     return executable, log_path
+
+
+def _kill_test_process(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _test_process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

@@ -1,7 +1,11 @@
 Usage: codex exec [OPTIONS] [PROMPT]
-Prompt is read from stdin when omitted.
+Arguments:
+  [PROMPT]
+          Initial instructions for the agent. If `-` is used, instructions are read from stdin.
+Options:
   --output-schema <FILE>
   --output-last-message <FILE>
-  --sandbox <SANDBOX_MODE> possible values: workspace-write, danger-full-access
+  --sandbox <SANDBOX_MODE>
+          [possible values: workspace-write, danger-full-access]
   --ignore-user-config
   --cd <DIR>
