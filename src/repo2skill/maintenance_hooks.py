@@ -46,50 +46,14 @@ def _git(root: Path, args: Sequence[str], *, timeout: float = 2.0) -> bytes:
     return result.stdout
 
 
-def _local_hooks_directory(root: Path) -> tuple[Path | None, str | None]:
-    root = Path(root).absolute()
-    git_marker = root / ".git"
-    if not root.is_dir() or not git_marker.is_dir() or _is_redirected(git_marker):
-        return None, "repository is linked, bare, or does not have an ordinary local .git directory"
-    try:
-        top = Path(os.fsdecode(_git(root, ("rev-parse", "--show-toplevel")).strip())).resolve()
-        git_dir = Path(os.fsdecode(_git(root, ("rev-parse", "--absolute-git-dir")).strip())).resolve()
-        common_dir_text = _git(root, ("rev-parse", "--git-common-dir")).strip()
-        common_dir = Path(os.fsdecode(common_dir_text))
-        if not common_dir.is_absolute():
-            common_dir = root / common_dir
-        common_dir = common_dir.resolve()
-        worktrees = _git(root, ("worktree", "list", "--porcelain", "-z"))
-        worktree_count = sum(record.startswith(b"worktree ") for record in worktrees.split(b"\0"))
-        configured = subprocess.run(
-            ["git", "-C", str(root), "config", "--get", "core.hooksPath"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired, GitReadError, ValueError):
-        return None, "could not safely inspect the repository Git configuration"
-    if top != root.resolve() or git_dir != (root / ".git").resolve() or common_dir != git_dir:
-        return None, "linked worktrees and shared Git directories require manual hook integration"
-    if worktree_count != 1:
-        return None, "repository hooks are shared with linked worktrees; use manual hook integration"
-    if configured.returncode == 0:
-        return None, "core.hooksPath is configured; use --manual-hooks or integrate observation manually"
-    if configured.returncode != 1:
-        return None, "could not safely inspect core.hooksPath; use manual hook integration"
-    hooks = git_dir / "hooks"
-    try:
-        if _is_redirected(hooks) or not hooks.is_dir():
-            return None, "the repository-local hooks directory is missing or redirected"
-    except OSError:
-        return None, "the repository-local hooks directory cannot be inspected"
-    return hooks, None
+def _resolve_main_hooks_directory(
+    root: Path, *, require_exclusive_worktree: bool,
+) -> tuple[Path | None, str | None]:
+    """Resolve canonical local hooks, optionally requiring an exclusive repo.
 
-
-def _main_hooks_directory_for_cleanup(root: Path) -> tuple[Path | None, str | None]:
-    """Resolve canonical main-checkout hooks for exact-owned cleanup only.
-
-    Unlike installation, cleanup can safely remove wrappers from a main
-    checkout after linked worktrees were added, provided Git still resolves to
-    this ordinary, unredirected local metadata directory.
+    Setup and any future authority/grant caller must require exclusivity.
+    Disable may omit only that check so it can remove exact-owned wrappers
+    after a linked worktree was added to the ordinary main checkout.
     """
     root = Path(root).absolute()
     git_marker = root / ".git"
@@ -103,6 +67,11 @@ def _main_hooks_directory_for_cleanup(root: Path) -> tuple[Path | None, str | No
         if not common_dir.is_absolute():
             common_dir = root / common_dir
         common_dir = common_dir.resolve()
+        if require_exclusive_worktree:
+            worktrees = _git(root, ("worktree", "list", "--porcelain", "-z"))
+            worktree_count = sum(record.startswith(b"worktree ") for record in worktrees.split(b"\0"))
+        else:
+            worktree_count = None
         configured = subprocess.run(
             ["git", "-C", str(root), "config", "--get", "core.hooksPath"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2, check=False,
@@ -111,8 +80,10 @@ def _main_hooks_directory_for_cleanup(root: Path) -> tuple[Path | None, str | No
         return None, "could not safely inspect the repository Git configuration"
     if top != root.resolve() or git_dir != (root / ".git").resolve() or common_dir != git_dir:
         return None, "linked worktrees and shared Git directories require manual hook integration"
+    if require_exclusive_worktree and worktree_count != 1:
+        return None, "repository hooks are shared with linked worktrees; use manual hook integration"
     if configured.returncode == 0:
-        return None, "core.hooksPath is configured; use manual hook integration"
+        return None, "core.hooksPath is configured; use --manual-hooks or integrate observation manually"
     if configured.returncode != 1:
         return None, "could not safely inspect core.hooksPath; use manual hook integration"
     hooks = git_dir / "hooks"
@@ -193,7 +164,7 @@ def install_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
         return HookInstallResult(False, True, message="store and repository roots differ")
     if store.state_dir != root / ".repo2skill":
         return HookInstallResult(False, True, message="custom state directories require manual hook integration")
-    hooks, refusal = _local_hooks_directory(root)
+    hooks, refusal = _resolve_main_hooks_directory(root, require_exclusive_worktree=True)
     if refusal or hooks is None:
         return HookInstallResult(False, True, message=refusal or "manual hook integration is required")
     expected = {name: _wrapper_bytes(name) for name in HOOK_NAMES}
@@ -238,7 +209,7 @@ def remove_owned_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
         return HookInstallResult(
             False, True, message=f"maintenance disable could not be persisted ({type(error).__name__}); hooks were left unchanged",
         )
-    hooks, refusal = _main_hooks_directory_for_cleanup(root)
+    hooks, refusal = _resolve_main_hooks_directory(root, require_exclusive_worktree=False)
     if hooks is None:
         return HookInstallResult(True, True, message=f"maintenance disabled; {refusal or 'manual hook integration is required'}")
     removed: list[str] = []
