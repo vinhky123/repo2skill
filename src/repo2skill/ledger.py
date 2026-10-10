@@ -256,7 +256,7 @@ def _merge_additive(
                 if key in old else value
             )
         return merged
-    if isinstance(old, list) and isinstance(new, list) and field_name == "reviewEvents":
+    if isinstance(old, list) and isinstance(new, list) and field_name in {"reviewEvents", "deferredEvents"}:
         old_by_id = {
             item["eventId"]: item
             for item in old
@@ -545,6 +545,47 @@ class LedgerStore:
                 if len(payload) != opened.stat_before.st_size or not opened.stable_after_read():
                     raise ValueError(f"immutable artifact changed while reading: {relative_path}")
                 return payload
+
+    def read_maintenance_state_document(self) -> dict[str, JsonValue] | None:
+        """Read the separate maintenance pointer without creating store paths."""
+        path = self._store_path("maintenance/state.json", create_parents=False)
+        if not path.exists():
+            return None
+        return _load_json(path)
+
+    def replace_maintenance_state_document(self, document: dict[str, JsonValue]) -> None:
+        """Atomically replace the typed maintenance pointer under the mutation lock."""
+        self._require_mutation()
+        validate_json_value(document)
+        path = self._store_path("maintenance/state.json", create_parents=False)
+        try:
+            old = _load_json(path)
+        except FileNotFoundError:
+            old = None
+        encoded: JsonValue = document
+        if old is not None:
+            encoded = _merge_additive(old, document)
+        if not isinstance(encoded, dict):
+            raise ValueError("maintenance state document must be an object")
+        parts = self.state_dir.relative_to(self.root).parts
+        store_io.replace_json(
+            self.root, parts + ("maintenance",), "state.json", encoded, create=True
+        )
+
+    def write_maintenance_job_bytes(self, job_id: str, payload: bytes) -> None:
+        """Create an immutable maintenance job, accepting only exact retries."""
+        self._require_mutation()
+        if not isinstance(job_id, str) or not re.fullmatch(
+            r"[a-z][a-z0-9-]*_[0-9a-f]{24}", job_id
+        ):
+            raise ValueError("job ID must be a canonical lowercase ID")
+        relative_path = f"maintenance/jobs/{job_id}.json"
+        existing = self.read_immutable_bytes(relative_path)
+        if existing is not None:
+            if existing == payload:
+                return
+            raise FileExistsError(relative_path)
+        self.write_immutable_bytes(relative_path, payload)
 
     def immutable_path_exists(self, relative_path: str) -> bool:
         """Check whether an immutable artifact path already exists below state_dir."""

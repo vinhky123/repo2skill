@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
+from typing import Mapping
+
+from .ids import canonical_json_bytes
+from .ledger import LedgerStore, decode_root_document, encode_record
+from .maintenance_models import MaintenanceJob, MaintenancePolicy, MaintenanceState
+from .models import ProjectDocument, ProjectState, validate_json_value
+
+
+_ID = re.compile(r"[a-z][a-z0-9-]*_[0-9a-f]{24}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class _MaintenanceJobEnvelope:
+    schemaVersion: str
+    job: MaintenanceJob
+
+
+class MaintenanceStore:
+    """Durable maintenance records kept beside, but separate from, P0 state."""
+
+    def __init__(self, root: Path, ledger: LedgerStore) -> None:
+        self.root = Path(root).absolute()
+        if self.root != ledger.root:
+            raise ValueError("maintenance root must match LedgerStore root")
+        self.ledger = ledger
+
+    def _require_initialized_project(self) -> tuple[ProjectDocument, ProjectState]:
+        project = self.ledger.read_project()
+        state = self.ledger.read_state()
+        if project is None or state is None:
+            raise ValueError("initialized P0 project documents are required")
+        relative_state_dir = self.ledger.state_dir.relative_to(self.ledger.root).as_posix()
+        if project.projectId != state.projectId:
+            raise ValueError("project and state project IDs do not match")
+        if project.stateDir != relative_state_dir:
+            raise ValueError("project state directory does not match LedgerStore")
+        if project.schemaVersion.split(".", 1)[0] != "1" or state.schemaVersion.split(".", 1)[0] != "1":
+            raise ValueError("initialized P0 schema major is unsupported")
+        return project, state
+
+    def read_state(self) -> MaintenanceState:
+        """Read the authoritative pointer, or a read-only default for old projects."""
+        project, _project_state = self._require_initialized_project()
+        raw = self.ledger.read_maintenance_state_document()
+        if raw is None:
+            kinds = tuple(dict.fromkeys(target.kind for target in project.targets))
+            if not kinds:
+                kinds = ("agents-md", "skill")
+            return MaintenanceState(
+                "1.0", None, None, MaintenancePolicy("ask", 0, kinds), (), {}, None
+            )
+        maintenance = decode_root_document(raw, MaintenanceState)
+        for job_id in maintenance.jobs:
+            if self.read_job(job_id) is None:
+                raise ValueError(f"maintenance state references missing job: {job_id}")
+        return maintenance
+
+    def read_job(self, job_id: str) -> MaintenanceJob | None:
+        self._validate_job_id(job_id)
+        payload = self.ledger.read_immutable_bytes(f"maintenance/jobs/{job_id}.json")
+        if payload is None:
+            return None
+        try:
+            raw = json.loads(
+                payload.decode("utf-8"),
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON number: {value}")
+                ),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("maintenance job is not valid UTF-8 JSON") from error
+        validate_json_value(raw)
+        if not isinstance(raw, dict):
+            raise ValueError("maintenance job envelope must be an object")
+        envelope = decode_root_document(raw, _MaintenanceJobEnvelope)
+        if envelope.schemaVersion != "1.0":
+            # Minor versions in the current major remain forward-readable.
+            if not re.fullmatch(r"1\.[0-9]+", envelope.schemaVersion):
+                raise ValueError("invalid maintenance job schemaVersion")
+        if envelope.job.jobId != job_id:
+            raise ValueError("maintenance job ID does not match its filename")
+        return envelope.job
+
+    def write_job(self, job: MaintenanceJob) -> None:
+        self._require_initialized_project()
+        self._validate_job_id(job.jobId)
+        payload = canonical_json_bytes({"schemaVersion": "1.0", "job": encode_record(job)}) + b"\n"
+        self.ledger.write_maintenance_job_bytes(job.jobId, payload)
+
+    def replace_state(self, state: MaintenanceState) -> None:
+        """Replace the sole maintenance pointer under LedgerStore's lock."""
+        self._require_initialized_project()
+        if not self.ledger._mutation_active:
+            raise RuntimeError("maintenance state write requires an active mutation scope")
+        self.read_state()  # Require an authoritative current read before replacing the pointer.
+        for job_id in state.jobs:
+            if self.read_job(job_id) is None:
+                raise ValueError(f"maintenance state references missing job: {job_id}")
+        encoded = encode_record(state)
+        if not isinstance(encoded, dict):
+            raise ValueError("maintenance state must encode as a JSON object")
+        self.ledger.replace_maintenance_state_document(encoded)
+
+    def publish_job(
+        self, job: MaintenanceJob, state: MaintenanceState
+    ) -> MaintenanceState:
+        """Publish an immutable job then commit its visibility with one pointer write."""
+        if not self.ledger._mutation_active:
+            raise RuntimeError("maintenance job publication requires an active mutation scope")
+        current = self.read_state()
+        prior_event_ids = {event.eventId for event in current.deferredEvents}
+        for job_id in current.jobs:
+            prior = self.read_job(job_id)
+            if prior is not None:
+                prior_event_ids.update(prior.eventIds)
+        if prior_event_ids.intersection(job.eventIds):
+            return current
+        lifecycle = state.jobs.get(job.jobId)
+        if lifecycle is None:
+            raise ValueError("published job must have a lifecycle in the new state")
+        self.write_job(job)
+        self.replace_state(state)
+        return state
+
+    @staticmethod
+    def _validate_job_id(job_id: str) -> None:
+        if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
+            raise ValueError("job ID must be a canonical lowercase ID")
+
