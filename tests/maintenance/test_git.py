@@ -10,14 +10,20 @@ import pytest
 
 import repo2skill.maintenance_git as maintenance_git
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
-from repo2skill.ledger import LedgerStore
+from repo2skill.ledger import LedgerStore, encode_record
 from repo2skill.ids import canonical_record_id
 from repo2skill.maintenance_git import (
-    _parse_diff, bootstrap_commit, compare_commits, enqueue_event,
-    materialize_commit, parse_hook_event, read_commit_blob,
+    CommitImpact, MaintenanceGitError, _parse_diff, bootstrap_commit,
+    compare_commits, enqueue_event, materialize_commit, parse_hook_event,
+    read_commit_blob,
 )
 from repo2skill.maintenance_models import GitEvent
-from repo2skill.models import ProjectDocument, ProjectState
+from repo2skill.maintenance_store import MaintenanceStore
+from repo2skill.models import (
+    ExtractionRead, InputSelector, ProjectDocument, ProjectState, RunLedger,
+    SourceSnapshot, TargetSpec,
+)
+from repo2skill.ids import effective_policy_revision
 
 
 def _git(root: Path, *args: str, input: bytes | None = None) -> bytes:
@@ -40,6 +46,80 @@ def _commit(root: Path, message: str) -> str:
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", message)
     return _git(root, "rev-parse", "HEAD").decode().strip()
+
+
+def _project(root: Path, *, targets: tuple[TargetSpec, ...] | None = None) -> ProjectDocument:
+    return ProjectDocument(
+        "1.0", "0.1.0", "project_0123456789abcdef01234567", "fixture",
+        ".repo2skill", "worktree", default_scan_policy(), default_claim_policy(),
+        targets or default_targets(root),
+    )
+
+
+def _store(
+    root: Path, *, targets: tuple[TargetSpec, ...] | None = None,
+    applied_baseline: str | None = None, run: RunLedger | None = None,
+) -> LedgerStore:
+    state_dir = root / ".repo2skill"
+    state_dir.mkdir(exist_ok=True)
+    project = _project(root, targets=targets)
+    state = ProjectState(
+        "1.0", "0.1.0", project.projectId,
+        None if run is None else run.runId, None, (), {}, None, None,
+    )
+    (state_dir / "project.json").write_text(json.dumps(dataclasses.asdict(project)), encoding="utf-8")
+    (state_dir / "state.json").write_text(json.dumps(dataclasses.asdict(state)), encoding="utf-8")
+    store = LedgerStore(root, state_dir)
+    if run is not None:
+        with store.mutation():
+            store.write_immutable(f"runs/{run.runId}.json", encode_record(run))
+    if applied_baseline is not None:
+        maintenance = MaintenanceStore(root, store)
+        with store.mutation():
+            maintenance.replace_state(dataclasses.replace(
+                maintenance.read_state(), appliedBaseline=applied_baseline,
+            ))
+    return store
+
+
+def _active_run(root: Path) -> RunLedger:
+    policy = default_scan_policy()
+    selectors = (
+        InputSelector("glob", "*.py", ".", False),
+        InputSelector("negative", "filename-absent:Cargo.toml", ".", False),
+    )
+    from repo2skill.extractors.base import ExtractionSession
+    from repo2skill.inventory import collect_inventory
+    from repo2skill.identity import capture_repository
+    from repo2skill.dependencies import build_snapshot
+
+    controls = []
+    inventory = collect_inventory(root, policy, control_sink=controls.append)
+    identity = capture_repository(
+        root, inventory, "worktree", project_id="project_0123456789abcdef01234567", policy=policy,
+    )
+    snapshot_id = "snapshot_0123456789abcdef01234567"
+    with ExtractionSession(
+        root=root, snapshot_id=snapshot_id, inventory=inventory, policy=policy,
+        repository_id=identity.repositoryId, prior_evidence=(), prior_facts=(),
+        excluded_paths=(), control_observations=controls,
+    ) as session:
+        reads = tuple(
+            session.bind("sample", "1.0", f"sample.selector-{index}", "1.0").read(selector).dependency
+            for index, selector in enumerate(selectors)
+        )
+    project = _project(root)
+    policy_revision = effective_policy_revision(
+        project.scanPolicy, project.claimPolicy, project.targets, generation_options={},
+    )
+    snapshot = build_snapshot(
+        snapshot_id, identity, inventory, {"sample": "1.0"}, reads,
+        policy_revision=policy_revision, root_label=project.rootLabel,
+    )
+    return RunLedger(
+        "1.0", "0.1.0", "run_0123456789abcdef01234567", snapshot,
+        policy, project.claimPolicy, project.targets, reads, (), (), (), (), (), (), {}, True,
+    )
 
 
 def test_diff_uses_commit_blobs_when_worktree_is_dirty(tmp_path: Path) -> None:
@@ -102,16 +182,35 @@ def test_diff_disables_external_diff_and_textconv(tmp_path: Path, monkeypatch: p
 
 def test_added_glob_match_and_negative_invalidation_queue_scope(tmp_path: Path) -> None:
     root = _repo(tmp_path / "repo")
-    (root / "src").mkdir()
-    (root / "src" / "main.py").write_text("pass\n", encoding="utf-8")
+    (root / "old.py").write_text("pass\n", encoding="utf-8")
     baseline = _commit(root, "base")
-    (root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
-    target = _commit(root, "add required input")
+    run = _active_run(root)
+    store = _store(root, applied_baseline=baseline, run=run)
+    (root / "new.py").write_text("pass\n", encoding="utf-8")
+    glob_target = _commit(root, "add glob match")
+    glob_event = GitEvent("git-event_111111111111111111111111", "post-commit", "cursor-1", glob_target)
 
-    impact = compare_commits(root, baseline, target)
+    glob_impact = compare_commits(root, baseline, glob_target)
+    glob_job = enqueue_event(store, glob_event, glob_impact)
 
-    assert impact.paths == ("pyproject.toml",)
-    assert impact.scopes
+    (root / "nested").mkdir()
+    (root / "nested" / "Cargo.toml").write_text("[package]\nname='x'\n", encoding="utf-8")
+    negative_target = _commit(root, "add nested negative match")
+    maintenance = MaintenanceStore(root, store)
+    with store.mutation():
+        maintenance.replace_state(dataclasses.replace(
+            maintenance.read_state(), appliedBaseline=glob_target,
+        ))
+    negative_event = GitEvent("git-event_111111111111111111111112", "post-commit", "cursor-2", negative_target)
+    negative_impact = compare_commits(root, glob_target, negative_target)
+    negative_job = enqueue_event(store, negative_event, negative_impact)
+
+    assert glob_job is not None
+    assert glob_job.changedPaths == ("new.py",)
+    assert glob_job.impactScopes == ("sample",)
+    assert negative_job is not None
+    assert negative_job.changedPaths == ("nested/Cargo.toml",)
+    assert negative_job.impactScopes == ("sample",)
 
 
 def test_deleted_and_control_file_changes_are_conservative(tmp_path: Path) -> None:
@@ -136,14 +235,61 @@ def test_state_and_output_only_change_has_no_impact(tmp_path: Path) -> None:
     baseline = _commit(root, "base")
     (root / ".repo2skill").mkdir()
     (root / ".repo2skill" / "state.json").write_text("{}\n", encoding="utf-8")
-    (root / ".agents").mkdir()
-    (root / ".agents" / "AGENTS.md").write_text("managed\n", encoding="utf-8")
+    (root / "AGENTS.md").write_text("managed\n", encoding="utf-8")
     target = _commit(root, "state and output")
 
     impact = compare_commits(root, baseline, target)
+    store = _store(root, applied_baseline=baseline)
+    event = GitEvent("git-event_222222222222222222222222", "post-commit", "cursor-2", target)
+    job = enqueue_event(store, event, impact)
+    state = MaintenanceStore(root, store).read_state()
 
-    assert impact.paths == ()
-    assert impact.scopes == ()
+    assert impact.paths == ("AGENTS.md",)
+    assert job is None
+    assert state.observedEventCursor == event.cursor
+    assert state.jobs == {}
+
+
+def test_enqueue_filters_custom_output_but_keeps_unrelated_agents_source(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / "main.py").write_text("pass\n", encoding="utf-8")
+    baseline = _commit(root, "base")
+    targets = (
+        TargetSpec("agents-md", "agents-md", "docs/generated.md", "whole-files", "keep"),
+        TargetSpec("skill", "skill", ".agents/skills/fixture", "whole-files", "keep"),
+    )
+    store = _store(root, targets=targets, applied_baseline=baseline)
+    (root / "docs").mkdir()
+    (root / "docs" / "generated.md").write_text("generated output\n", encoding="utf-8")
+    (root / ".agents").mkdir()
+    (root / ".agents" / "unrelated.py").write_text("pass\n", encoding="utf-8")
+    target = _commit(root, "output plus source")
+    event = GitEvent("git-event_333333333333333333333333", "post-commit", "cursor-3", target)
+
+    job = enqueue_event(store, event, compare_commits(root, baseline, target))
+
+    assert job is not None
+    assert job.changedPaths == (".agents/unrelated.py",)
+
+
+def test_mismatched_empty_impact_is_deferred_before_no_impact_fast_path(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    applied = _commit(root, "applied")
+    (root / "README.md").write_text("target\n", encoding="utf-8")
+    target = _commit(root, "target")
+    store = _store(root, applied_baseline=applied)
+    event = GitEvent("git-event_444444444444444444444444", "post-commit", "cursor-4", target)
+    wrong = CommitImpact("f" * 40, target, (), (), "sha256:" + "a" * 64, (), False, ())
+
+    job = enqueue_event(store, event, wrong)
+    state = MaintenanceStore(root, store).read_state()
+
+    assert job is None
+    assert state.observedEventCursor == event.cursor
+    assert len(state.deferredEvents) == 1
+    assert state.deferredEvents[0].reasonCode == "maintenance.baseline-mismatch"
 
 
 def test_missing_baseline_requires_rebuild(tmp_path: Path) -> None:
@@ -206,6 +352,21 @@ def test_materialize_records_size_cap_as_an_explicit_omission(tmp_path: Path, mo
 
     assert manifest.files == ()
     assert manifest.omittedPaths == ("large.txt",)
+
+
+def test_materialize_rejects_symlink_mode_on_every_platform(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "base.txt").write_text("base\n", encoding="utf-8")
+    _commit(root, "empty baseline")
+    blob = _git(root, "hash-object", "-w", "--stdin", input=b"target.txt").decode().strip()
+    _git(root, "update-index", "--add", "--cacheinfo", "120000", blob, "link")
+    _git(root, "commit", "-qm", "add symlink mode")
+    target = _git(root, "rev-parse", "HEAD").decode().strip()
+
+    with pytest.raises(MaintenanceGitError, match="unsupported") as error:
+        materialize_commit(root, target, ("link",), tmp_path / "snapshot")
+
+    assert error.value.code == "maintenance.git-mode-unsupported"
 
 
 def test_enqueue_persists_context_before_publishing_job_and_cursor(tmp_path: Path) -> None:

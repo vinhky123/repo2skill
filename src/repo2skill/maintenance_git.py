@@ -82,6 +82,7 @@ class CommitImpact:
     scopes: tuple[str, ...]
     requiredFullScan: bool
     diagnostics: tuple[str, ...]
+    changeStatuses: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,9 +264,9 @@ def _classify(paths: Sequence[str], statuses: Sequence[tuple[str, str]]) -> tupl
     for status, path in statuses:
         lower = path.lower()
         name = path.rsplit("/", 1)[-1]
-        if path == ".repo2skill" or path.startswith(".repo2skill/") or path == ".agents" or path.startswith(".agents/") or path.startswith(".github/skills/"):
+        if path == ".repo2skill" or path.startswith(".repo2skill/"):
             continue
-        if status == "D" or name.lower() in control_names or name == "AGENTS.md" or path.startswith(".github/workflows/"):
+        if status == "D" or name.lower() in control_names or path.startswith(".github/workflows/"):
             full = True
             diagnostics.append("maintenance.impact-conservative")
         scope = None
@@ -306,15 +307,11 @@ def compare_commits(
     statuses = tuple((status, path) for status, path in statuses if not _excluded_path(path))
     scopes, full, diagnostics = _classify(paths, statuses)
     # Hash exact NUL-framed Git status/path records, independent of worktree state.
-    return CommitImpact(base, head, paths, renames, _HASH(raw), scopes, full, diagnostics)
+    return CommitImpact(base, head, paths, renames, _HASH(raw), scopes, full, diagnostics, statuses)
 
 
 def _excluded_path(path: str) -> bool:
-    return (
-        path == ".repo2skill" or path.startswith(".repo2skill/")
-        or path == ".agents" or path.startswith(".agents/")
-        or path.startswith(".github/skills/")
-    )
+    return path == ".repo2skill" or path.startswith(".repo2skill/")
 
 
 def bootstrap_commit(
@@ -333,13 +330,14 @@ def bootstrap_commit(
             mode, kind, _oid = metadata.split(b" ")
         except ValueError as error:
             raise MaintenanceGitError("maintenance.git-tree-malformed", "Git emitted a malformed recursive tree entry") from error
-        if kind != b"blob" or mode not in {b"100644", b"100755", b"120000"}:
+        if kind != b"blob" or mode not in {b"100644", b"100755"}:
             raise MaintenanceGitError("maintenance.git-mode-unsupported", "committed tree contains an unsupported object or mode")
         path = _valid_path(raw_path)
         if not _excluded_path(path):
             paths.append(path)
     scopes, _full, diagnostics = _classify(paths, tuple(("A", path) for path in paths))
-    return CommitImpact(None, head, tuple(sorted(paths)), (), _HASH(raw), scopes, True, diagnostics)
+    statuses = tuple(("A", path) for path in sorted(paths))
+    return CommitImpact(None, head, tuple(sorted(paths)), (), _HASH(raw), scopes, True, diagnostics, statuses)
 
 
 def read_commit_blob(
@@ -362,7 +360,9 @@ def read_commit_blob(
             raise MaintenanceGitError("maintenance.git-tree-malformed", "Git emitted a malformed tree entry") from error
         if _valid_path(raw_path) == canonical:
             exact.append((mode, kind, oid))
-    if len(exact) != 1 or exact[0][1] != b"blob" or exact[0][0] not in {b"100644", b"100755", b"120000"}:
+    if len(exact) == 1 and exact[0][1] == b"blob" and exact[0][0] == b"120000":
+        raise MaintenanceGitError("maintenance.git-mode-unsupported", "unsupported symlink tree mode cannot be materialized as a regular file")
+    if len(exact) != 1 or exact[0][1] != b"blob" or exact[0][0] not in {b"100644", b"100755"}:
         raise MaintenanceGitError("maintenance.git-object-missing", "requested committed file is missing or has an unsupported mode")
     blob_id = exact[0][2].decode("ascii")
     try:
@@ -479,6 +479,65 @@ def _expected_output_hashes(store: LedgerStore, *, target_kinds: Sequence[str]) 
     return dict(sorted(result.items()))
 
 
+def _project_output_paths(
+    store: LedgerStore, project, project_state,
+) -> tuple[set[str], set[str]]:
+    """Resolve outputs from configured targets and the active ownership manifests."""
+    exact = {target.livePath for target in project.targets if target.kind == "agents-md"}
+    prefixes = {target.livePath.rstrip("/") for target in project.targets if target.kind == "skill"}
+    if project_state.activeExportId is None and project_state.activeManifestSetId is None:
+        return exact, prefixes
+    if project_state.activeExportId is None or project_state.activeManifestSetId is None:
+        raise ValueError("active output manifest binding is incomplete")
+    manifest_set = store.read_manifest_set(
+        f"manifests/{project_state.activeExportId}/{project_state.activeManifestSetId}.json"
+    )
+    if (
+        manifest_set is None
+        or manifest_set.exportId != project_state.activeExportId
+        or manifest_set.manifestSetId != project_state.activeManifestSetId
+    ):
+        raise ValueError("active output manifest set is missing or mismatched")
+    for target_id, reference in manifest_set.targets.items():
+        manifest = store.read_target_manifest(
+            f"manifests/{reference.exportId}/{reference.manifestId}.json"
+        )
+        if (
+            manifest is None
+            or manifest.manifestId != reference.manifestId
+            or manifest.exportId != reference.exportId
+            or manifest.targetId != target_id
+        ):
+            raise ValueError("active target output manifest is missing or mismatched")
+        exact.update(file.path for file in manifest.files)
+    return exact, prefixes
+
+
+def _filter_project_outputs(
+    impact: CommitImpact, exact: set[str], prefixes: set[str],
+) -> CommitImpact:
+    statuses = impact.changeStatuses or tuple(("M", path) for path in impact.paths)
+    filtered_statuses = tuple(
+        (status, path) for status, path in statuses
+        if path not in exact and not any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+    )
+    paths = tuple(sorted({path for _status, path in filtered_statuses}))
+    renames = tuple(
+        pair for pair in impact.renames
+        if all(path in paths for path in pair)
+    )
+    scopes, full, diagnostics = _classify(paths, filtered_statuses)
+    return replace(
+        impact,
+        paths=paths,
+        renames=renames,
+        scopes=scopes,
+        requiredFullScan=impact.baselineCommit is None or full,
+        diagnostics=diagnostics,
+        changeStatuses=filtered_statuses,
+    )
+
+
 def _affected_scopes(impact: CommitImpact, run: RunLedger | None) -> tuple[str, ...]:
     if impact.requiredFullScan or run is None:
         return impact.scopes or ("full",)
@@ -495,7 +554,7 @@ def _affected_scopes(impact: CommitImpact, run: RunLedger | None) -> tuple[str, 
             matches = matches or any(path not in read.matchPaths and GitIgnoreSpec.from_lines([selector.value], backend="simple").match_file(path) for path in paths)
         elif selector.type == "negative":
             name = selector.value.split(":", 1)[-1]
-            matches = any(path == name for path in paths)
+            matches = any(path.rsplit("/", 1)[-1] == name for path in paths)
         if matches:
             scopes.add(selector.scope if selector.scope != "." else read.extractorId)
     return tuple(sorted(scopes))
@@ -521,16 +580,6 @@ def enqueue_event(
             reason_code = "maintenance.event-impact-mismatch"
         if impact.baselineCommit != state.appliedBaseline:
             reason_code = "maintenance.baseline-mismatch"
-        run = _run_for_store(store)
-        scopes = _affected_scopes(impact, run)
-        if not impact.paths:
-            next_state = replace(state, observedEventCursor=event.cursor)
-            maint.replace_state(next_state)
-            return None
-        if not scopes:
-            # A previously unobserved input or selector gap cannot prove that
-            # changed committed source is irrelevant. Preserve it for review.
-            scopes = impact.scopes or ("full",)
         if reason_code:
             maint.replace_state(_deferred_state(state, event, reason_code))
             return None
@@ -539,6 +588,16 @@ def enqueue_event(
         if project is None or project_state is None:
             raise ValueError("initialized P0 project is required to enqueue committed impact")
         run = _run_for_store(store)
+        exact_outputs, output_prefixes = _project_output_paths(store, project, project_state)
+        impact = _filter_project_outputs(impact, exact_outputs, output_prefixes)
+        if not impact.paths and impact.baselineCommit is not None:
+            maint.replace_state(replace(state, observedEventCursor=event.cursor))
+            return None
+        scopes = _affected_scopes(impact, run)
+        if not scopes:
+            # A previously unobserved input or selector gap cannot prove that
+            # changed committed source is irrelevant. Preserve it for review.
+            scopes = impact.scopes or ("full",)
         extractor_revisions = dict(run.snapshot.extractorVersions) if run is not None else {}
         from .ids import effective_policy_revision
         policy_revision = effective_policy_revision(
