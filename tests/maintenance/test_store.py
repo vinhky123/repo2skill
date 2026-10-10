@@ -94,6 +94,27 @@ def test_job_is_immutable_and_identical_retry_is_idempotent(tmp_path: Path) -> N
     assert store.read_job(JOB_ID) == job
 
 
+def test_job_hashes_are_defensively_immutable_across_round_trip(tmp_path: Path) -> None:
+    store = _make_store(tmp_path / "repo")
+    path = ".agents/skills/fixture/SKILL.md"
+    original_hash = "sha256:" + "3" * 64
+    changed_hash = "sha256:" + "4" * 64
+    source_hashes = {path: original_hash}
+    job = dataclasses.replace(_job(), expectedOutputHashes=source_hashes)
+
+    source_hashes[path] = changed_hash
+    assert job.expectedOutputHashes[path] == original_hash
+    with pytest.raises(TypeError):
+        job.expectedOutputHashes[path] = changed_hash
+
+    with store.ledger.mutation():
+        store.write_job(job)
+    reopened = store.read_job(JOB_ID)
+    assert reopened == job
+    with pytest.raises(TypeError):
+        reopened.expectedOutputHashes[path] = changed_hash
+
+
 def test_single_pointer_commits_cursor_and_job_together(tmp_path: Path) -> None:
     store = _make_store(tmp_path / "repo")
     job = _job()

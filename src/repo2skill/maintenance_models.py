@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from types import MappingProxyType
 from typing import Literal, Mapping
 
 from .models import _repository_path
@@ -108,9 +109,11 @@ class MaintenanceJob:
             raise ValueError("unsupported maintenance target kind")
         if self.expectedManifestSetId is not None:
             _identifier(self.expectedManifestSetId, "expectedManifestSetId")
-        for path, digest in self.expectedOutputHashes.items():
+        output_hashes = dict(self.expectedOutputHashes)
+        for path, digest in output_hashes.items():
             _repository_path(path, "expected output path")
             _hash(digest, "expected output hash")
+        object.__setattr__(self, "expectedOutputHashes", MappingProxyType(output_hashes))
 
 
 @dataclass(frozen=True, slots=True)
