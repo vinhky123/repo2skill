@@ -82,6 +82,17 @@ def test_old_project_without_maintenance_reads_empty_state(tmp_path: Path) -> No
     assert not (tmp_path / "repo" / ".repo2skill" / "maintenance").exists()
 
 
+def test_old_maintenance_document_defaults_enabled_to_false(tmp_path: Path) -> None:
+    store = _make_store(tmp_path / "repo")
+    path = store.ledger.state_dir / "maintenance" / "state.json"
+    path.parent.mkdir()
+    raw = dataclasses.asdict(_state(cursor=None))
+    raw.pop("enabled")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert store.read_state().enabled is False
+
+
 def test_job_is_immutable_and_identical_retry_is_idempotent(tmp_path: Path) -> None:
     store = _make_store(tmp_path / "repo")
     job = _job()

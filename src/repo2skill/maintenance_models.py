@@ -151,6 +151,7 @@ class MaintenanceState:
     deferredEvents: tuple[GitEvent, ...]
     jobs: Mapping[str, MaintenanceLifecycle]
     runningJobId: str | None
+    enabled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.schemaVersion, str) or not re.fullmatch(r"[1-9][0-9]*\.[0-9]+", self.schemaVersion):
@@ -175,6 +176,8 @@ class MaintenanceState:
                 raise ValueError("runningJobId must reference the running lifecycle")
         if any(job_id != self.runningJobId and item.status == "running" for job_id, item in self.jobs.items()):
             raise ValueError("only runningJobId may have running status")
+        if type(self.enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
 
     @property
     def pendingJobIds(self) -> tuple[str, ...]:

@@ -25,6 +25,8 @@ from .ids import canonical_json_bytes, canonical_record_id, effective_policy_rev
 from .inventory import InventoryError
 from .ledger import ExportRecoveryRequired, LedgerStore, LockBusyError
 from .models import Claim, Diagnostic, Finding, ProjectDocument, ProjectState, ReviewEvent, RunLedger, TargetManifest
+from .maintenance_hooks import HookInstallResult, install_hooks, remove_owned_hooks
+from .maintenance_store import MaintenanceStore
 from .ownership import (
     ExportFreshnessError, _active_manifests, _ownership, export_staged,
     inspect_target_ownership, resume_export,
@@ -156,6 +158,15 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor")
     _common(doctor)
     doctor.add_argument("--codex", action="store_true")
+
+    maintain = commands.add_parser("maintain")
+    _common(maintain)
+    maintain_commands = maintain.add_subparsers(dest="maintain_command", required=True, parser_class=_Parser)
+    setup = maintain_commands.add_parser("setup")
+    _common(setup)
+    setup.add_argument("--manual-hooks", action="store_true")
+    disable = maintain_commands.add_parser("disable")
+    _common(disable)
     return parser
 
 
@@ -891,6 +902,29 @@ def _command_doctor(args: argparse.Namespace):
     return {"checks": checks, "codexRequested": False, "codexCapability": None}, tuple(findings), (), []
 
 
+def _command_maintain(args: argparse.Namespace):
+    _project, store = _store_context(args)
+    assert store is not None
+    if args.maintain_command == "setup":
+        if args.manual_hooks:
+            maintenance = MaintenanceStore(store.root, store)
+            with store.mutation():
+                maintenance.replace_state(replace(maintenance.read_state(), enabled=True))
+            result = HookInstallResult(True, True, (), "maintenance enabled; install only the documented observation call in your own hook")
+        else:
+            result = install_hooks(store.root, store)
+        findings = () if result.installed else (
+            _finding("maintenance.manual-integration-required", "error", result.message,
+                     details={"exitCode": 1}),
+        )
+        actions = [] if result.installed else ["run maintain setup --manual-hooks and invoke maintain catch-up manually"]
+        return result, findings, (), actions
+    if args.maintain_command == "disable":
+        result = remove_owned_hooks(store.root, store)
+        return result, (), (), []
+    raise InvocationError("unknown maintenance command")
+
+
 def _dispatch(args: argparse.Namespace):
     command = args.command
     if command == "init":
@@ -911,6 +945,8 @@ def _dispatch(args: argparse.Namespace):
         return _command_export(args)
     if command == "doctor":
         return _command_doctor(args)
+    if command == "maintain":
+        return _command_maintain(args)
     raise InvocationError("unknown command")
 
 

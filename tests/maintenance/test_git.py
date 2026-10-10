@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import dataclasses
@@ -20,8 +21,8 @@ from repo2skill.maintenance_git import (
 from repo2skill.maintenance_models import GitEvent
 from repo2skill.maintenance_store import MaintenanceStore
 from repo2skill.models import (
-    ExtractionRead, InputSelector, ProjectDocument, ProjectState, RunLedger,
-    SourceSnapshot, TargetSpec,
+    ExtractionRead, InputSelector, ManifestFile, ManifestReference, ManifestSet,
+    ProjectDocument, ProjectState, RunLedger, SourceSnapshot, TargetManifest, TargetSpec,
 )
 from repo2skill.ids import effective_policy_revision
 
@@ -271,6 +272,51 @@ def test_enqueue_filters_custom_output_but_keeps_unrelated_agents_source(tmp_pat
 
     assert job is not None
     assert job.changedPaths == (".agents/unrelated.py",)
+
+
+def test_enqueue_reads_actual_exported_manifest_reference_path(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / "main.py").write_text("pass\n", encoding="utf-8")
+    output = root / "AGENTS.md"
+    output.write_text("generated\n", encoding="utf-8")
+    baseline = _commit(root, "base with generated output")
+    store = _store(root, applied_baseline=baseline)
+    project = store.read_project()
+    state = store.read_state()
+    assert project is not None and state is not None
+    target = next(item for item in project.targets if item.kind == "agents-md")
+    export_id = "export_0123456789abcdef01234567"
+    manifest_id = "manifest_0123456789abcdef01234567"
+    manifest_set_id = "manifestset_0123456789abcdef01234567"
+    relative_path = f"manifests/{export_id}/{target.targetId}.json"
+    exact_hash = "sha256:" + hashlib.sha256(output.read_bytes()).hexdigest()
+    manifest = TargetManifest(
+        "1.0", "0.1.0", manifest_id, export_id, target.targetId,
+        "run_0123456789abcdef01234567", 1,
+        (ManifestFile(1, "AGENTS.md", "whole-files", exact_hash, "lf", (), {}),),
+        (), "2026-10-09T00:00:00Z",
+    )
+    manifest_set = ManifestSet(
+        "1.0", "0.1.0", manifest_set_id, export_id,
+        {target.targetId: ManifestReference(1, target.targetId, manifest_id, export_id, relative_path)},
+        "2026-10-09T00:00:00Z",
+    )
+    with store.mutation():
+        store.write_immutable(relative_path, encode_record(manifest))
+        store.write_immutable(f"manifests/{export_id}/{manifest_set_id}.json", encode_record(manifest_set))
+        store.replace_state(dataclasses.replace(
+            store.read_state(), activeExportId=export_id, activeManifestSetId=manifest_set_id,
+        ))
+    (root / "src" / "main.py").write_text("changed\n", encoding="utf-8")
+    target_commit = _commit(root, "source change")
+    event = GitEvent("git-event_555555555555555555555555", "post-commit", "cursor-manifest", target_commit)
+
+    job = enqueue_event(store, event, compare_commits(root, baseline, target_commit))
+
+    assert job is not None
+    assert job.changedPaths == ("src/main.py",)
+    assert job.expectedOutputHashes["AGENTS.md"] == exact_hash
 
 
 def test_mismatched_empty_impact_is_deferred_before_no_impact_fast_path(tmp_path: Path) -> None:

@@ -53,7 +53,7 @@ class MaintenanceStore:
             if not kinds:
                 kinds = ("agents-md", "skill")
             return MaintenanceState(
-                "1.0", None, None, MaintenancePolicy("ask", 0, kinds), (), {}, None
+                "1.0", None, None, MaintenancePolicy("ask", 0, kinds), (), {}, None, False
             )
         maintenance = decode_root_document(raw, MaintenanceState)
         for job_id in maintenance.jobs:

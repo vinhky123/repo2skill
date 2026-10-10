@@ -222,6 +222,12 @@ def _decode_dataclass(raw: dict[str, JsonValue], record_type: type[T]) -> T:
     values: dict[str, object] = {}
     for field in dataclasses.fields(record_type):
         if field.name not in raw:
+            if field.default is not dataclasses.MISSING:
+                values[field.name] = field.default
+                continue
+            if field.default_factory is not dataclasses.MISSING:
+                values[field.name] = field.default_factory()
+                continue
             raise ValueError(f"missing required field: {record_type.__name__}.{field.name}")
         values[field.name] = _decode_value(raw[field.name], hints[field.name], f"{record_type.__name__}.{field.name}")
     return record_type(**values)

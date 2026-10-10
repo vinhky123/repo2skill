@@ -462,9 +462,7 @@ def _expected_output_hashes(store: LedgerStore, *, target_kinds: Sequence[str]) 
     for target_id, reference in manifest_set.targets.items():
         if kinds.get(target_id) not in target_kinds:
             continue
-        manifest = store.read_target_manifest(
-            f"manifests/{reference.exportId}/{reference.manifestId}.json"
-        )
+        manifest = store.read_target_manifest(reference.path)
         if (
             manifest is None
             or manifest.manifestId != reference.manifestId
@@ -499,9 +497,7 @@ def _project_output_paths(
     ):
         raise ValueError("active output manifest set is missing or mismatched")
     for target_id, reference in manifest_set.targets.items():
-        manifest = store.read_target_manifest(
-            f"manifests/{reference.exportId}/{reference.manifestId}.json"
-        )
+        manifest = store.read_target_manifest(reference.path)
         if (
             manifest is None
             or manifest.manifestId != reference.manifestId
