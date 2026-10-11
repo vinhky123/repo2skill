@@ -1,2 +1,4 @@
 graft tests
+include assets/repo2skill-logo.png
+include assets/repo2skill-logo-dark.png
 global-exclude *.py[cod]
