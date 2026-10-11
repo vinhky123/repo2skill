@@ -5,3 +5,16 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# Keep the public documentation set small; other research and working notes stay local.
+/docs/*
+!/docs/install.md
+!/docs/schema-migrations.md
+!/docs/threat-model.md
+!/docs/engineering/
+/docs/engineering/*
+!/docs/engineering/cli-contract.md
+!/docs/engineering/upstream-source-map.md
+!/docs/engineering/maintenance-acceptance.md
+!/docs/engineering/maintenance-decisions.md
+!/docs/engineering/maintenance-final-review.md
