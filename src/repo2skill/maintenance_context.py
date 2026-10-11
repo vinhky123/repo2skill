@@ -53,6 +53,7 @@ class MaintenanceContext:
     configuredTargets: tuple[TargetSpec, ...] = ()
     priorFacts: tuple[Fact, ...] = ()
     priorEvidence: tuple[Evidence, ...] = ()
+    acceptedPriorClaimRefs: tuple[str, ...] = ()
 
 
 def build_agent_request(context: MaintenanceContext, snapshot_root: Path, *, source_root: Path):
@@ -266,6 +267,25 @@ def _prior_prose_support_unchanged(prior: Claim, context: MaintenanceContext) ->
     return True
 
 
+def retained_accepted_prose_claims(context: MaintenanceContext) -> tuple[Claim, ...]:
+    """Return only proof-valid prose revisions accepted by the active P0 disposition."""
+    active = set(context.acceptedPriorClaimRefs)
+    current_facts = {fact.factId for fact in context.facts}
+    current_evidence = {item.evidenceId for item in context.evidence}
+    retained = []
+    for prior in context.priorClaims:
+        reference = f"{prior.claimId}@{prior.claimRevision}"
+        if (reference not in active or prior.kind != "inferred" or prior.origin != "llm"
+                or prior.supportMode != "evidence-backed-prose"
+                or not set(prior.factIds).issubset(current_facts)
+                or not set(prior.evidenceIds).issubset(current_evidence)
+                or not _prior_prose_support_unchanged(prior, context)):
+            continue
+        retained.append(replace(prior, lastVerifiedSnapshotId=context.snapshot.snapshotId,
+                                proposalStatus="accepted"))
+    return tuple(retained)
+
+
 def _control_observations(paths: Sequence[str], reader, policy) -> tuple[IgnoreControlObservation, ...]:
     controls = sorted(path for path in paths if path.rsplit("/", 1)[-1] == ".gitignore")
     observations = []
@@ -425,6 +445,7 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
             tuple((*inventory.coverage, *batch.coverage)), inventory,
             project.scanPolicy, project.claimPolicy, project.targets,
             prior_facts, prior_evidence,
+            tuple(sorted(f"{claim_id}@{revision}" for claim_id, revision in state.acceptedClaimRevisions.items())),
         )
     finally:
         temp_context.cleanup()
@@ -465,6 +486,9 @@ def build_prose_claim(operation: ClaimOperation, context: MaintenanceContext) ->
     if operation.op == "update":
         if prior is None or operation.claimRef != f"{prior.claimId}@{prior.claimRevision}":
             raise ValueError("update operation does not reference the current claim revision")
+        if (prior.kind != "inferred" or prior.origin != "llm"
+                or prior.supportMode != "evidence-backed-prose"):
+            raise ValueError("update operations may edit only prior model-authored prose claims")
         revision = prior.claimRevision + 1
         supersedes = (f"{prior.claimId}@{prior.claimRevision}",)
     elif prior is not None:
@@ -506,6 +530,74 @@ def _persist_authorization(store, authorization: ApplicationAuthorization) -> No
                 store.write_immutable_bytes(relative, payload)
             elif existing != payload:
                 raise ValueError("persisted application authorization ID collides with different content")
+
+
+def verify_application_authorization(store, run) -> None:
+    """Verify a machine run against its exact durable response and accepted projection."""
+    authorization_id = run.applicationAuthorizationId
+    if authorization_id is None:
+        accepted_model = tuple(
+            claim for claim in run.claims
+            if claim.kind == "inferred" and claim.origin == "llm" and claim.proposalStatus == "accepted"
+        )
+        state = store.read_state()
+        if accepted_model and (state is None or any(
+            state.acceptedClaimRevisions.get(claim.claimId) != claim.claimRevision
+            for claim in accepted_model
+        )):
+            raise ValueError("accepted model revisions require an application authorization")
+        return
+    from .maintenance_attempts import read_attempt, read_response
+    from .maintenance_store import MaintenanceStore
+
+    raw = store.read_immutable_bytes(f"maintenance/authorizations/{authorization_id}.json")
+    if raw is None:
+        raise ValueError("machine run application authorization is missing")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+        auth = document["authorization"]
+        refs = auth["acceptedClaimRefs"]
+        response_hash = auth["responseHash"]
+        job_id = auth["jobId"]
+        approval_hash = auth["approvalBindingHash"]
+        target_kinds = auth["targetKinds"]
+    except (UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise ValueError("machine run application authorization is malformed") from error
+    if (document.get("schemaVersion") != "1.0" or not isinstance(auth, dict)
+            or auth.get("authorizationId") != authorization_id or job_id is None
+            or not isinstance(refs, list) or any(not isinstance(item, str) for item in refs)
+            or refs != sorted(set(refs))
+            or not isinstance(response_hash, str) or not isinstance(approval_hash, str)
+            or not isinstance(target_kinds, list)):
+        raise ValueError("machine run application authorization fields are invalid")
+    expected_id = canonical_record_id("application-auth", {
+        "jobId": job_id, "approvalBindingHash": approval_hash, "responseHash": response_hash,
+        "acceptedClaimRefs": refs, "targetKinds": target_kinds,
+    })
+    if expected_id != authorization_id:
+        raise ValueError("machine run application authorization ID is invalid")
+    maintenance = MaintenanceStore(store.root, store)
+    state = maintenance.read_state()
+    job = maintenance.read_job(job_id)
+    lifecycle = state.jobs.get(job_id)
+    if (job is None or lifecycle is None or lifecycle.activeAttemptId is None
+            or lifecycle.approvalBindingHash != approval_hash or tuple(target_kinds) != job.targetKinds
+            or run.applicationAuthorizationId != authorization_id):
+        raise ValueError("machine run application authorization does not match active job authority")
+    attempt = read_attempt(store, lifecycle.activeAttemptId)
+    if (attempt.jobId != job_id or attempt.phase != "responded"
+            or attempt.approvalBindingHash != approval_hash):
+        raise ValueError("machine run authorization has no matching durable responded attempt")
+    response = read_response(store, attempt.attemptId)
+    digest = "sha256:" + hashlib.sha256(response.outputBytes).hexdigest()
+    if response.status != "ok" or digest != response_hash:
+        raise ValueError("machine run authorization response hash differs from durable attempt")
+    accepted = tuple(sorted(
+        f"{claim.claimId}@{claim.claimRevision}" for claim in run.claims
+        if claim.kind == "inferred" and claim.origin == "llm" and claim.proposalStatus == "accepted"
+    ))
+    if accepted != tuple(refs):
+        raise ValueError("machine run accepted model projection differs from application authorization")
 
 
 def _parse_claim_ref(value: str | None) -> tuple[str, int]:
@@ -598,8 +690,11 @@ def build_maintenance_run(store, job: MaintenanceJob, context: MaintenanceContex
             if (set(prior.factIds).issubset(current_fact_ids)
                     and set(prior.evidenceIds).issubset(current_evidence_ids)
                     and _prior_prose_support_unchanged(prior, context)):
+                accepted_ref = f"{prior.claimId}@{prior.claimRevision}"
+                accepted = (accepted_ref in context.acceptedPriorClaimRefs
+                            and accepted_ref in authorization.acceptedClaimRefs)
                 candidates[prior.claimId] = replace(prior, lastVerifiedSnapshotId=context.snapshot.snapshotId,
-                                                    proposalStatus="pending")
+                                                    proposalStatus="accepted" if accepted else "pending")
         unsupported_prior = tuple(
             prior for prior in context.priorClaims
             if prior.claimId not in candidates and prior.claimId not in deleted
@@ -645,7 +740,9 @@ def build_maintenance_run(store, job: MaintenanceJob, context: MaintenanceContex
                                    if claim.origin == "llm" and claim.kind == "inferred"
                                    and claim.proposalStatus == "accepted"))
         if actual_refs != tuple(sorted(authorization.acceptedClaimRefs)):
-            raise ValueError("authorization claim refs do not exactly match validated claim revisions")
+            raise ValueError("authorization claim refs do not exactly match validated claim revisions: "
+                             f"expected {tuple(sorted(authorization.acceptedClaimRefs))!r}, "
+                             f"found {actual_refs!r}")
 
         documentation = tuple(fact for fact in context.facts if fact.factType == "documentation.line")
         deduped = deduplicate(tuple(claims), documentation, context.snapshot)
@@ -670,7 +767,8 @@ def recheck_committed_source(store, guard: CommittedSourceGuard) -> None:
     """Revalidate commit, policy, extractor, context, and live job authorization."""
     from .ids import effective_policy_revision
     from .maintenance_approval import verify_approval_binding
-    from .maintenance_git import GitReadBudget, _git, _resolve_commit
+    from .maintenance_git import (GitReadBudget, _git, _resolve_commit, materialize_commit,
+                                  snapshot_manifest_record)
     from .maintenance_store import MaintenanceStore
 
     job = MaintenanceStore(store.root, store).read_job(guard.jobId)
@@ -727,6 +825,24 @@ def recheck_committed_source(store, guard: CommittedSourceGuard) -> None:
         _resolve_commit(store.root, guard.targetCommit, budget)
         if manifest.get("contextHash") != guard.sourceContextHash:
             raise ValueError("committed source context hash changed")
+        files = manifest.get("files")
+        omitted = manifest.get("omittedPaths", ())
+        if not isinstance(files, list) or not isinstance(omitted, list):
+            raise ValueError("committed source context projection is malformed")
+        paths = [entry.get("path") for entry in files if isinstance(entry, dict)]
+        if (len(paths) != len(files) or any(not isinstance(path, str) for path in paths)
+                or any(not isinstance(path, str) for path in omitted)):
+            raise ValueError("committed source context paths are malformed")
+        with tempfile.TemporaryDirectory(prefix="repo2skill-source-guard-") as directory:
+            rebuilt = materialize_commit(
+                store.root, guard.targetCommit, tuple(sorted(set(paths) | set(omitted))), Path(directory),
+                policy_revision=job.policyRevision,
+                extractor_revisions=maintenance_extractor_versions(), budget=budget,
+                impact_projection=manifest.get("impactProjection"),
+            )
+        if (rebuilt.contextHash != guard.sourceContextHash
+                or snapshot_manifest_record(rebuilt) != manifest):
+            raise ValueError("committed source context projection no longer matches its hash")
 
     if store._mutation_active:
         check_locked()

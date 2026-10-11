@@ -163,8 +163,28 @@ def begin_invocation(store: LedgerStore, job_id: str, attempt_id: str) -> Attemp
         job = maintenance.read_job(job_id)
         if lifecycle is None or lifecycle.activeAttemptId != attempt_id or lifecycle.status != "approved" or job is None:
             raise ValueError("attempt pointer or approval changed before invocation")
+        if not state.enabled:
+            raise ValueError("maintenance is disabled before invocation")
         if lifecycle.approvalBindingHash != prepared.get("approvalBindingHash"):
             raise ValueError("attempt approval binding changed before invocation")
+        from .maintenance_approval import _binding_hash, auto_approval_binding, verify_job_fingerprints
+        from .maintenance_context import _context_manifest
+        from .maintenance_git import GitReadBudget, _git
+        if lifecycle.approvalSource == "user":
+            expected_binding = _binding_hash(job, state.policy.grantRevision, "user")
+        else:
+            expected_binding = auto_approval_binding(store, job, lifecycle)
+        if expected_binding is None or lifecycle.approvalBindingHash != expected_binding:
+            raise ValueError("approval authority changed before invocation")
+        verify_job_fingerprints(store, job)
+        if (store.root / ".git").exists():
+            current_head = _git(store.root, ("rev-parse", "--verify", "HEAD^{commit}"), 256,
+                                GitReadBudget()).strip().decode("ascii")
+            if current_head != job.targetCommit:
+                raise ValueError("committed HEAD changed before invocation")
+            manifest = _context_manifest(store, job)
+            if manifest.get("contextHash") != job.sourceContextHash or manifest.get("commit") != job.targetCommit:
+                raise ValueError("committed source context changed before invocation")
         store.write_immutable(f"{_base_path(attempt_id)}/invoking.json", prepared)
         jobs = dict(state.jobs)
         jobs[job_id] = replace(lifecycle, status="running", failureCode=None)

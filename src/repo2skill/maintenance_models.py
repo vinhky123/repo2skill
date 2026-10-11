@@ -53,6 +53,25 @@ class GitEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedDeferredEvent:
+    event: GitEvent
+    resolutionReason: Literal["no-impact", "target-applied", "covered-by-applied-interval",
+                              "covered-by-tree-bootstrap"]
+    resolvedByJobId: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event, GitEvent):
+            raise ValueError("resolved deferred event must retain its original event")
+        if self.resolutionReason not in {"no-impact", "target-applied", "covered-by-applied-interval",
+                                         "covered-by-tree-bootstrap"}:
+            raise ValueError("unsupported deferred event resolution reason")
+        if self.resolvedByJobId is not None:
+            _identifier(self.resolvedByJobId, "resolvedByJobId")
+        if (self.resolutionReason != "no-impact") != (self.resolvedByJobId is not None):
+            raise ValueError("target-applied deferred events must name their applied job")
+
+
+@dataclass(frozen=True, slots=True)
 class MaintenancePolicy:
     approval: Literal["ask", "auto"]
     grantRevision: int
@@ -188,6 +207,8 @@ class MaintenanceLifecycle:
     activeAttemptId: str | None
     failureCode: str | None
     queuedGrantRevision: int | None = None
+    supersededByJobId: str | None = None
+    resolutionReason: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"pending", "approved", "running", "skipped", "applied", "failed", "stale"}:
@@ -203,6 +224,10 @@ class MaintenanceLifecycle:
             _identifier(self.activeAttemptId, "activeAttemptId")
         if self.failureCode is not None:
             _nonempty(self.failureCode, "failureCode")
+        if self.supersededByJobId is not None:
+            _identifier(self.supersededByJobId, "supersededByJobId")
+        if self.resolutionReason not in {None, "no-impact"}:
+            raise ValueError("unsupported maintenance resolution reason")
         if self.queuedGrantRevision is not None and (
             isinstance(self.queuedGrantRevision, bool) or not isinstance(self.queuedGrantRevision, int)
             or self.queuedGrantRevision < 0
@@ -220,6 +245,7 @@ class MaintenanceState:
     jobs: Mapping[str, MaintenanceLifecycle]
     runningJobId: str | None
     enabled: bool = False
+    resolvedDeferredEvents: tuple[ResolvedDeferredEvent, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.schemaVersion, str) or not re.fullmatch(r"[1-9][0-9]*\.[0-9]+", self.schemaVersion):
@@ -234,6 +260,13 @@ class MaintenanceState:
             if event.eventId in seen_events:
                 raise ValueError("deferred event IDs must be unique")
             seen_events.add(event.eventId)
+        resolved_ids: set[str] = set()
+        for resolved in self.resolvedDeferredEvents:
+            if not isinstance(resolved, ResolvedDeferredEvent):
+                raise ValueError("resolved deferred event history has an invalid record")
+            if resolved.event.eventId in seen_events or resolved.event.eventId in resolved_ids:
+                raise ValueError("deferred event history IDs must be unique")
+            resolved_ids.add(resolved.event.eventId)
         for job_id, lifecycle in self.jobs.items():
             _identifier(job_id, "job ID")
             if not isinstance(lifecycle, MaintenanceLifecycle):

@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from .extractors.base import ExtractionSession
-from .models import EvidenceLocator, ExtractionBatch, ExtractionContext, InputSelector
+from .models import CoverageEntry, EvidenceLocator, ExtractionBatch, ExtractionContext, InputSelector
 
 
 EXTRACTOR_ID = "maintenance.source-fragment"
@@ -38,6 +38,7 @@ class SourceFragmentExtractor:
 
     def extract(self, ctx: ExtractionContext, selectors: Sequence[InputSelector]) -> ExtractionBatch:
         reads = []
+        coverage = []
         for selector in selectors:
             result = ctx.read(selector)
             reads.append(result.dependency)
@@ -46,12 +47,16 @@ class SourceFragmentExtractor:
             text = result.bytes.decode(result.encoding or "utf-8-sig", errors="strict")
             lines = []
             used_bytes = 0
-            for line in text.splitlines():
+            all_lines = text.splitlines()
+            for line in all_lines:
                 line_bytes = len(line.encode(result.encoding or "utf-8-sig")) + (1 if lines else 0)
                 if len(lines) >= MAX_FRAGMENT_LINES or used_bytes + line_bytes > MAX_FRAGMENT_BYTES:
                     break
                 lines.append(line)
                 used_bytes += line_bytes
+            if len(lines) < len(all_lines):
+                coverage.append(CoverageEntry(1, selector, self.extractor_id, "capped",
+                                              "source-fragment-limit", ()))
             if not lines:
                 continue
             start, end = 1, len(lines)
@@ -72,4 +77,6 @@ class SourceFragmentExtractor:
                 value={"path": path, "start": start, "end": end, "text": fragment},
                 derivation="observed", evidence_ids=(evidence.evidenceId,),
             )
-        return self.session.make_batch(reads)
+        batch = self.session.make_batch(reads)
+        return ExtractionBatch(batch.reads, batch.evidence, batch.facts, batch.diagnostics,
+                               tuple((*batch.coverage, *coverage)))

@@ -140,7 +140,9 @@ def test_update_and_delete_for_same_semantic_claim_are_one_invalid_transaction()
         job=SimpleNamespace(jobId="job"), snapshot=SimpleNamespace(snapshotId="snap"),
         facts=(SimpleNamespace(factId="fact_a", snapshotId="snap", scope="global", factType="source.fragment.v1", evidenceIds=("evidence_a",)),),
         evidence=(SimpleNamespace(evidenceId="evidence_a", snapshotId="snap"),),
-        priorClaims=(SimpleNamespace(claimId="claim_a", claimRevision=1, scope="global", semanticKey="source.fragment.v1:test"),),
+        priorClaims=(SimpleNamespace(claimId="claim_a", claimRevision=1, scope="global",
+                                     semanticKey="source.fragment.v1:test", kind="inferred",
+                                     origin="llm", supportMode="evidence-backed-prose"),),
     )
     update = {"op":"update", "semanticKey":"source.fragment.v1:test", "scope":"global",
         "renderedText":"Updated wording.", "factIds":["fact_a"], "evidenceIds":["evidence_a"], "claimRef":"claim_a@1"}
@@ -148,6 +150,62 @@ def test_update_and_delete_for_same_semantic_claim_are_one_invalid_transaction()
         "renderedText":None, "factIds":[], "evidenceIds":[], "claimRef":"claim_a@1"}
     response = SimpleNamespace(status="ok", outputBytes=json.dumps({"jobId":"job", "snapshotId":"snap", "operations":[update, delete]}).encode(), diagnostic=None)
     with pytest.raises(ValueError, match="duplicate"):
+        validate_operations(response, context)
+
+
+@pytest.mark.parametrize(("kind", "origin"), [("observed", "llm"), ("inferred", "human")])
+def test_update_rejects_typed_or_human_prior_claims(kind: str, origin: str) -> None:
+    from types import SimpleNamespace
+
+    prior = SimpleNamespace(claimId="claim_a", claimRevision=1, scope="global",
+                            semanticKey="source.fragment.v1:test", kind=kind, origin=origin,
+                            supportMode="typed")
+    context = SimpleNamespace(
+        job=SimpleNamespace(jobId="job"), snapshot=SimpleNamespace(snapshotId="snap"),
+        facts=(SimpleNamespace(factId="fact_a", snapshotId="snap", scope="global",
+                               factType="source.fragment.v1", evidenceIds=("evidence_a",)),),
+        evidence=(SimpleNamespace(evidenceId="evidence_a", snapshotId="snap"),),
+        priorClaims=(prior,),
+    )
+    operation = {"op": "update", "semanticKey": prior.semanticKey, "scope": "global",
+                 "renderedText": "Updated wording.", "factIds": ["fact_a"],
+                 "evidenceIds": ["evidence_a"], "claimRef": "claim_a@1"}
+    response = SimpleNamespace(
+        status="ok", outputBytes=json.dumps({"jobId": "job", "snapshotId": "snap",
+                                               "operations": [operation]}).encode(),
+        diagnostic=None,
+    )
+
+    with pytest.raises(ValueError, match="only prior model-authored prose"):
+        validate_operations(response, context)
+
+
+def test_mixed_transaction_rejects_valid_add_with_typed_update() -> None:
+    from types import SimpleNamespace
+
+    prior = SimpleNamespace(claimId="claim_a", claimRevision=1, scope="global",
+                            semanticKey="source.fragment.v1:test", kind="observed", origin="llm",
+                            supportMode="typed")
+    context = SimpleNamespace(
+        job=SimpleNamespace(jobId="job"), snapshot=SimpleNamespace(snapshotId="snap"),
+        facts=(SimpleNamespace(factId="fact_a", snapshotId="snap", scope="global",
+                               factType="source.fragment.v1", evidenceIds=("evidence_a",)),),
+        evidence=(SimpleNamespace(evidenceId="evidence_a", snapshotId="snap"),),
+        priorClaims=(prior,),
+    )
+    valid_add = {"op": "add", "semanticKey": "source.fragment.v1:new", "scope": "global",
+                 "renderedText": "New wording.", "factIds": ["fact_a"],
+                 "evidenceIds": ["evidence_a"], "claimRef": None}
+    invalid_update = {"op": "update", "semanticKey": prior.semanticKey, "scope": "global",
+                      "renderedText": "Updated wording.", "factIds": ["fact_a"],
+                      "evidenceIds": ["evidence_a"], "claimRef": "claim_a@1"}
+    response = SimpleNamespace(
+        status="ok", outputBytes=json.dumps({"jobId": "job", "snapshotId": "snap",
+                                               "operations": [valid_add, invalid_update]}).encode(),
+        diagnostic=None,
+    )
+
+    with pytest.raises(ValueError, match="only prior model-authored prose"):
         validate_operations(response, context)
 
 
@@ -257,7 +315,7 @@ def test_invoking_crash_recovers_as_unknown_and_retry_appends_child(tmp_path: Pa
     state_dir.mkdir()
     project_id = "project_0123456789abcdef01234567"
     job_id = "maintenance-job_0123456789abcdef01234567"
-    binding = "sha256:" + "a" * 64
+    binding = None
     project = ProjectDocument("1.0", "0.1.0", project_id, "fixture", ".repo2skill", "worktree",
                                default_scan_policy(), default_claim_policy(), default_targets(root))
     pstate = ProjectState("1.0", "0.1.0", project_id, None, None, (), {}, None, None)
@@ -268,8 +326,11 @@ def test_invoking_crash_recovers_as_unknown_and_retry_appends_child(tmp_path: Pa
     job = MaintenanceJob(job_id, "a" * 40, "b" * 40, ("git-event_0123456789abcdef01234567",),
                          ("src/app.py",), ("skill",), "sha256:" + "1" * 64,
                          "sha256:" + "2" * 64, "policy-v1", ("skill",), None, {})
+    from repo2skill.maintenance_approval import _binding_hash
+    binding = _binding_hash(job, 1, "user")
     lifecycle = MaintenanceLifecycle("approved", "user", binding, "pending", None, None, None)
-    state = MaintenanceState("1.0", None, "a" * 40, MaintenancePolicy("ask", 1, ("skill",)), (), {job_id: lifecycle}, None)
+    state = MaintenanceState("1.0", None, "a" * 40, MaintenancePolicy("ask", 1, ("skill",)), (),
+                             {job_id: lifecycle}, None, enabled=True)
     with ledger.mutation():
         maintenance.write_job(job)
         maintenance.replace_state(state)

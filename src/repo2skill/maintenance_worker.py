@@ -29,41 +29,62 @@ class WorkerResult:
 
 @contextmanager
 def _worker_lease(root: Path, *, state_dir: Path | None = None) -> Iterator[None]:
-    """Hold a persistent OS file lock; the OS releases it when an owner dies."""
-    lease_dir = (Path(state_dir).absolute() if state_dir is not None else Path(root).absolute() / ".repo2skill") / "maintenance"
-    lease_dir.mkdir(parents=True, exist_ok=True)
-    path = lease_dir / "worker.lock"
-    stream = path.open("a+b")
+    """Hold a lock on one confined, retained state-file handle."""
+    from .safe_fs import open_directory
+
+    root = Path(root).absolute()
+    state_dir = Path(state_dir).absolute() if state_dir is not None else root / ".repo2skill"
     try:
+        state_parts = state_dir.relative_to(root).parts
+    except ValueError as error:
+        raise ValueError("worker state directory must be inside project root") from error
+    store = LedgerStore(root, state_dir)
+    with store.mutation():
+        existing = store.read_immutable_bytes("maintenance/worker.lock")
+        if existing is None:
+            store.write_immutable_bytes("maintenance/worker.lock", b"\0")
+        elif existing != b"\0":
+            raise ValueError("maintenance worker lease file has invalid contents")
+    guards = []
+    opened = None
+    try:
+        guard = open_directory(root)
+        guards.append(guard)
+        for component in state_parts:
+            guard = guard.open_directory(component)
+            guards.append(guard)
+        guard = guard.open_directory("maintenance")
+        guards.append(guard)
+        opened = guard.open_file("worker.lock")
+        if opened.stat_before.st_size != 1:
+            raise ValueError("maintenance worker lease file has invalid size")
+        descriptor = opened._descriptor
         if os.name == "nt":
             import msvcrt
-            stream.seek(0)
-            if path.stat().st_size == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
             try:
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
             except OSError as error:
                 raise LockBusyError("maintenance worker lease is held") from error
         else:
             import fcntl
             try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as error:
                 raise LockBusyError("maintenance worker lease is held") from error
         try:
             yield
         finally:
-            stream.seek(0)
             if os.name == "nt":
                 import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
-        stream.close()
+        if opened is not None:
+            opened.close()
+        for guard in reversed(guards):
+            guard.close()
 
 
 def _source_guard(store: LedgerStore, job, authorization_id: str):
@@ -182,6 +203,7 @@ def _run_one(
     )
     from .maintenance_context import (
         authorize_claim_revisions, build_maintenance_run, build_prose_claim,
+        retained_accepted_prose_claims,
     )
 
     maintenance = MaintenanceStore(store.root, store)
@@ -312,6 +334,14 @@ def _run_one(
         response_hash = "sha256:" + hashlib.sha256(response.outputBytes).hexdigest()
         claims = tuple(build_prose_claim(operation, context) for operation in operations
                        if operation.op in {"add", "update"})
+        changed_claim_ids = {
+            operation.claimRef.rsplit("@", 1)[0]
+            for operation in operations if operation.op in {"update", "delete"}
+            and operation.claimRef is not None
+        }
+        retained = tuple(claim for claim in retained_accepted_prose_claims(context)
+                         if claim.claimId not in changed_claim_ids)
+        claims = (*claims, *retained)
         authorization = authorize_claim_revisions(job, attempt.approvalBindingHash, response_hash,
                                                   claims)
         bundle = build_maintenance_run(store, job, context, operations, authorization)

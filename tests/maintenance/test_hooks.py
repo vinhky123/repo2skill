@@ -230,7 +230,7 @@ def test_hook_prints_job_targets_and_approve_command(tmp_path: Path) -> None:
     result = process_hook(root, "post-commit", b"", (), store=store, output=output.append)
 
     lifecycle = MaintenanceStore(root, store).read_state().jobs[result.jobId]
-    assert lifecycle.notificationState == "pending"
+    assert lifecycle.notificationState == "reported"
     assert result.jobId in output[0]
     assert "src.py" in output[0]
     assert baseline in output[0] and target in output[0]
@@ -424,6 +424,21 @@ def test_post_rewrite_record_count_is_bounded(tmp_path: Path) -> None:
     assert event.targetCommit == current
 
 
+def test_post_rewrite_accepts_git_amend_command(tmp_path: Path) -> None:
+    from repo2skill.maintenance_git import parse_hook_event
+
+    root, _store = _repo(tmp_path / "repo")
+    old = _commit(root)
+    (root / "src.py").write_text("source = 2\n", encoding="utf-8")
+    _git(root, "add", "src.py")
+    _git(root, "commit", "--amend", "-qm", "amended")
+    new = _git(root, "rev-parse", "HEAD").decode().strip()
+
+    event = parse_hook_event("post-rewrite", f"{old} {new}\n".encode(), ("amend",), root=root)
+
+    assert event.targetCommit == new
+
+
 def test_post_checkout_wrapper_returns_success_after_diagnostic(tmp_path: Path, monkeypatch) -> None:
     import types
     import repo2skill.maintenance_hooks as hooks
@@ -565,5 +580,5 @@ def test_windows_git_bash_runs_installed_wrapper_for_real_commit(tmp_path: Path)
     assert len(state.jobs) == 1
     lifecycle = next(iter(state.jobs.values()))
     assert lifecycle.status == "pending"
-    assert lifecycle.notificationState == "pending"
+    assert lifecycle.notificationState == "reported"
     assert lifecycle.activeAttemptId is None

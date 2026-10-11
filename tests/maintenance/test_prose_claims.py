@@ -130,6 +130,28 @@ def test_source_fragment_fact_registers_captured_blob_hash_and_locator(tmp_path:
     assert batch.evidence[0].locator == EvidenceLocator("line-range", [1, 2], 1)
 
 
+def test_source_fragment_reports_tail_omission_as_coverage_failure(tmp_path: Path) -> None:
+    raw = b"early\n" * 400
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    inventory = InventoryResult(tmp_path, (InventoryEntry(PATH, "file", len(raw), digest, False, False, None),),
+                                "sha256:" + "a" * 64, (), ())
+    controls = (IgnoreControlObservation(InputSelector("glob", "**/.gitignore", ".", True),
+                                         "no-match", None, (),
+                                         "sha256:" + hashlib.sha256(b"[]").hexdigest(), 0, 0),)
+    with ExtractionSession(
+        root=tmp_path, snapshot_id="snapshot_aaaaaaaaaaaaaaaaaaaaaaaa", inventory=inventory,
+        policy=default_scan_policy(), repository_id="repo_0123456789abcdef01234567",
+        prior_evidence=(), prior_facts=(), excluded_paths=(), control_observations=controls,
+        committed_reader=lambda _path, _cap: raw,
+    ) as session:
+        extractor = SourceFragmentExtractor(session)
+        ctx = session.bind("maintenance.source-fragment", "1", RULE_ID, "1")
+        batch = extractor.extract(ctx, extractor.discover(ctx))
+
+    with pytest.raises(ValueError, match="maintenance.source-fragment-incomplete"):
+        maintenance_context.require_complete_source_fragments(batch.reads, batch.coverage)
+
+
 @pytest.mark.parametrize(("reader", "expected"), [
     (lambda _path, _cap: b"too large", "capped"),
     (lambda _path, _cap: (_ for _ in ()).throw(OSError("fixture read failed")), "io-error"),
@@ -384,6 +406,31 @@ def test_build_committed_context_uses_target_commit_even_with_dirty_worktree(tmp
     guard = CommittedSourceGuard(job.jobId, target, job.sourceContextHash,
                                  job.policyRevision, authorization.authorizationId)
     recheck_committed_source(store, guard)
+    alternate_blob = subprocess.run(
+        ["git", "-C", str(root), "hash-object", "-w", "--stdin"],
+        input=b"print('replacement view')\n", stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, check=True,
+    ).stdout.decode().strip()
+    git("read-tree", target)
+    git("update-index", "--add", "--cacheinfo", f"100644,{alternate_blob},src.py")
+    alternate_tree = git("write-tree").decode().strip()
+    alternate_commit = subprocess.run(
+        ["git", "-C", str(root), "commit-tree", alternate_tree, "-p", baseline],
+        input=b"replacement source view\n", stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, check=True,
+    ).stdout.decode().strip()
+    git("replace", target, alternate_commit)
+    with pytest.raises(ValueError, match="projection"):
+        recheck_committed_source(store, guard)
+    git("replace", "-d", target)
+    recheck_committed_source(store, guard)
+    context_id = canonical_record_id("source-context", {"contextHash": job.sourceContextHash})
+    context_path = store.state_dir / "maintenance" / "contexts" / f"{context_id}.json"
+    saved_context = json.loads(context_path.read_text(encoding="utf-8"))
+    saved_context["manifest"]["files"][0]["rawHash"] = "sha256:" + "0" * 64
+    context_path.write_text(json.dumps(saved_context), encoding="utf-8")
+    with pytest.raises(ValueError, match="context"):
+        recheck_committed_source(store, guard)
     source.write_text("print('later commit')\n", encoding="utf-8")
     git("add", "src.py")
     git("commit", "-qm", "later")

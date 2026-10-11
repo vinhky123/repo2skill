@@ -89,6 +89,104 @@ def test_worker_recovers_dead_lease(tmp_path: Path) -> None:
     assert state.jobs[result.jobId].status == "failed"
 
 
+def test_worker_lease_rejects_redirected_lock_without_touching_target(tmp_path: Path) -> None:
+    import pytest
+    from repo2skill.safe_fs import UnsafePathError
+
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"protected")
+    lease_dir = root / ".repo2skill" / "maintenance"
+    lease_dir.mkdir(parents=True, exist_ok=True)
+    link = lease_dir / "worker.lock"
+    try:
+        link.symlink_to(outside)
+    except OSError as error:
+        pytest.skip(f"native symlink fixture is unavailable: {error}")
+
+    calls = []
+    with pytest.raises((UnsafePathError, ValueError)):
+        run_worker(
+            store, foreground=True, job_id=job_id,
+            probe=lambda *_args, **_kwargs: calls.append("probe"),
+            invoke=lambda *_args, **_kwargs: calls.append("invoke"),
+        )
+
+    assert outside.read_bytes() == b"protected"
+    assert calls == []
+
+
+def test_worker_lease_rejects_redirected_maintenance_directory(tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import pytest
+    from repo2skill.safe_fs import UnsafePathError
+
+    root, store = _store(tmp_path / "repo")
+    maintenance_dir = root / ".repo2skill" / "maintenance"
+    outside = tmp_path / "outside-maintenance"
+    outside.mkdir()
+    marker = outside / "protected"
+    marker.write_bytes(b"protected")
+    try:
+        maintenance_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"native directory redirect unavailable: {error}")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(maintenance_dir), str(outside)],
+            capture_output=True, text=True, check=False,
+        )
+        if completed.returncode:
+            pytest.skip(f"directory junction unavailable: {completed.stderr.strip()}")
+
+    calls = []
+    try:
+        with pytest.raises((UnsafePathError, ValueError)):
+            run_worker(
+                store, foreground=True, job_id="maintenance-job_0123456789abcdef01234567",
+                probe=lambda *_args, **_kwargs: calls.append("probe"),
+                invoke=lambda *_args, **_kwargs: calls.append("invoke"),
+            )
+        assert marker.read_bytes() == b"protected"
+        assert not (outside / "worker.lock").exists()
+        assert calls == []
+    finally:
+        if os.name == "nt":
+            maintenance_dir.rmdir()
+        else:
+            maintenance_dir.unlink()
+
+
+def test_worker_lease_guarded_open_failure_precedes_adapter_entry(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+    from repo2skill.safe_fs import GuardedDirectory
+
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"protected")
+    original_open_file = GuardedDirectory.open_file
+
+    def deny_worker_lock(self, name):
+        if name == "worker.lock":
+            raise PermissionError("injected guarded lease-open denial")
+        return original_open_file(self, name)
+
+    monkeypatch.setattr(GuardedDirectory, "open_file", deny_worker_lock)
+    calls = []
+    with pytest.raises(PermissionError, match="injected guarded lease-open denial"):
+        run_worker(
+            store, foreground=True, job_id=job_id,
+            probe=lambda *_args, **_kwargs: calls.append("probe"),
+            invoke=lambda *_args, **_kwargs: calls.append("invoke"),
+        )
+
+    assert outside.read_bytes() == b"protected"
+    assert calls == []
+
+
 def test_disabled_worker_does_not_claim_approved_job(tmp_path: Path) -> None:
     root, store = _store(tmp_path / "repo")
     job_id = _approved_job(store)
@@ -99,6 +197,23 @@ def test_disabled_worker_does_not_claim_approved_job(tmp_path: Path) -> None:
     result = run_worker(store, foreground=True, job_id=job_id)
 
     assert result.status == "disabled"
+    assert maint.read_state().jobs[job_id].status == "approved"
+
+
+def test_begin_invocation_rechecks_enabled_state_after_probe_boundary(tmp_path: Path) -> None:
+    import pytest
+    from repo2skill.maintenance_attempts import begin_invocation, prepare_attempt
+
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    attempt = prepare_attempt(store, job_id, "sha256:" + "a" * 64)
+    maint = MaintenanceStore(root, store)
+    with store.mutation():
+        maint.replace_state(dataclasses.replace(maint.read_state(), enabled=False))
+
+    with pytest.raises(ValueError, match="disabled"):
+        begin_invocation(store, job_id, attempt.attemptId)
+
     assert maint.read_state().jobs[job_id].status == "approved"
 
 

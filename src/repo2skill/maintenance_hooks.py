@@ -158,8 +158,49 @@ def _set_enabled(store: LedgerStore, enabled: bool) -> None:
         maintenance.replace_state(replace(state, enabled=True))
 
 
+def _mark_notification_reported(store: LedgerStore, job_id: str, expected) -> None:
+    """Record successful hook output only while the exact queued lifecycle is current."""
+    maintenance = MaintenanceStore(store.root, store)
+    with store.mutation():
+        state = maintenance.read_state()
+        lifecycle = state.jobs.get(job_id)
+        if lifecycle != expected or lifecycle is None or lifecycle.notificationState != "pending":
+            return
+        jobs = dict(state.jobs)
+        jobs[job_id] = replace(lifecycle, notificationState="reported")
+        maintenance.replace_state(replace(state, jobs=jobs))
+
+
 def install_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
     """Install wrappers only when every local hook destination is absent/owned."""
+    preflight = preflight_hooks(root, store)
+    if not preflight.installed:
+        return preflight
+    root = Path(root).absolute()
+    expected = {name: _wrapper_bytes(name) for name in HOOK_NAMES}
+    hooks = _resolve_main_hooks_directory(root, require_exclusive_worktree=True)[0]
+    assert hooks is not None
+    created: list[Path] = []
+    try:
+        for name, payload in expected.items():
+            path = hooks / name
+            if not path.exists() and not path.is_symlink():
+                _write_absent(path, payload)
+                created.append(path)
+        _set_enabled(store, True)
+    except (OSError, ValueError, RuntimeError) as error:
+        for path in reversed(created):
+            try:
+                if path.read_bytes() == expected[path.name]:
+                    path.unlink()
+            except OSError:
+                pass
+        return HookInstallResult(False, True, message=f"hook installation could not be completed: {type(error).__name__}")
+    return HookInstallResult(True, False, HOOK_NAMES, "repository-local maintenance hooks installed")
+
+
+def preflight_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
+    """Check every installation boundary without writing policy or hook bytes."""
     root = Path(root).absolute()
     if store.root != root:
         return HookInstallResult(False, True, message="store and repository roots differ")
@@ -180,23 +221,7 @@ def install_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
                 return HookInstallResult(False, True, message=f"cannot inspect existing {name} hook")
             if current != payload:
                 return HookInstallResult(False, True, message=f"existing {name} hook is not owned by repo2skill")
-    created: list[Path] = []
-    try:
-        for name, payload in expected.items():
-            path = hooks / name
-            if not path.exists() and not path.is_symlink():
-                _write_absent(path, payload)
-                created.append(path)
-        _set_enabled(store, True)
-    except (OSError, ValueError, RuntimeError) as error:
-        for path in reversed(created):
-            try:
-                if path.read_bytes() == expected[path.name]:
-                    path.unlink()
-            except OSError:
-                pass
-        return HookInstallResult(False, True, message=f"hook installation could not be completed: {type(error).__name__}")
-    return HookInstallResult(True, False, HOOK_NAMES, "repository-local maintenance hooks installed")
+    return HookInstallResult(True, False, HOOK_NAMES, "repository-local hook installation is available")
 
 
 def remove_owned_hooks(root: Path, store: LedgerStore) -> HookInstallResult:
@@ -303,6 +328,8 @@ def process_hook(
             + ("automatic processing started" if auto_eligible else f"run maintain approve {job.jobId}")
         )
         emit(message)
+        if lifecycle is not None:
+            _mark_notification_reported(store, job.jobId, lifecycle)
         return HookProcessResult("pending", job.jobId, message)
     except Exception as error:
         # Git hooks must not turn a successful user Git operation into failure.

@@ -27,7 +27,7 @@ from .ids import canonical_json_bytes, canonical_record_id, effective_policy_rev
 from .inventory import InventoryError
 from .ledger import ExportRecoveryRequired, LedgerStore, LockBusyError
 from .models import Claim, Diagnostic, Finding, ProjectDocument, ProjectState, ReviewEvent, RunLedger, TargetManifest
-from .maintenance_hooks import HookInstallResult, install_hooks, remove_owned_hooks
+from .maintenance_hooks import HookInstallResult, install_hooks, preflight_hooks, remove_owned_hooks
 from .maintenance_store import MaintenanceStore
 from .ownership import (
     ExportFreshnessError, _active_manifests, _ownership, export_staged,
@@ -205,6 +205,24 @@ def _exit_code(findings: Sequence[Finding]) -> int:
     codes = {"error": 1, "incomplete": 2, "pending": 3, "stale": 4, "unknown": 4, "conflict": 5}
     observed = [item.details.get("exitCode", codes.get(item.status, 0)) for item in findings]
     return next(code for code in _PRIORITY if code in observed) if observed else 0
+
+
+def _superseded_resolved(state, job_id: str, lifecycle) -> bool:
+    if lifecycle.resolutionReason == "no-impact":
+        return True
+    seen = {job_id}
+    successor_id = lifecycle.supersededByJobId
+    while successor_id is not None and successor_id not in seen:
+        seen.add(successor_id)
+        successor = state.jobs.get(successor_id)
+        if successor is None:
+            return False
+        if successor.status == "applied":
+            return True
+        if successor.status != "stale":
+            return False
+        successor_id = successor.supersededByJobId
+    return False
 
 
 def _envelope(command: str, result: object = None, findings: Sequence[Finding] = (), diagnostics: Sequence[Diagnostic] = (), next_actions: Sequence[str] = ()) -> dict[str, object]:
@@ -930,6 +948,15 @@ def _command_maintain(args: argparse.Namespace):
     ):
         return None, (_finding("invocation.invalid", "error", "job ID is invalid", details={"exitCode": 1}),), (), []
     if args.maintain_command == "setup":
+        if not args.manual_hooks:
+            preflight = preflight_hooks(store.root, store)
+            if not preflight.installed:
+                finding = _finding("maintenance.manual-integration-required", "error", preflight.message,
+                                   details={"exitCode": 1})
+                return {"installed": False, "message": preflight.message,
+                        "policy": maintenance.read_state().policy}, (finding,), (), [
+                            "invoke maintain catch-up manually, then inspect maintain status",
+                        ]
         if args.auto_approve:
             from .maintenance_approval import AutoGrantUnavailableError, configure_auto_approval
             try:
@@ -969,7 +996,11 @@ def _command_maintain(args: argparse.Namespace):
         from .maintenance_approval import _matches_current, _policy_revision, auto_approval_binding
         jobs = []
         findings = []
-        if state.appliedBaseline is None and not state.jobs:
+        live_bootstrap = any(
+            lifecycle.status not in {"skipped", "applied"}
+            for lifecycle in state.jobs.values()
+        )
+        if state.appliedBaseline is None and not live_bootstrap:
             findings.append(_finding(
                 "maintenance.rebuild-required", "stale",
                 "no verified applied baseline exists; run maintain catch-up --rebuild and approve its job",
@@ -984,7 +1015,9 @@ def _command_maintain(args: argparse.Namespace):
                          "approvalSource": lifecycle.approvalSource,
                          "approvalState": lifecycle.status,
                          "baselineCommit": job.baselineCommit,
-                         "targetKinds": job.targetKinds})
+                         "targetKinds": job.targetKinds,
+                         "supersededByJobId": lifecycle.supersededByJobId,
+                         "resolved": lifecycle.status == "stale" and _superseded_resolved(state, job_id, lifecycle)})
             auto_eligible = (
                 lifecycle.status == "pending" and state.policy.approval == "auto"
                 and auto_approval_binding(store, job, lifecycle) is not None
@@ -992,7 +1025,7 @@ def _command_maintain(args: argparse.Namespace):
             if lifecycle.status == "pending" and not auto_eligible:
                 findings.append(_finding("maintenance.approval-required", "pending",
                                          "a maintenance job is waiting for approval", details={"jobId": job_id}, exit_code=3))
-            elif lifecycle.status == "stale":
+            elif lifecycle.status == "stale" and not _superseded_resolved(state, job_id, lifecycle):
                 findings.append(_finding("maintenance.stale-binding", "stale",
                                          "a maintenance job must be rebuilt before it can run", details={"jobId": job_id}, exit_code=4))
             elif lifecycle.status == "failed":
@@ -1003,13 +1036,31 @@ def _command_maintain(args: argparse.Namespace):
                 else:
                     findings.append(_finding("maintenance.agent-failed", "error",
                                              "maintenance agent attempt failed", details={"jobId": job_id}, exit_code=6))
+        deferred = [{"eventId": item.eventId, "cursor": item.cursor, "targetCommit": item.targetCommit,
+                     "reasonCode": item.reasonCode} for item in state.deferredEvents]
+        resolved_deferred = [{"eventId": item.event.eventId, "cursor": item.event.cursor,
+                              "targetCommit": item.event.targetCommit,
+                              "reasonCode": item.event.reasonCode,
+                              "resolutionReason": item.resolutionReason,
+                              "resolvedByJobId": item.resolvedByJobId}
+                             for item in state.resolvedDeferredEvents]
+        for item in state.deferredEvents:
+            capped = any(token in (item.reasonCode or "") for token in ("cap", "timeout"))
+            findings.append(_finding(
+                "maintenance.coverage-required" if capped else "maintenance.deferred-event",
+                "incomplete" if capped else "stale",
+                "a deferred Git event still needs bounded catch-up",
+                details={"eventId": item.eventId, "reasonCode": item.reasonCode},
+                exit_code=2 if capped else 4,
+            ))
         return {"observedEventCursor": state.observedEventCursor, "appliedBaseline": state.appliedBaseline,
                 "policyRevision": _policy_revision(store),
                 "enabled": state.enabled,
                 "policy": {"approval": state.policy.approval, "grantRevision": state.policy.grantRevision,
                            "targetKinds": state.policy.targetKinds,
                            "autoGrantActive": _matches_current(store, state) if state.policy.approval == "auto" else False},
-                "jobs": jobs}, tuple(findings), (), []
+                "jobs": jobs, "deferredEvents": deferred,
+                "resolvedDeferredEvents": resolved_deferred}, tuple(findings), (), []
     if args.maintain_command in {"approve", "retry"}:
         from .maintenance_approval import OwnershipConflictError, StaleApprovalError, approve_job, verify_approval_binding
         job_id = args.job_id
@@ -1145,6 +1196,41 @@ def _command_maintain(args: argparse.Namespace):
                     _finding("maintenance.approval-required", "pending",
                              "maintenance work is waiting for approval", exit_code=3),
                 ), (), []
+            if deferred is not None:
+                return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                        "jobs": [], "deferredEvent": {"eventId": deferred.eventId,
+                        "reasonCode": deferred.reasonCode}}, (
+                    _finding("maintenance.deferred-event", "stale",
+                             "the observed event remains deferred and needs catch-up", details={
+                                 "eventId": deferred.eventId, "reasonCode": deferred.reasonCode,
+                             }, exit_code=4),
+                ), (), ["retry maintain catch-up after resolving the reported condition"]
+            unresolved = [
+                (key, lifecycle) for key, lifecycle in current.jobs.items()
+                if lifecycle.status in {"approved", "running", "failed"}
+                or (lifecycle.status == "stale" and not _superseded_resolved(current, key, lifecycle))
+            ]
+            if unresolved:
+                active = [{"jobId": key, "status": lifecycle.status,
+                           "targetCommit": maintenance.read_job(key).targetCommit}
+                          for key, lifecycle in unresolved]
+                if any(lifecycle.status in {"approved", "running", "stale"} for _key, lifecycle in unresolved):
+                    return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                            "jobs": active, "recoveryRequired": True}, (
+                        _finding("maintenance.recovery-required", "stale",
+                                 "unresolved or in-progress maintenance work remains visible",
+                                 exit_code=4),
+                    ), (), ["inspect maintain status and resume the exact job"]
+                failed = unresolved[0][1]
+                conflict = "conflict" in (failed.failureCode or "")
+                code = 5 if conflict else 6
+                return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
+                        "jobs": active, "retryRequired": True}, (
+                    _finding("maintenance.source-conflict" if conflict else "maintenance.agent-failed",
+                             "conflict" if conflict else "error",
+                             "a failed maintenance attempt requires explicit retry",
+                             exit_code=code),
+                ), (), ["inspect maintain status, then run maintain retry with the exact job ID"]
             return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,
                     "jobs": [], "rebuildRequested": rebuilding}, (), (), []
         return {"appliedBaseline": current.appliedBaseline, "targetCommit": target,

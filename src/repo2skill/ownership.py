@@ -196,6 +196,8 @@ def _validate_export_context(
     run = store.read_run(run_id)
     if run is None:
         raise FileNotFoundError("active run is missing")
+    from .maintenance_context import verify_application_authorization
+    verify_application_authorization(store, run)
     if tuple(sorted(set(targets))) != tuple(sorted(targets)):
         raise ValueError("target IDs must be unique")
     configured = {spec.targetId: spec for spec in project.targets}

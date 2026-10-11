@@ -388,6 +388,49 @@ def test_missing_baseline_requires_rebuild(tmp_path: Path) -> None:
         compare_commits(root, "f" * 40, target)
 
 
+def test_deferred_event_retries_same_cursor_into_a_published_job(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "src.py").write_text("base\n", encoding="utf-8")
+    baseline = _commit(root, "baseline")
+    store = _store(root, applied_baseline=baseline)
+    (root / "src.py").write_text("changed\n", encoding="utf-8")
+    target = _commit(root, "target")
+    event = GitEvent("git-event_333333333333333333333333", "manual-catch-up", "deferred-cursor", target)
+
+    assert enqueue_event(store, event, None, "maintenance.git-timeout") is None
+    job = enqueue_event(store, event, compare_commits(root, baseline, target))
+
+    assert job is not None
+    state = MaintenanceStore(root, store).read_state()
+    assert state.observedEventCursor == event.cursor
+    assert all(item.eventId != event.eventId for item in state.deferredEvents)
+    assert job.jobId in state.jobs
+
+
+def test_deferred_event_retries_after_intervening_cursor_with_real_publication(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "src.py").write_text("base\n", encoding="utf-8")
+    baseline = _commit(root, "baseline")
+    store = _store(root, applied_baseline=baseline)
+    (root / "src.py").write_text("changed\n", encoding="utf-8")
+    target = _commit(root, "target")
+    deferred = GitEvent("git-event_333333333333333333333333", "manual-catch-up", "cursor-deferred", target)
+    intervening = GitEvent("git-event_444444444444444444444444", "manual-catch-up", "cursor-later", target)
+
+    assert enqueue_event(store, deferred, None, "maintenance.git-timeout") is None
+    intervening_job = enqueue_event(store, intervening, compare_commits(root, baseline, target))
+    assert intervening_job is not None
+    retried_job = enqueue_event(store, deferred, compare_commits(root, baseline, target))
+
+    assert retried_job is not None
+    state = MaintenanceStore(root, store).read_state()
+    assert state.observedEventCursor == deferred.cursor
+    assert retried_job.jobId in state.jobs
+    assert all(item.eventId != deferred.eventId for item in state.deferredEvents)
+    published = MaintenanceStore(root, store).read_job(retried_job.jobId)
+    assert published is not None and deferred.eventId in published.eventIds
+
+
 def test_bootstrap_has_explicit_full_tree_impact(tmp_path: Path) -> None:
     root = _repo(tmp_path / "repo")
     (root / "src").mkdir()

@@ -492,6 +492,10 @@ def validate_operations(response: AgentResponse, context) -> tuple[ClaimOperatio
                 prior = prior_by_ref[operation.claimRef]
                 if prior.scope != operation.scope or prior.semanticKey != operation.semanticKey:
                     raise ValueError("update operation binding does not match the prior claim")
+                if (getattr(prior, "kind", None) != "inferred"
+                        or getattr(prior, "origin", None) != "llm"
+                        or getattr(prior, "supportMode", None) != "evidence-backed-prose"):
+                    raise ValueError("update operations may edit only prior model-authored prose claims")
         else:
             if operation.renderedText is not None or operation.factIds or operation.evidenceIds:
                 raise ValueError("delete operation must not include generated text or support")

@@ -149,8 +149,8 @@ def parse_hook_event(
         if argv[2] not in {"0", "1"} or target != current:
             raise MaintenanceGitError("maintenance.hook-target-mismatch", "post-checkout target does not match committed HEAD")
     else:
-        if len(argv) != 1 or argv[0] not in {"rebase", "am"} or not stdin:
-            raise MaintenanceGitError("maintenance.hook-arguments-invalid", "post-rewrite requires the rebase/am command and stdin")
+        if len(argv) != 1 or argv[0] not in {"rebase", "am", "amend"} or not stdin:
+            raise MaintenanceGitError("maintenance.hook-arguments-invalid", "post-rewrite requires the rebase/amend command and stdin")
         record_count = stdin.count(b"\n") + (1 if stdin and not stdin.endswith(b"\n") else 0)
         if record_count > MAX_POST_REWRITE_RECORDS:
             return deferred("maintenance.hook-record-cap")
@@ -668,7 +668,13 @@ def enqueue_event(
     maint = MaintenanceStore(store.root, store)
     with store.mutation():
         state = maint.read_state()
-    if state.observedEventCursor == event.cursor:
+    deferred_retry = next((item for item in state.deferredEvents if item.eventId == event.eventId), None)
+    if deferred_retry is not None and (
+        deferred_retry.cursor != event.cursor or deferred_retry.targetCommit != event.targetCommit
+        or deferred_retry.hookName != event.hookName
+    ):
+        return None
+    if state.observedEventCursor == event.cursor and deferred_retry is None:
         return None
     event_records = [(job_id, maint.read_job(job_id), lifecycle) for job_id, lifecycle in state.jobs.items()]
     matches = [(prior, lifecycle) for _job_id, prior, lifecycle in event_records
@@ -767,9 +773,20 @@ def enqueue_event(
                 for predecessor_id in predecessors:
                     jobs[predecessor_id] = replace(
                         jobs[predecessor_id], status="stale", approvalSource=None,
-                        approvalBindingHash=None,
+                        approvalBindingHash=None, resolutionReason="no-impact",
                     )
-                maint.replace_state(replace(state, observedEventCursor=event.cursor, jobs=jobs))
+                resolved_retry = next((item for item in state.deferredEvents
+                                       if item.eventId == event.eventId), None)
+                resolved_history = state.resolvedDeferredEvents
+                if resolved_retry is not None:
+                    from .maintenance_models import ResolvedDeferredEvent
+                    resolved_history = (*resolved_history,
+                                        ResolvedDeferredEvent(resolved_retry, "no-impact"))
+                maint.replace_state(replace(
+                    state, observedEventCursor=event.cursor, jobs=jobs,
+                    deferredEvents=tuple(item for item in state.deferredEvents if item.eventId != event.eventId),
+                    resolvedDeferredEvents=resolved_history,
+                ))
         return None
     scopes = _affected_scopes(impact, run)
     for predecessor_id in predecessors:
@@ -820,6 +837,27 @@ def enqueue_event(
                 policy_revision=policy_revision, extractor_revisions=extractor_revisions,
                 budget=budget, impact_projection=impact_projection,
             )
+            for omitted_path in manifest.omittedPaths:
+                try:
+                    read_commit_blob(
+                        store.root, event.targetCommit, omitted_path,
+                        MAX_CONTEXT_FILE_BYTES, budget=budget,
+                    )
+                except MaintenanceGitError as error:
+                    if error.code == "maintenance.git-object-missing":
+                        # Deleted or otherwise absent support is represented by
+                        # the committed change projection; it is not a cap.
+                        continue
+                    if error.code == "maintenance.git-blob-cap":
+                        raise MaintenanceGitError(
+                            "maintenance.context-file-cap",
+                            "required committed file exceeds the per-file context cap",
+                        ) from error
+                    raise
+                raise MaintenanceGitError(
+                    "maintenance.context-byte-cap",
+                    "required committed files exceed the total context byte cap",
+                )
             manifest_bytes = canonical_json_bytes({
                 "schemaVersion": "1.0", "manifest": snapshot_manifest_record(manifest),
             }) + b"\n"
@@ -856,7 +894,7 @@ def enqueue_event(
     for predecessor_id in predecessors:
         jobs[predecessor_id] = replace(
             jobs[predecessor_id], status="stale", approvalSource=None,
-            approvalBindingHash=None,
+            approvalBindingHash=None, supersededByJobId=job_id,
         )
     queued_grant = state.policy.grantRevision
     if predecessors:
@@ -886,8 +924,11 @@ def enqueue_event(
             deferred = _deferred_state(current, event, "maintenance.stale-binding")
             maint.replace_state(replace(deferred, observedEventCursor=current.observedEventCursor))
             return None
-        maint.publish_job(job, next_state, supersedes=tuple(predecessors))
-    return job
+        published = maint.publish_job(
+            job, next_state, supersedes=tuple(predecessors),
+            resolves_deferred_event_id=event.eventId if deferred_retry is not None else None,
+        )
+    return job if job.jobId in published.jobs else None
 
 
 def refresh_queued_successor(store: LedgerStore) -> MaintenanceJob | None:

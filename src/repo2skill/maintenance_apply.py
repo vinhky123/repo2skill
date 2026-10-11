@@ -11,7 +11,7 @@ from typing import Mapping
 from .ids import canonical_json_bytes
 from .ledger import LedgerStore
 from .maintenance_context import MaintenanceRunBundle, recheck_committed_source
-from .maintenance_models import CommittedSourceGuard, MaintenanceJob
+from .maintenance_models import CommittedSourceGuard, MaintenanceJob, ResolvedDeferredEvent
 from .maintenance_store import MaintenanceStore
 from .models import ExportJournal, RepositoryIdentity
 
@@ -46,6 +46,28 @@ class ApplyResult:
 
 def _prefix(job_id: str) -> str:
     return f"maintenance/apply/{job_id}"
+
+
+def _deferred_resolution(store: LedgerStore, job: MaintenanceJob, event) -> str | None:
+    from .maintenance_context import _context_manifest
+    from .maintenance_git import GitReadBudget, MaintenanceGitError, _proves_ancestor
+
+    budget = GitReadBudget()
+    try:
+        manifest = _context_manifest(store, job)
+        tree_bootstrap = manifest.get("impactProjection") == "tree-bootstrap"
+        if tree_bootstrap and _proves_ancestor(store.root, event.targetCommit, job.targetCommit, budget):
+            return "covered-by-tree-bootstrap"
+        if event.targetCommit == job.targetCommit:
+            return "target-applied"
+        if not _proves_ancestor(store.root, event.targetCommit, job.targetCommit, budget):
+            return None
+        if (job.baselineCommit is not None
+                and _proves_ancestor(store.root, job.baselineCommit, event.targetCommit, budget)):
+            return "covered-by-applied-interval"
+    except (MaintenanceGitError, ValueError, OSError):
+        return None
+    return None
 
 
 def _read_apply_journal(store: LedgerStore, job_id: str) -> ApplyJournal | None:
@@ -91,7 +113,7 @@ def _active_targets(store: LedgerStore, bundle: MaintenanceRunBundle):
     return manifest_set, manifests, {key: value for key, value in _ownership(manifests).items() if key in target_ids}
 
 
-def _guarded_live_projection(store: LedgerStore, journal: ExportJournal, manifests) -> dict[str, str | None]:
+def _guarded_live_projection(journal: ExportJournal, manifests) -> dict[str, str | None]:
     projected = {file.path: file.exactHash for manifest in manifests.values() for file in manifest.files}
     for operation in journal.operations:
         if operation.action == "replace":
@@ -154,8 +176,17 @@ def _finalize(store: LedgerStore, job: MaintenanceJob, intent: ApplyJournal, gua
             raise ValueError("maintenance lifecycle disappeared during finalization")
         jobs = dict(current.jobs)
         jobs[job.jobId] = replace(lifecycle, status="applied", failureCode=None)
+        covered_deferred = tuple((item, _deferred_resolution(store, job, item))
+                                 for item in current.deferredEvents)
+        resolved_deferred = tuple(item for item, resolution in covered_deferred if resolution is None)
+        resolved_history = current.resolvedDeferredEvents + tuple(
+            ResolvedDeferredEvent(item, resolution, job.jobId)
+            for item, resolution in covered_deferred if resolution is not None
+        )
         maintenance.replace_state(replace(current, appliedBaseline=job.targetCommit,
-                                           jobs=jobs, runningJobId=None))
+                                           jobs=jobs, runningJobId=None,
+                                           deferredEvents=resolved_deferred,
+                                           resolvedDeferredEvents=resolved_history))
         completed = replace(intent, status="applied", completedAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
         _persist_apply_journal(store, completed)
     return "applied"
@@ -226,7 +257,7 @@ def apply_job(store: LedgerStore, job: MaintenanceJob, bundle: MaintenanceRunBun
     manifests = {}
     ownership = {}
     def bind_export(export_journal: ExportJournal) -> None:
-        projection = _guarded_live_projection(store, export_journal, manifests)
+        projection = _guarded_live_projection(export_journal, manifests)
         bound = ApplyJournal(
             job.jobId, "export-prepared", job.expectedManifestSetId, dict(job.expectedOutputHashes),
             bundle.run.runId, 1, manifest_set_id_for_export(export_journal.exportId),
@@ -320,7 +351,7 @@ def recover_apply(store: LedgerStore, job_id: str, guard: CommittedSourceGuard) 
         selected_ids = tuple(spec.targetId for spec in selected_specs)
         ownership = {key: value for key, value in ownership.items() if key in selected_ids}
         def bind_export(export_journal: ExportJournal) -> None:
-            projected = _guarded_live_projection(store, export_journal, manifests)
+            projected = _guarded_live_projection(export_journal, manifests)
             _persist_apply_journal(store, ApplyJournal(
                 job.jobId, "export-prepared", job.expectedManifestSetId, dict(job.expectedOutputHashes),
                 intent.intendedRunId, intent.intendedStageRevision,

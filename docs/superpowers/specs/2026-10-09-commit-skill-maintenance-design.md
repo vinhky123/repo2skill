@@ -1,10 +1,10 @@
 # Commit-triggered skill maintenance design
 
-**Status:** Proposed. This document does not describe implemented behavior. **Date:** 2026-10-09 (Asia/Saigon)
+**Status:** Implemented alpha. This document records the approved design; tested behavior and known limits are tracked in [maintenance acceptance](../../engineering/maintenance-acceptance.md). **Date:** 2026-10-09 (Asia/Saigon)
 
 ## Decision and user-visible sequence
 
-repo2skill remains the product name. This proposal adds local maintenance of repo2skill-owned `AGENTS.md` and Agent
+repo2skill remains the product name. This design adds local maintenance of repo2skill-owned `AGENTS.md` and Agent
 Skill outputs after repository changes. The baseline is the commit whose skill output was successfully applied and
 verified, never the newest commit merely observed by a hook.
 

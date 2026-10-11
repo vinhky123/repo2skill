@@ -128,6 +128,7 @@ class MaintenanceStore:
 
     def publish_job(
         self, job: MaintenanceJob, state: MaintenanceState, *, supersedes: tuple[str, ...] = (),
+        resolves_deferred_event_id: str | None = None,
     ) -> MaintenanceState:
         """Publish an immutable job then commit its visibility with one pointer write."""
         if not self.ledger._mutation_active:
@@ -149,7 +150,10 @@ class MaintenanceStore:
                 raise ValueError("superseded jobs must become stale in the published state")
         if not set(job.eventIds).issuperset(carried_ids):
             raise ValueError("replacement job must retain predecessor event provenance")
-        prior_event_ids = {event.eventId for event in current.deferredEvents}
+        deferred_ids = {event.eventId for event in current.deferredEvents}
+        if resolves_deferred_event_id is not None and resolves_deferred_event_id not in deferred_ids:
+            raise ValueError("resolved deferred event must be visible in the current state")
+        prior_event_ids = deferred_ids - ({resolves_deferred_event_id} if resolves_deferred_event_id else set())
         for job_id in current.jobs:
             prior = self.read_job(job_id)
             if prior is not None:

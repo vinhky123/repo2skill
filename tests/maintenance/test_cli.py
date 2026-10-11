@@ -5,6 +5,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from repo2skill.cli import build_parser, main
 from repo2skill.config import default_claim_policy, default_scan_policy, default_targets
 from repo2skill.ledger import LedgerStore
@@ -80,6 +82,121 @@ def test_default_status_requires_approval(tmp_path: Path, capsys) -> None:
     assert payload["result"]["jobs"][0]["status"] == "pending"
     assert payload["result"]["policyRevision"]
     assert stderr == ""
+
+
+def test_setup_refusal_preflights_before_auto_grant_or_policy_write(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_approval import read_auto_grant
+
+    root = tmp_path / "repo"
+    ledger, maint = _repo(root)
+    hook = root / ".git" / "hooks" / "post-commit"
+    hook.write_bytes(b"human hook bytes\n")
+    before = maint.read_state()
+
+    code, _payload, _stderr = _invoke(root, capsys, "setup", "--auto-approve")
+
+    assert code == 1
+    assert maint.read_state() == before
+    assert read_auto_grant(ledger) is None
+    assert hook.read_bytes() == b"human hook bytes\n"
+
+
+def test_plain_setup_refusal_preserves_current_auto_authority_bytes(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_approval import configure_auto_approval, read_auto_grant
+
+    root = tmp_path / "repo"
+    ledger, maint = _repo(root)
+    configure_auto_approval(ledger)
+    grant_path = root / ".git" / "repo2skill" / "maintenance" / "auto-grant.json"
+    grant_before = grant_path.read_bytes()
+    state_before = maint.read_state()
+    hook = root / ".git" / "hooks" / "post-commit"
+    hook.write_bytes(b"human hook bytes\n")
+
+    code, _payload, _stderr = _invoke(root, capsys, "setup")
+
+    assert code == 1
+    assert maint.read_state() == state_before
+    assert grant_path.read_bytes() == grant_before
+    assert read_auto_grant(ledger) is not None
+    assert hook.read_bytes() == b"human hook bytes\n"
+
+
+@pytest.mark.parametrize("cap_kind", ["file", "total"])
+def test_catch_up_defers_required_context_caps_and_retries_same_event(
+    tmp_path: Path, capsys, monkeypatch, cap_kind: str,
+) -> None:
+    from repo2skill import maintenance_git
+
+    root = tmp_path / "repo"
+    ledger, maint = _repo(root)
+    (root / ".git" / "info" / "exclude").write_text(".repo2skill/\n", encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "a.py").write_text("123\n", encoding="utf-8")
+    if cap_kind == "total":
+        (root / "src" / "b.py").write_text("456\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
+                    "user.email=fixture@example.invalid", "commit", "-m", "source"],
+                   check=True, capture_output=True)
+    with ledger.mutation():
+        maint.replace_state(dataclasses.replace(maint.read_state(), enabled=True))
+
+    if cap_kind == "file":
+        monkeypatch.setattr(maintenance_git, "MAX_CONTEXT_FILE_BYTES", 2)
+    else:
+        monkeypatch.setattr(maintenance_git, "MAX_CONTEXT_TOTAL_BYTES", 4)
+
+    code, payload, _stderr = _invoke(root, capsys, "catch-up", "--rebuild")
+    assert code == 2
+    assert payload["result"]["coverageFailure"] in {
+        "maintenance.context-file-cap", "maintenance.context-byte-cap",
+    }
+    assert maint.read_state().jobs == {}
+    before_retry = maint.read_state()
+    assert len(before_retry.deferredEvents) == 1
+    assert before_retry.appliedBaseline is None
+
+    monkeypatch.setattr(maintenance_git, "MAX_CONTEXT_FILE_BYTES", 1024 * 1024)
+    monkeypatch.setattr(maintenance_git, "MAX_CONTEXT_TOTAL_BYTES", 64 * 1024 * 1024)
+    code, payload, _stderr = _invoke(root, capsys, "catch-up", "--rebuild")
+    assert code == 3
+    assert payload["result"]["jobs"]
+    assert maint.read_state().deferredEvents == ()
+    assert maint.read_state().appliedBaseline is None
+
+
+def test_status_reports_deferred_event_without_jobs(tmp_path: Path, capsys) -> None:
+    from repo2skill.maintenance_models import GitEvent
+
+    root = tmp_path / "repo"
+    ledger, maint = _repo(root)
+    event = GitEvent("git-event_111111111111111111111111", "manual-catch-up", "deferred-cursor",
+                     "a" * 40, "maintenance.git-timeout")
+    with ledger.mutation():
+        maint.replace_state(dataclasses.replace(maint.read_state(), appliedBaseline="b" * 40,
+                                                deferredEvents=(event,)))
+
+    code, payload, _stderr = _invoke(root, capsys, "status")
+
+    assert code == 2
+    assert payload["result"]["deferredEvents"][0]["reasonCode"] == "maintenance.git-timeout"
+    assert payload["findings"][0]["code"] == "maintenance.coverage-required"
+
+
+def test_status_reports_missing_baseline_after_skipped_bootstrap(tmp_path: Path, capsys) -> None:
+    ledger, maint = _repo(tmp_path / "repo")
+    _pending(ledger, maint)
+    with ledger.mutation():
+        state = maint.read_state()
+        jobs = dict(state.jobs)
+        jobs[JOB_ID] = dataclasses.replace(jobs[JOB_ID], status="skipped")
+        maint.replace_state(dataclasses.replace(state, jobs=jobs))
+
+    code, payload, _stderr = _invoke(tmp_path / "repo", capsys, "status")
+
+    assert code == 4
+    assert any(item["code"] == "maintenance.rebuild-required" for item in payload["findings"])
 
 
 def test_status_does_not_request_user_approval_for_current_auto_grant(tmp_path: Path, capsys) -> None:
@@ -303,6 +420,70 @@ def test_new_target_after_skip_can_create_a_new_pending_job(tmp_path: Path, caps
     assert code == 3
     assert payload["result"]["jobs"][-1]["jobId"] == new_id
     assert maint.read_state().jobs[JOB_ID].status == "skipped"
+
+
+def test_status_resolves_applied_supersession_but_keeps_unrelated_stale(tmp_path: Path, capsys) -> None:
+    ledger, maint = _repo(tmp_path / "repo")
+    _pending(ledger, maint)
+    predecessor = maint.read_job(JOB_ID)
+    assert predecessor is not None
+    successor_id = "maintenance-job_1123456789abcdef01234567"
+    unrelated_id = "maintenance-job_2123456789abcdef01234567"
+    successor = dataclasses.replace(
+        predecessor, jobId=successor_id, eventIds=("git-event_1123456789abcdef01234567",),
+        targetCommit="c" * 40,
+    )
+    unrelated = dataclasses.replace(
+        predecessor, jobId=unrelated_id, eventIds=("git-event_2123456789abcdef01234567",),
+        targetCommit="d" * 40,
+    )
+    with ledger.mutation():
+        maint.write_job(successor)
+        maint.write_job(unrelated)
+        state = maint.read_state()
+        jobs = dict(state.jobs)
+        jobs[JOB_ID] = dataclasses.replace(
+            jobs[JOB_ID], status="stale", supersededByJobId=successor_id,
+        )
+        jobs[successor_id] = MaintenanceLifecycle("applied", None, None, "reported", None, None, None)
+        jobs[unrelated_id] = MaintenanceLifecycle("stale", None, None, "reported", None, None, None)
+        maint.replace_state(dataclasses.replace(state, appliedBaseline="c" * 40, jobs=jobs))
+
+    code, payload, _stderr = _invoke(tmp_path / "repo", capsys, "status")
+
+    by_id = {item["jobId"]: item for item in payload["result"]["jobs"]}
+    assert by_id[JOB_ID]["resolved"] is True
+    assert by_id[unrelated_id]["resolved"] is False
+    assert code == 4
+    assert [item["details"]["jobId"] for item in payload["findings"]] == [unrelated_id]
+
+
+@pytest.mark.parametrize(("job_status", "exit_code"), [("approved", 4), ("failed", 6)])
+def test_catch_up_keeps_approved_or_failed_work_visible(
+    tmp_path: Path, capsys, job_status: str, exit_code: int,
+) -> None:
+    root = tmp_path / "repo"
+    ledger, maint = _repo(root)
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
+                    "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "baseline"],
+                   check=True, capture_output=True)
+    baseline = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    _pending(ledger, maint)
+    with ledger.mutation():
+        state = maint.read_state()
+        jobs = dict(state.jobs)
+        jobs[JOB_ID] = dataclasses.replace(
+            jobs[JOB_ID], status=job_status,
+            failureCode="maintenance.agent-failed" if job_status == "failed" else None,
+        )
+        maint.replace_state(dataclasses.replace(state, appliedBaseline=baseline, jobs=jobs))
+
+    code, payload, _stderr = _invoke(root, capsys, "catch-up")
+
+    assert code == exit_code
+    assert payload["result"]["jobs"][0]["jobId"] == JOB_ID
+    assert payload["result"]["jobs"][0]["status"] == job_status
 
 
 def test_real_enqueue_deduplicates_skipped_event_and_reports_later_commit(tmp_path: Path, capsys) -> None:

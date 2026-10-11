@@ -161,6 +161,8 @@ def _prepare_descriptor(bundle: RenderBundle, run: RunLedger, store: LedgerStore
                         project: ProjectDocument, *, accepted_only: bool = False) -> tuple[dict[str, object], dict[str, bytes], dict[str, bytes]]:
     if isinstance(stage_revision, bool) or not isinstance(stage_revision, int) or stage_revision < 1:
         raise ValueError("stage revision must be a positive integer")
+    from .maintenance_context import verify_application_authorization
+    verify_application_authorization(store, run)
     _validate_paths(store, project, project.targets)
     if len({spec.targetId for spec in run.configuredTargets}) != len(run.configuredTargets):
         raise ValueError("duplicate configured target ID in run")
