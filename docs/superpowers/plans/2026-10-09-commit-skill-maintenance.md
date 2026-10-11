@@ -297,11 +297,14 @@ platform lifecycle. Each task has a focused reviewer gate and its own commit.
 
 ## Handoff
 
-Tasks 1–9 were delivered and reviewed in their task commits. Task 10 adds the
-integrated commit-to-approved-apply acceptance test, installed-wheel
-maintenance smoke checks, and durable engineering acceptance and decision
-records. Local verification ran on Windows/Python 3.13.15: 183 focused tests,
-436 full-suite tests with one Windows path-normalization case skipped, a fresh
-wheel and sdist build, and installed-wheel smoke. The other five configured CI
-cells remain unexecuted remotely; no real provider or model behavior was
-exercised. Task 10 review is pending separately.
+Tasks 1–10 are delivered and reviewed locally. The reviewed runtime is commit
+`90b76e8e0db00253649fed463d197e047b8f6343` on `codex/p0-foundation`; the final
+scoped residual review found all four residual findings addressed and no new
+Critical or Important issue. The local Windows/Python 3.13.15 acceptance run
+completed with 474 passed and 2 skipped in 610.79s (the separate numeric
+process exit was not retained; see the [acceptance record](../../engineering/maintenance-acceptance.md)).
+The configured remote CI matrix remains unexecuted. No real provider or model
+behavior was exercised. The [final scoped review](../../engineering/maintenance-final-review.md)
+and [69 durable decisions](../../engineering/maintenance-decisions.md) record
+the final boundaries. The original task checklist above remains the plan; this
+handoff does not claim unexecuted remote CI or pre-fix RED steps as completed.
