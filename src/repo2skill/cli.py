@@ -1105,6 +1105,16 @@ def _command_maintain(args: argparse.Namespace):
             else:
                 impact = compare_commits(store.root, state.appliedBaseline, target, budget=budget)
         except (MaintenanceGitError, OSError, subprocess.SubprocessError) as error:
+            error_code = getattr(error, "code", None)
+            coverage_failure = error_code in {"maintenance.git-output-cap", "maintenance.git-timeout",
+                                              "maintenance.context-file-cap", "maintenance.context-byte-cap"}
+            if coverage_failure:
+                return {"appliedBaseline": state.appliedBaseline, "rebuildRequired": False, "jobs": [],
+                        "coverageFailure": error_code}, (
+                    _finding("maintenance.coverage-required", "incomplete",
+                             f"committed context could not be covered within the configured limit: {error}",
+                             details={"reasonCode": error_code}, exit_code=2),
+                ), (), ["reduce the repository context or retry maintain catch-up"]
             return {"appliedBaseline": state.appliedBaseline, "rebuildRequired": True, "jobs": []}, (
                 _finding("maintenance.rebuild-required", "stale",
                          f"committed snapshot could not be proven or covered: {error}", exit_code=4),
@@ -1114,7 +1124,9 @@ def _command_maintain(args: argparse.Namespace):
         event = GitEvent(canonical_record_id("git-event", event_data), "manual-catch-up",
                          "manual:" + canonical_record_id("event-cursor", event_data), target)
         job = enqueue_event(store, event, impact, budget=budget,
-                            allow_unreachable_target=rebuilding)
+                            allow_unreachable_target=rebuilding,
+                            allow_baseline_bootstrap=rebuilding,
+                            impact_projection="tree-bootstrap" if rebuilding else None)
         current = maintenance.read_state()
         deferred = next((item for item in current.deferredEvents if item.eventId == event.eventId), None)
         if deferred is not None and any(token in (deferred.reasonCode or "") for token in ("cap", "timeout")):

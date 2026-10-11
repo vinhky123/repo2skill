@@ -103,6 +103,7 @@ class SnapshotManifest:
     contextHash: str
     policyRevision: str = ""
     extractorRevisions: Mapping[str, str] | None = None
+    impactProjection: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "extractorRevisions", MappingProxyType(dict(self.extractorRevisions or {})))
@@ -374,13 +375,17 @@ def bootstrap_commit(
 def committed_change_statuses(
     root: Path, baseline: str | None, target: str, expected_diff_hash: str,
     changed_paths: Sequence[str], *, budget: GitReadBudget | None = None,
+    impact_projection: str | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Rebuild eligible change statuses and verify the immutable Git byte hash.
 
     Bootstrap jobs bind the exact recursive-tree listing from ``ls-tree``; later
     jobs bind the exact NUL-framed ``diff-tree --name-status`` output.
     """
-    impact = (bootstrap_commit(root, target, budget=budget) if baseline is None
+    if impact_projection not in {None, "tree-bootstrap"}:
+        raise MaintenanceGitError("maintenance.context-projection-unknown", "saved committed context projection is unknown")
+    impact = (bootstrap_commit(root, target, budget=budget)
+              if baseline is None or impact_projection == "tree-bootstrap"
               else compare_commits(root, baseline, target, budget=budget))
     if impact.diffHash != expected_diff_hash:
         raise MaintenanceGitError(
@@ -434,10 +439,12 @@ def read_commit_blob(
 def materialize_commit(
     root: Path, commit: str, paths: Sequence[str], destination: Path, *,
     policy_revision: str = "", extractor_revisions: Mapping[str, str] | None = None,
-    budget: GitReadBudget | None = None,
+    budget: GitReadBudget | None = None, impact_projection: str | None = None,
 ) -> SnapshotManifest:
     root = Path(root).absolute()
     budget = budget or GitReadBudget()
+    if impact_projection not in {None, "tree-bootstrap"}:
+        raise MaintenanceGitError("maintenance.context-projection-unknown", "committed context projection is unknown")
     head = _resolve_commit(root, commit, budget)
     if len(paths) > MAX_CONTEXT_FILES:
         raise MaintenanceGitError("maintenance.context-file-cap", "committed context exceeds file-count cap")
@@ -481,11 +488,29 @@ def materialize_commit(
         "policyRevision": policy_revision,
         "extractorRevisions": dict(sorted((extractor_revisions or {}).items())),
     }
+    if impact_projection is not None:
+        projection["impactProjection"] = impact_projection
     digest = _HASH(canonical_json_bytes(projection))
     return SnapshotManifest(
         head, tuple(files), tuple(sorted(omitted)), digest, policy_revision,
-        dict(sorted((extractor_revisions or {}).items())),
+        dict(sorted((extractor_revisions or {}).items())), impact_projection,
     )
+
+
+def snapshot_manifest_record(manifest: SnapshotManifest) -> dict[str, object]:
+    """Serialize manifests without changing legacy bytes when no marker is present."""
+    record: dict[str, object] = {
+        "commit": manifest.commit,
+        "files": [{"path": item.path, "blobId": item.blobId, "rawHash": item.rawHash, "size": item.size}
+                  for item in manifest.files],
+        "omittedPaths": list(manifest.omittedPaths),
+        "contextHash": manifest.contextHash,
+        "policyRevision": manifest.policyRevision,
+        "extractorRevisions": dict(manifest.extractorRevisions or {}),
+    }
+    if manifest.impactProjection is not None:
+        record["impactProjection"] = manifest.impactProjection
+    return record
 
 
 def _run_for_store(store: LedgerStore) -> RunLedger | None:
@@ -635,6 +660,8 @@ def enqueue_event(
     reason_code: str | None = None, *, budget: GitReadBudget | None = None,
     supersede_job_ids: Sequence[str] | None = None,
     allow_unreachable_target: bool = False,
+    allow_baseline_bootstrap: bool = False,
+    impact_projection: str | None = None,
 ) -> MaintenanceJob | None:
     """Atomically persist the committed context, immutable job, and event cursor."""
     budget = budget or GitReadBudget()
@@ -643,8 +670,23 @@ def enqueue_event(
         state = maint.read_state()
     if state.observedEventCursor == event.cursor:
         return None
+    event_records = [(job_id, maint.read_job(job_id), lifecycle) for job_id, lifecycle in state.jobs.items()]
+    matches = [(prior, lifecycle) for _job_id, prior, lifecycle in event_records
+               if prior is not None and event.eventId in prior.eventIds]
+    for prior, lifecycle in reversed(matches):
+        if lifecycle.status in {"pending", "approved"} and lifecycle.activeAttemptId is None:
+            return prior
+    if matches:
+        # A consumed event is history, not authority to create another job.
+        return None
+    if impact_projection not in {None, "tree-bootstrap"}:
+        _defer_event(store, maint, state, event, "maintenance.context-projection-unknown")
+        return None
     if impact is None:
         _defer_event(store, maint, state, event, reason_code or event.reasonCode or "maintenance.impact-unavailable")
+        return None
+    if state.appliedBaseline is None and not allow_baseline_bootstrap:
+        _defer_event(store, maint, state, event, "maintenance.rebuild-required")
         return None
     if impact.targetCommit != event.targetCommit:
         reason_code = "maintenance.event-impact-mismatch"
@@ -682,7 +724,7 @@ def enqueue_event(
     if predecessors:
         try:
             impact = (bootstrap_commit(store.root, event.targetCommit, budget=budget)
-                      if state.appliedBaseline is None else
+                      if state.appliedBaseline is None or impact_projection == "tree-bootstrap" else
                       compare_commits(store.root, state.appliedBaseline, event.targetCommit, budget=budget))
             impact = replace(impact, baselineCommit=state.appliedBaseline)
         except MaintenanceGitError as error:
@@ -714,16 +756,26 @@ def enqueue_event(
                      scopes=_classify(eligible_paths, statuses)[0],
                      requiredFullScan=impact.requiredFullScan or any(status == "D" for status, _path in statuses),
                      changeStatuses=statuses)
-    if not impact.paths and impact.baselineCommit is not None:
+    if not impact.paths and impact.baselineCommit is not None and impact_projection != "tree-bootstrap":
         with store.mutation():
             current = maint.read_state()
             if current != state:
                 deferred = _deferred_state(current, event, "maintenance.stale-binding")
                 maint.replace_state(replace(deferred, observedEventCursor=current.observedEventCursor))
             else:
-                maint.replace_state(replace(state, observedEventCursor=event.cursor))
+                jobs = dict(state.jobs)
+                for predecessor_id in predecessors:
+                    jobs[predecessor_id] = replace(
+                        jobs[predecessor_id], status="stale", approvalSource=None,
+                        approvalBindingHash=None,
+                    )
+                maint.replace_state(replace(state, observedEventCursor=event.cursor, jobs=jobs))
         return None
     scopes = _affected_scopes(impact, run)
+    for predecessor_id in predecessors:
+        prior = maint.read_job(predecessor_id)
+        if prior is not None:
+            scopes = tuple(sorted(set(scopes) | set(prior.impactScopes)))
     if not scopes:
         # A previously unobserved input or selector gap cannot prove that
         # changed committed source is irrelevant. Preserve it for review.
@@ -766,10 +818,10 @@ def enqueue_event(
             manifest = materialize_commit(
                 store.root, event.targetCommit, tuple(sorted(selected_paths)), temporary,
                 policy_revision=policy_revision, extractor_revisions=extractor_revisions,
-                budget=budget,
+                budget=budget, impact_projection=impact_projection,
             )
             manifest_bytes = canonical_json_bytes({
-                "schemaVersion": "1.0", "manifest": manifest,
+                "schemaVersion": "1.0", "manifest": snapshot_manifest_record(manifest),
             }) + b"\n"
             source_hash = manifest.contextHash
             manifest_id = canonical_record_id("source-context", {"contextHash": source_hash})

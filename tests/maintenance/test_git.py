@@ -429,6 +429,33 @@ def test_materialize_and_blob_reads_use_committed_bytes(tmp_path: Path) -> None:
     assert manifest.contextHash.startswith("sha256:")
 
 
+def test_optional_bootstrap_projection_preserves_legacy_default_hash_and_record(tmp_path: Path) -> None:
+    from repo2skill.ids import canonical_json_bytes
+
+    root = _repo(tmp_path / "repo")
+    (root / "source.py").write_text("source = True\n", encoding="utf-8")
+    target = _commit(root, "target")
+    default = materialize_commit(root, target, ("source.py",), tmp_path / "default")
+    bootstrap = materialize_commit(
+        root, target, ("source.py",), tmp_path / "bootstrap", impact_projection="tree-bootstrap",
+    )
+    expected_projection = {
+        "commit": target,
+        "files": [{"path": item.path, "blobId": item.blobId, "rawHash": item.rawHash, "size": item.size}
+                  for item in default.files],
+        "omittedPaths": [], "policyRevision": "", "extractorRevisions": {},
+    }
+    expected_hash = "sha256:" + hashlib.sha256(canonical_json_bytes(expected_projection)).hexdigest()
+    default_record = maintenance_git.snapshot_manifest_record(default)
+
+    assert default.impactProjection is None
+    assert default.contextHash == expected_hash
+    assert "impactProjection" not in default_record
+    assert bootstrap.impactProjection == "tree-bootstrap"
+    assert bootstrap.contextHash != default.contextHash
+    assert maintenance_git.snapshot_manifest_record(bootstrap)["impactProjection"] == "tree-bootstrap"
+
+
 def test_materialize_records_size_cap_as_an_explicit_omission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _repo(tmp_path / "repo")
     (root / "large.txt").write_text("too large for this test cap", encoding="utf-8")
@@ -475,7 +502,7 @@ def test_enqueue_persists_context_before_publishing_job_and_cursor(tmp_path: Pat
     event = GitEvent("git-event_0123456789abcdef01234567", "post-commit", "cursor-1", target)
     impact = bootstrap_commit(root, target)
 
-    job = enqueue_event(store, event, impact)
+    job = enqueue_event(store, event, impact, allow_baseline_bootstrap=True)
 
     assert job is not None
     manifest_id = canonical_record_id("source-context", {"contextHash": job.sourceContextHash})
@@ -499,7 +526,7 @@ def test_full_scan_context_excludes_owned_outputs_but_keeps_agents_source(tmp_pa
     store = _store(root)
     event = GitEvent("git-event_555555555555555555555555", "post-commit", "cursor-full", target)
 
-    job = enqueue_event(store, event, bootstrap_commit(root, target))
+    job = enqueue_event(store, event, bootstrap_commit(root, target), allow_baseline_bootstrap=True)
 
     assert job is not None
     manifest_id = canonical_record_id("source-context", {"contextHash": job.sourceContextHash})

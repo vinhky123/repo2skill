@@ -75,7 +75,7 @@ def test_responded_attempt_recovery_and_explicit_retry(
     git("commit", "-qm", "target")
     target = git("rev-parse", "HEAD")
     event = GitEvent("git-event_0123456789abcdef01234567", "post-commit", "cursor-target", target)
-    job = enqueue_event(store, event, bootstrap_commit(root, target))
+    job = enqueue_event(store, event, bootstrap_commit(root, target), allow_baseline_bootstrap=True)
     assert job is not None
     approve_job(store, job.jobId)
     context = build_committed_context(store, job)
@@ -172,7 +172,8 @@ def test_responded_attempt_recovery_and_explicit_retry(
             later_commit = git("rev-parse", "HEAD")
             later_event = GitEvent("git-event_1123456789abcdef01234567", "post-commit",
                                    "cursor-later", later_commit)
-            later_job = enqueue_event(store, later_event, bootstrap_commit(root, later_commit))
+            later_job = enqueue_event(store, later_event, bootstrap_commit(root, later_commit),
+                                      allow_baseline_bootstrap=True)
             assert later_job is not None
             queued.append(later_job.jobId)
         if scenario == "failed-agent":

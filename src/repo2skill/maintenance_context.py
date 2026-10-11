@@ -125,6 +125,8 @@ def _context_manifest(store, job: MaintenanceJob) -> dict[str, object]:
         raise ValueError("saved committed source context hash differs from job binding")
     if manifest.get("commit") != job.targetCommit:
         raise ValueError("saved committed source context commit differs from job binding")
+    if "impactProjection" in manifest and manifest["impactProjection"] != "tree-bootstrap":
+        raise ValueError("saved committed source context projection is unknown")
     return manifest
 
 
@@ -361,9 +363,10 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
     current_head = _git(store.root, ("rev-parse", "--verify", "HEAD^{commit}"), 256, budget).strip().decode("ascii")
     if current_head != job.targetCommit:
         raise ValueError("current committed HEAD differs from maintenance target")
+    impact_projection = manifest.get("impactProjection")
     change_statuses = committed_change_statuses(
         store.root, job.baselineCommit, job.targetCommit, job.diffHash, job.changedPaths,
-        budget=budget,
+        budget=budget, impact_projection=impact_projection,
     )
     for omitted in omitted_paths:
         try:
@@ -384,6 +387,7 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
         rebuilt = materialize_commit(
             store.root, job.targetCommit, tuple(sorted(set(paths) | set(omitted_paths))), root,
             policy_revision=job.policyRevision, extractor_revisions=versions, budget=budget,
+            impact_projection=impact_projection,
         )
         if rebuilt.contextHash != job.sourceContextHash:
             raise ValueError("target commit no longer matches the saved source context")
@@ -408,7 +412,7 @@ def build_committed_context(store, job: MaintenanceJob) -> MaintenanceContext:
             policy_revision=policy_revision, root_label=project.rootLabel,
         )
         changed_diff = canonical_json_bytes({
-            "projection": "bootstrap-inventory" if job.baselineCommit is None else "committed-change-status",
+            "projection": "bootstrap-inventory" if job.baselineCommit is None or impact_projection == "tree-bootstrap" else "committed-change-status",
             "diffHash": job.diffHash,
             "changedPaths": list(job.changedPaths),
             "changeStatuses": [[status, path] for status, path in change_statuses],

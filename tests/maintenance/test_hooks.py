@@ -237,6 +237,80 @@ def test_hook_prints_job_targets_and_approve_command(tmp_path: Path) -> None:
     assert f"maintain approve {result.jobId}" in output[0]
 
 
+def test_no_baseline_hook_defers_until_explicit_rebuild(tmp_path: Path) -> None:
+    root, store = _repo(tmp_path / "repo")
+    _commit(root)
+    with store.mutation():
+        maint = MaintenanceStore(root, store)
+        maint.replace_state(dataclasses.replace(maint.read_state(), enabled=True))
+    output = []
+
+    result = process_hook(root, "post-commit", b"", (), store=store, output=output.append)
+
+    state = MaintenanceStore(root, store).read_state()
+    assert result.status == "deferred"
+    assert state.deferredEvents[-1].reasonCode == "maintenance.rebuild-required"
+    assert not state.jobs
+    assert "maintain catch-up --rebuild" in output[0]
+
+
+@pytest.mark.parametrize("hook_name", ["post-merge", "post-rewrite", "post-checkout"])
+def test_completed_git_hook_is_recovered_by_manual_catch_up(tmp_path: Path, capsys, hook_name: str) -> None:
+    root, store = _repo(tmp_path / "repo")
+    baseline = _commit(root, "src.py")
+    with store.mutation():
+        maint = MaintenanceStore(root, store)
+        maint.replace_state(dataclasses.replace(maint.read_state(), appliedBaseline=baseline, enabled=True))
+    base_branch = _git(root, "branch", "--show-current").decode().strip()
+
+    if hook_name == "post-merge":
+        _git(root, "checkout", "-b", "feature")
+        _commit(root, "feature.py")
+        feature_tip = _git(root, "rev-parse", "HEAD").decode().strip()
+        _git(root, "checkout", base_branch)
+        (root / "base.py").write_text("base = 1\n", encoding="utf-8")
+        _git(root, "add", "base.py")
+        _git(root, "commit", "-qm", "base-side")
+        _git(root, "merge", "--no-ff", "feature", "-m", "merge-feature")
+        hook_stdin, hook_argv = b"", ("0",)
+    elif hook_name == "post-checkout":
+        _git(root, "checkout", "-b", "feature")
+        _commit(root, "feature.py")
+        feature_tip = _git(root, "rev-parse", "HEAD").decode().strip()
+        _git(root, "checkout", baseline)
+        _git(root, "checkout", "feature")
+        hook_stdin, hook_argv = b"", (baseline, feature_tip, "1")
+    else:
+        _commit(root, "old.py")
+        old_tip = _git(root, "rev-parse", "HEAD").decode().strip()
+        _git(root, "reset", "--hard", baseline)
+        _commit(root, "rewritten.py")
+        new_tip = _git(root, "rev-parse", "HEAD").decode().strip()
+        hook_stdin, hook_argv = f"{old_tip} {new_tip}\n".encode(), ("rebase",)
+
+    hook_output = []
+    result = process_hook(root, hook_name, hook_stdin, hook_argv, store=store, output=hook_output.append)
+    assert result.status == "pending", hook_output
+    prior_job = MaintenanceStore(root, store).read_job(result.jobId)
+    assert prior_job is not None
+    (root / "recovered.py").write_text("recovered = True\n", encoding="utf-8")
+    _git(root, "add", "recovered.py")
+    _git(root, "commit", "-qm", "recovered without hook")
+    latest = _git(root, "rev-parse", "HEAD").decode().strip()
+
+    code = main(["--root", str(root), "--format", "json", "maintain", "catch-up"])
+    catch_up = json.loads(capsys.readouterr().out.splitlines()[-1])
+
+    assert code == 3
+    assert catch_up["result"]["targetCommit"] == latest
+    state = MaintenanceStore(root, store).read_state()
+    successor_id = next(job_id for job_id, lifecycle in state.jobs.items() if lifecycle.status == "pending")
+    successor = MaintenanceStore(root, store).read_job(successor_id)
+    assert successor is not None and successor.targetCommit == latest
+    assert prior_job.eventIds[0] in successor.eventIds
+    assert state.jobs[result.jobId].status == "stale"
+
+
 def test_hook_budget_failure_prints_catch_up_not_completed_diff(tmp_path: Path, monkeypatch) -> None:
     root, store = _repo(tmp_path / "repo")
     baseline = _commit(root)

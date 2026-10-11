@@ -15,7 +15,7 @@ from typing import Callable, Sequence
 from .git_read import GitReadError, run_git_bounded
 from .ledger import LedgerStore
 from .maintenance_git import (
-    GitReadBudget, MaintenanceGitError, MAX_HOOK_STDIN_BYTES, bootstrap_commit,
+    GitReadBudget, MaintenanceGitError, MAX_HOOK_STDIN_BYTES,
     compare_commits, enqueue_event, parse_hook_event,
 )
 from .maintenance_store import MaintenanceStore
@@ -262,10 +262,13 @@ def process_hook(
             emit(message)
             return HookProcessResult("deferred", message=message)
         baseline = state.appliedBaseline
+        if baseline is None:
+            enqueue_event(store, event, None, "maintenance.rebuild-required", budget=budget)
+            message = "no verified baseline exists; run repo2skill maintain catch-up --rebuild, then review the job"
+            emit(message)
+            return HookProcessResult("deferred", message=message)
         try:
-            impact = bootstrap_commit(root, event.targetCommit, budget=budget) if baseline is None else compare_commits(
-                root, baseline, event.targetCommit, budget=budget,
-            )
+            impact = compare_commits(root, baseline, event.targetCommit, budget=budget)
             job = enqueue_event(store, event, impact, budget=budget)
         except MaintenanceGitError as error:
             enqueue_event(store, event, None, error.code, budget=budget)

@@ -180,7 +180,8 @@ def test_reopen_v10_state_with_maintenance_orphans(tmp_path: Path) -> None:
     path = state_dir / "maintenance" / "jobs"
     path.mkdir(parents=True, exist_ok=True)
     (path / "maintenance-job_0123456789abcdef01234567.json").write_text("{}", encoding="utf-8")
-    assert reopened.read_state().jobs == {}
+    fresh = MaintenanceStore(root, LedgerStore(root, state_dir))
+    assert fresh.read_state().jobs == {}
 
 
 def test_reachable_events_coalesce_without_transferring_approval(tmp_path: Path) -> None:
@@ -308,3 +309,221 @@ def test_queued_successor_refreshes_after_apply_with_new_binding(tmp_path: Path)
     assert refreshed.jobs[successor.jobId].status == "pending"
     assert refreshed.jobs[successor.jobId].approvalBindingHash is None
     assert queued.eventIds[0] in successor.eventIds
+
+
+@pytest.mark.parametrize("scenario", ["reachable-predecessor", "divergent", "missing-baseline"])
+def test_rebuild_projection_is_verified_by_real_worker_before_baseline_moves(
+    tmp_path: Path, capsys, monkeypatch, scenario: str,
+) -> None:
+    from dataclasses import replace
+    from repo2skill import maintenance_worker
+    from repo2skill.config import load_project_document
+    from repo2skill.ids import canonical_record_id
+    from repo2skill.ledger import LedgerStore
+    from repo2skill.maintenance_agent import AgentResponse
+    from repo2skill.maintenance_git import compare_commits, enqueue_event
+    from repo2skill.maintenance_models import GitEvent
+    from repo2skill.maintenance_store import MaintenanceStore
+
+    root = tmp_path / "repo"
+    _initialized(root)
+    original_baseline = _git(root, "rev-parse", "HEAD")
+    _project, state_dir = load_project_document(root, ".repo2skill/project.json")
+    store = LedgerStore(root, state_dir)
+    maintenance = MaintenanceStore(root, store)
+    _invoke(root, capsys, "setup", "--manual-hooks")
+    if scenario != "missing-baseline":
+        with store.mutation():
+            maintenance.replace_state(replace(maintenance.read_state(), appliedBaseline=original_baseline))
+    if scenario == "reachable-predecessor":
+        (root / "src.py").write_text("first = True\n", encoding="utf-8")
+        intermediate = _commit(root, "intermediate source")
+        first_event = GitEvent(
+            canonical_record_id("git-event", {"test": "predecessor", "target": intermediate}),
+            "post-commit", "cursor-predecessor", intermediate,
+        )
+        predecessor = enqueue_event(
+            store, first_event, compare_commits(root, original_baseline, intermediate),
+        )
+        assert predecessor is not None
+        (root / "src.py").write_text("second = True\n", encoding="utf-8")
+        target = _commit(root, "latest source")
+    elif scenario == "divergent":
+        _git(root, "checkout", "--orphan", "rewritten")
+        (root / "fresh.py").write_text("fresh = True\n", encoding="utf-8")
+        target = _commit(root, "divergent rebuild target")
+    else:
+        (root / "fresh.py").write_text("fresh = True\n", encoding="utf-8")
+        target = _commit(root, "initial rebuild target")
+
+    code, queued, _ = _invoke(root, capsys, "catch-up", "--rebuild")
+    assert code == 3
+    assert queued["result"]["targetCommit"] == target
+    job_id = queued["result"]["jobs"][0]["jobId"]
+    job = maintenance.read_job(job_id)
+    assert job is not None
+    assert job.baselineCommit == (None if scenario == "missing-baseline" else original_baseline)
+    assert maintenance.read_state().appliedBaseline == job.baselineCommit
+    context_id = canonical_record_id("source-context", {"contextHash": job.sourceContextHash})
+    context_doc = json.loads(store.read_immutable_bytes(f"maintenance/contexts/{context_id}.json"))
+    assert context_doc["manifest"]["impactProjection"] == "tree-bootstrap"
+    if scenario == "reachable-predecessor":
+        assert maintenance.read_state().jobs[predecessor.jobId].status == "stale"
+        assert first_event.eventId in job.eventIds
+
+    adapter_calls = []
+    run_worker = maintenance_worker.run_worker
+
+    def fake_probe(*_args, **_kwargs):
+        adapter_calls.append("probe")
+        return type("Capability", (), {"supported": True, "executable": None,
+                                        "version": "fixture", "missingCapabilities": ()})()
+
+    def fake_invoke(_capability, request, _timeout):
+        adapter_calls.append("invoke")
+        prompt = json.loads(request.promptBytes)
+        output = json.dumps({"jobId": request.jobId, "snapshotId": prompt["snapshotId"],
+                             "operations": []}, separators=(",", ":")).encode()
+        return AgentResponse("ok", output, None, 0)
+
+    def isolated_worker(*args, **kwargs):
+        return run_worker(*args, probe=fake_probe, invoke=fake_invoke, **kwargs)
+
+    monkeypatch.setattr(maintenance_worker, "run_worker", isolated_worker)
+    code, applied, _ = _invoke(root, capsys, "approve", job_id)
+    assert code == 0, applied["findings"]
+    assert applied["result"]["status"] == "applied"
+    assert adapter_calls == ["probe", "invoke"]
+    final_state = maintenance.read_state()
+    assert final_state.appliedBaseline == target
+    assert final_state.jobs[job_id].status == "applied"
+
+
+def test_net_zero_endpoint_stales_pending_predecessor_without_losing_history(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from repo2skill.config import load_project_document
+    from repo2skill.ledger import LedgerStore
+    from repo2skill.maintenance_git import compare_commits, enqueue_event
+    from repo2skill.maintenance_models import GitEvent
+    from repo2skill.maintenance_store import MaintenanceStore
+
+    root = tmp_path / "repo"
+    _initialized(root)
+    original = b"stable = True\n"
+    (root / "src.py").write_bytes(original)
+    baseline = _commit(root, "baseline source")
+    _project, state_dir = load_project_document(root, ".repo2skill/project.json")
+    store = LedgerStore(root, state_dir)
+    maintenance = MaintenanceStore(root, store)
+    with store.mutation():
+        maintenance.replace_state(replace(maintenance.read_state(), appliedBaseline=baseline, enabled=True))
+    (root / "src.py").write_text("changed = True\n", encoding="utf-8")
+    first_target = _commit(root, "change source")
+    first_event = GitEvent("git-event_666666666666666666666666", "post-commit", "cursor-change", first_target)
+    first = enqueue_event(store, first_event, compare_commits(root, baseline, first_target))
+    assert first is not None
+    (root / "src.py").write_bytes(original)
+    net_zero_target = _commit(root, "revert source")
+    revert_event = GitEvent("git-event_777777777777777777777777", "post-commit", "cursor-revert", net_zero_target)
+
+    replacement = enqueue_event(store, revert_event, compare_commits(root, baseline, net_zero_target))
+
+    assert replacement is None
+    state = maintenance.read_state()
+    assert state.observedEventCursor == revert_event.cursor
+    assert state.jobs[first.jobId].status == "stale"
+    assert state.jobs[first.jobId].approvalBindingHash is None
+    assert maintenance.read_job(first.jobId).eventIds == (first_event.eventId,)
+    assert not any(item.status in {"pending", "approved"} for item in state.jobs.values())
+
+
+def test_coalescing_unions_transient_and_endpoint_scopes(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from repo2skill.config import load_project_document
+    from repo2skill.ledger import LedgerStore
+    from repo2skill.maintenance_git import compare_commits, enqueue_event
+    from repo2skill.maintenance_models import GitEvent
+    from repo2skill.maintenance_store import MaintenanceStore
+
+    root = tmp_path / "repo"
+    _initialized(root)
+    baseline = _git(root, "rev-parse", "HEAD")
+    _project, state_dir = load_project_document(root, ".repo2skill/project.json")
+    store = LedgerStore(root, state_dir)
+    maintenance = MaintenanceStore(root, store)
+    with store.mutation():
+        maintenance.replace_state(replace(maintenance.read_state(), appliedBaseline=baseline, enabled=True))
+    (root / "src.py").write_text("transient = True\n", encoding="utf-8")
+    first_target = _commit(root, "python scope")
+    first_event = GitEvent("git-event_888888888888888888888888", "post-commit", "cursor-scope-1", first_target)
+    first = enqueue_event(store, first_event, compare_commits(root, baseline, first_target))
+    assert first is not None
+    (root / "src.py").unlink()
+    (root / "README.md").write_text("endpoint = True\n", encoding="utf-8")
+    endpoint = _commit(root, "docs scope")
+    second_event = GitEvent("git-event_999999999999999999999999", "post-commit", "cursor-scope-2", endpoint)
+
+    replacement = enqueue_event(store, second_event, compare_commits(root, baseline, endpoint))
+
+    assert replacement is not None
+    assert "python" in first.impactScopes
+    assert "docs" in replacement.impactScopes
+    assert set(first.impactScopes).issubset(replacement.impactScopes)
+
+
+def test_replayed_carried_event_returns_existing_coalesced_job(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from repo2skill.config import load_project_document
+    from repo2skill.ledger import LedgerStore
+    from repo2skill.maintenance_git import compare_commits, enqueue_event
+    from repo2skill.maintenance_models import GitEvent
+    from repo2skill.maintenance_store import MaintenanceStore
+
+    root = tmp_path / "repo"
+    _initialized(root)
+    baseline = _git(root, "rev-parse", "HEAD")
+    _project, state_dir = load_project_document(root, ".repo2skill/project.json")
+    store = LedgerStore(root, state_dir)
+    maintenance = MaintenanceStore(root, store)
+    with store.mutation():
+        maintenance.replace_state(replace(maintenance.read_state(), appliedBaseline=baseline, enabled=True))
+    (root / "src.py").write_text("changed = True\n", encoding="utf-8")
+    target = _commit(root, "same target")
+    impact = compare_commits(root, baseline, target)
+    original = GitEvent("git-event_aaaaaaaaaaaaaaaaaaaaaaaa", "manual-catch-up", "manual:first", target)
+    duplicate = GitEvent("git-event_bbbbbbbbbbbbbbbbbbbbbbbb", "post-commit", "hook:second", target)
+    first = enqueue_event(store, original, impact)
+    assert first is not None
+    replacement = enqueue_event(store, duplicate, impact)
+    assert replacement is not None and original.eventId in replacement.eventIds
+
+    replay = enqueue_event(store, original, impact)
+
+    assert replay == replacement
+    state = maintenance.read_state()
+    assert state.observedEventCursor == duplicate.cursor
+    assert sum(item.status in {"pending", "approved"} for item in state.jobs.values()) == 1
+
+
+@pytest.mark.parametrize("failure", ["cap", "timeout"])
+def test_early_catch_up_git_budget_failures_use_coverage_exit_code(
+    tmp_path: Path, capsys, monkeypatch, failure: str,
+) -> None:
+    import repo2skill.maintenance_git as git_api
+
+    root = tmp_path / "repo"
+    _initialized(root)
+    original_budget = git_api.GitReadBudget
+    if failure == "cap":
+        monkeypatch.setattr(git_api, "GitReadBudget", lambda: original_budget(max_output_bytes=1))
+        reason_code = "maintenance.git-output-cap"
+    else:
+        monkeypatch.setattr(git_api, "GitReadBudget", lambda: original_budget(timeout_seconds=0.000001))
+        reason_code = "maintenance.git-timeout"
+
+    code, payload, _ = _invoke(root, capsys, "catch-up")
+
+    assert code == 2
+    assert payload["findings"][0]["code"] == "maintenance.coverage-required"
+    assert payload["findings"][0]["details"]["reasonCode"] == reason_code
+    assert payload["result"]["appliedBaseline"] is None
