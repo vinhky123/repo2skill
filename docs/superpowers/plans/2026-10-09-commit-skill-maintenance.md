@@ -297,6 +297,11 @@ platform lifecycle. Each task has a focused reviewer gate and its own commit.
 
 ## Handoff
 
-This plan is proposed and unexecuted. Review it together with the design
-before implementation. All command names, records, hooks, and tests in this
-plan describe future behavior until code is delivered.
+Tasks 1–9 were delivered and reviewed in their task commits. Task 10 adds the
+integrated commit-to-approved-apply acceptance test, installed-wheel
+maintenance smoke checks, and durable engineering acceptance and decision
+records. Local verification ran on Windows/Python 3.13.15: 183 focused tests,
+436 full-suite tests with one Windows path-normalization case skipped, a fresh
+wheel and sdist build, and installed-wheel smoke. The other five configured CI
+cells remain unexecuted remotely; no real provider or model behavior was
+exercised. Task 10 review is pending separately.

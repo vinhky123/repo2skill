@@ -15,6 +15,183 @@ def test_apply_module_exposes_recoverable_apply_api() -> None:
     assert callable(recover_apply)
 
 
+def test_commit_to_approved_apply_to_verified_baseline(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Exercise completed hook observation, exact CLI approval, fake agent, and verified export."""
+    import hashlib
+
+    from repo2skill.cli import main
+    from repo2skill.config import load_project_document
+    from repo2skill.ledger import LedgerStore
+    from repo2skill.maintenance_agent import AgentResponse
+    from repo2skill.maintenance_hooks import process_hook
+    from repo2skill.maintenance_models import MaintenancePolicy
+    from repo2skill.maintenance_store import MaintenanceStore
+    from repo2skill import maintenance_worker
+    from repo2skill import maintenance_hooks
+    from repo2skill.maintenance_approval import configure_auto_approval
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(root), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    (root / "src.py").write_text("print('baseline')\n", encoding="utf-8")
+    git("add", "src.py")
+    git("commit", "-qm", "baseline")
+    baseline = git("rev-parse", "HEAD")
+
+    assert main(["--root", str(root), "init", "--target", "agents-md", "--format", "json"]) == 0
+    capsys.readouterr()
+    assert main(["--root", str(root), "scan", "--format", "json"]) == 0
+    capsys.readouterr()
+    assert main(["--root", str(root), "generate", "--no-ai", "--target", "agents-md",
+                 "--format", "json"]) == 0
+    capsys.readouterr()
+    assert main(["--root", str(root), "export", "--target", "agents-md", "--format", "json"]) == 0
+    capsys.readouterr()
+
+    project, state_dir = load_project_document(root, ".repo2skill/project.json")
+    store = LedgerStore(root, state_dir)
+    maintenance = MaintenanceStore(root, store)
+    with store.mutation():
+        maintenance.replace_state(dataclasses.replace(
+            maintenance.read_state(), enabled=True, appliedBaseline=baseline,
+            policy=MaintenancePolicy("ask", 1, ("agents-md",)),
+        ))
+
+    output_path = root / "AGENTS.md"
+    previous_bytes = output_path.read_bytes()
+    begin_marker = b"<!-- repo2skill:"
+    assert begin_marker in previous_bytes, previous_bytes
+    human_prefix = b"Human preface\n"
+    human_suffix = b"Human suffix\n"
+    output_path.write_bytes(human_prefix + previous_bytes + human_suffix)
+
+    (root / "src.py").write_text("print('committed target')\n", encoding="utf-8")
+    git("add", "src.py")
+    git("commit", "-qm", "target")
+    target = git("rev-parse", "HEAD")
+    hook_output: list[str] = []
+    observed = process_hook(root, "post-commit", b"", (), store=store, output=hook_output.append)
+    assert observed.status == "pending", hook_output
+    job = maintenance.read_job(observed.jobId)
+    assert job is not None and job.targetCommit == target
+    assert job.eventIds
+
+    # Replace the adapter boundary before CLI approval can enter the worker.
+    calls: list[str] = []
+    run_worker = maintenance_worker.run_worker
+
+    def fake_probe(*_args, **_kwargs):
+        calls.append("probe")
+        return type("FakeCapability", (), {"supported": True})()
+
+    def fake_invoke(_capability, request, _timeout):
+        calls.append("invoke")
+        prompt = json.loads(request.promptBytes.decode("utf-8"))
+        fact = next(item for item in prompt["facts"] if item["factType"] == "source.fragment.v1")
+        prior = prompt["priorClaims"]
+        operation = {
+            "op": "update" if prior else "add",
+            "semanticKey": "maintenance:source-guidance:python",
+            "scope": fact["scope"],
+            "renderedText": "The committed Python source prints a message.",
+            "factIds": [fact["factId"]],
+            "evidenceIds": sorted(fact["evidenceIds"]),
+            "claimRef": (f"{prior[0]['claimId']}@{prior[0]['claimRevision']}" if prior else None),
+        }
+        response = {"jobId": prompt["jobId"], "snapshotId": prompt["snapshotId"],
+                    "operations": [operation]}
+        return AgentResponse("ok", json.dumps(response, separators=(",", ":")).encode(), None)
+
+    def isolated_worker(*args, **kwargs):
+        return run_worker(*args, probe=fake_probe, invoke=fake_invoke, **kwargs)
+
+    first_baseline_seen: list[str] = []
+    late_event_jobs: list[str] = []
+    late_pending_authorizations: list[tuple[str | None, str | None]] = []
+    launch_requests: list[Path] = []
+    real_run_one = maintenance_worker._run_one
+
+    def interposed_run_one(*args, **kwargs):
+        result = real_run_one(*args, **kwargs)
+        if result.status == "applied" and not late_event_jobs:
+                # The first baseline is already verified. Observe a later commit while
+                # the same OS lease is held and record the hidden-worker handoff.
+            first_baseline_seen.append(maintenance.read_state().appliedBaseline)
+            configure_auto_approval(store)
+            (root / "src.py").write_text("print('queued successor')\n", encoding="utf-8")
+            git("add", "src.py")
+            git("commit", "-qm", "queued successor")
+            successor_target = git("rev-parse", "HEAD")
+            late_result = process_hook(root, "post-commit", b"", (), store=store,
+                                       output=hook_output.append)
+            assert late_result.status == "pending"
+            assert maintenance.read_job(late_result.jobId).targetCommit == successor_target
+            late_event_jobs.append(late_result.jobId)
+        return result
+
+    def hidden_launch(_root, *, state_dir):
+        current_state = maintenance.read_state()
+        late_id = next(job_id for job_id, lifecycle in current_state.jobs.items()
+                       if lifecycle.status == "pending"
+                       and maintenance.read_job(job_id).targetCommit == git("rev-parse", "HEAD"))
+        lifecycle = current_state.jobs[late_id]
+        late_pending_authorizations.append((lifecycle.approvalSource, lifecycle.approvalBindingHash))
+        launch_requests.append(Path(state_dir))
+
+    monkeypatch.setattr(maintenance_worker, "_run_one", interposed_run_one)
+    monkeypatch.setattr(maintenance_hooks, "launch_worker", hidden_launch)
+    monkeypatch.setattr(maintenance_worker, "run_worker", isolated_worker)
+    assert main(["--root", str(root), "--format", "json", "maintain", "approve", job.jobId]) == 0
+    approval_output = capsys.readouterr().out
+    assert json.loads(approval_output.splitlines()[-1])["result"]["status"] == "applied"
+
+    assert first_baseline_seen == [target]
+    # The hidden-launch request was issued while the foreground worker held its
+    # lease. Drain the durable auto-eligible event after that lease is released.
+    assert launch_requests == [state_dir]
+    successor_result = run_worker(
+        store, auto_drain=True, wait_budget_seconds=0, probe=fake_probe, invoke=fake_invoke,
+    )
+    assert successor_result.status == "idle"  # auto-drain applied the successor, then found no more work
+    final_state = maintenance.read_state()
+    successor_id = late_event_jobs[0]
+    successor = maintenance.read_job(successor_id)
+    assert successor is not None and final_state.jobs[successor_id].status == "applied"
+    assert successor.targetCommit == git("rev-parse", "HEAD")
+    assert late_pending_authorizations == [(None, None)]
+    assert final_state.jobs[successor_id].approvalSource == "auto"
+    assert final_state.appliedBaseline == successor.targetCommit
+    p0_state = store.read_state()
+    assert p0_state is not None and p0_state.activeManifestSetId is not None
+    manifest_set = store.read_manifest_set(
+        f"manifests/{p0_state.activeExportId}/{p0_state.activeManifestSetId}.json"
+    )
+    assert manifest_set is not None and manifest_set.targets
+    for reference in manifest_set.targets.values():
+        manifest = store.read_target_manifest(reference.path)
+        assert manifest is not None
+        for output_file in manifest.files:
+            live = (root / output_file.path).read_bytes()
+            assert "sha256:" + hashlib.sha256(live).hexdigest() == output_file.exactHash
+    final_bytes = output_path.read_bytes()
+    assert final_bytes.startswith(human_prefix)
+    assert final_bytes.endswith(human_suffix)
+    assert b"The committed Python source prints a message." in final_bytes
+    applied_run = store.read_run(p0_state.currentRunId)
+    assert applied_run is not None
+    accepted = [claim for claim in applied_run.claims
+                if claim.origin == "llm" and claim.proposalStatus == "accepted"]
+    assert len(accepted) == 1
+    assert calls == ["probe", "invoke", "probe", "invoke"]
+
+
 @pytest.mark.parametrize("scenario", [
     "responded-recovery", "post-baseline-crash", "explicit-retry",
     "disable-mid-call", "finalization-p0-race", "accepted-claim",

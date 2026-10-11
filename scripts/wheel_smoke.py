@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -53,6 +54,30 @@ def main() -> int:
         )
         subprocess.run([str(executable), "--help"], cwd=temporary_root, env=environment, check=True)
         subprocess.run([str(executable), "--version"], cwd=temporary_root, env=environment, check=True)
+        for command in ("setup", "disable", "status", "catch-up", "approve", "retry", "skip"):
+            subprocess.run(
+                [str(executable), "maintain", command, "--help"],
+                cwd=temporary_root, env=environment, check=True,
+                stdout=subprocess.DEVNULL,
+            )
+        maintenance_fixture = temporary_root / "maintenance-fixture"
+        maintenance_fixture.mkdir()
+        status = subprocess.run(
+            [str(executable), "--root", str(maintenance_fixture), "--format", "json",
+             "maintain", "status"],
+            cwd=temporary_root, env=environment, capture_output=True, text=True, check=False,
+        )
+        if status.returncode != 4:
+            raise AssertionError(
+                f"empty-fixture maintain status returned {status.returncode}: {status.stderr}"
+            )
+        payload = json.loads(status.stdout)
+        if (payload.get("command") != "maintain status"
+                or not any(item.get("code") == "maintenance.rebuild-required"
+                           for item in payload.get("findings", ()))):
+            raise AssertionError("empty-fixture maintain status did not report rebuild-required")
+        if (maintenance_fixture / ".repo2skill").exists():
+            raise AssertionError("read-only maintain status created project state")
         subprocess.run(
             [
                 str(python),
