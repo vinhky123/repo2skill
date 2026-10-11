@@ -25,4 +25,4 @@ repo2skill --help
 
 Do not claim platform coverage from configuration alone. Report the command, platform, Python version, and actual result. Integration fixtures are synthetic and hermetic: tests must not access a model or network, execute repository-provided scripts, or include real secrets. Update the upstream source map whenever an upstream rule or file is adapted; preserve the pinned commit and full MIT notice.
 
-Use each human contributor's own configured Git identity as the commit author. For work assisted by OpenAI Codex, record it with the commit trailer `Assisted-by: OpenAI Codex`; do not invent an email address or account for the tool.
+Use each human contributor's own configured Git identity as the commit author. For Codex-assisted commits, keep the human as primary author and add the trailer `Co-authored-by: Codex <codex@openai.com>` to credit [Codex's GitHub profile](https://github.com/codex). An `Assisted-by` trailer may be added as extra context, but does not replace the coauthor trailer.
