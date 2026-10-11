@@ -117,6 +117,90 @@ def test_worker_lease_rejects_redirected_lock_without_touching_target(tmp_path: 
     assert calls == []
 
 
+def test_live_windows_lease_contention_waits_then_drains_without_replacing_lock(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import os
+    import pytest
+    from repo2skill import maintenance_worker
+    from repo2skill.maintenance_approval import configure_auto_approval
+    from repo2skill.maintenance_worker import WorkerResult
+
+    if os.name != "nt":
+        pytest.skip("native Windows byte-range contention regression")
+    root, store = _store(tmp_path / "repo")
+    job_id = _approved_job(store)
+    maint = MaintenanceStore(root, store)
+    grant = configure_auto_approval(store)
+    with store.mutation():
+        state = maint.read_state()
+        jobs = dict(state.jobs)
+        jobs[job_id] = dataclasses.replace(
+            jobs[job_id], status="pending", approvalSource=None,
+            approvalBindingHash=None, queuedGrantRevision=grant.policy.grantRevision,
+        )
+        maint.replace_state(dataclasses.replace(state, jobs=jobs))
+
+    lock_path = store.state_dir / "maintenance" / "worker.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"\0")
+    identity = lock_path.stat()
+    ready = multiprocessing.Event()
+    release = multiprocessing.Event()
+    owner = multiprocessing.Process(target=_hold_lease, args=(str(root), ready, release))
+    owner.start()
+    assert ready.wait(10)
+    calls = []
+    ran = []
+
+    def fake_probe(*_args, **_kwargs):
+        calls.append("probe")
+        return type("DeniedCapability", (), {"supported": False})()
+
+    def fake_invoke(*_args, **_kwargs):
+        calls.append("invoke")
+        raise AssertionError("lease fixture must never invoke a provider")
+
+    def fake_run_one(ledger, selected, **_kwargs):
+        ran.append(selected)
+        with ledger.mutation():
+            state = maint.read_state()
+            jobs = dict(state.jobs)
+            jobs[selected] = dataclasses.replace(jobs[selected], status="applied")
+            maint.replace_state(dataclasses.replace(
+                state, jobs=jobs, appliedBaseline=maint.read_job(selected).targetCommit,
+            ))
+        return WorkerResult("applied", selected, "fake drain")
+
+    monkeypatch.setattr(maintenance_worker, "_run_one", fake_run_one)
+    sleeps = []
+
+    def release_after_busy(seconds):
+        sleeps.append(seconds)
+        release.set()
+        owner.join(10)
+        assert owner.exitcode == 0
+
+    try:
+        result = maintenance_worker.run_worker(
+            store, auto_drain=True, wait_budget_seconds=2,
+            sleep=release_after_busy, retry_delay=lambda _attempt: 0.01,
+            probe=fake_probe, invoke=fake_invoke,
+        )
+    finally:
+        release.set()
+        owner.join(10)
+    assert result.status == "idle"
+    assert sleeps == [0.01]
+    assert ran == [job_id]
+    assert calls == []
+    after_identity = lock_path.stat()
+    assert (after_identity.st_dev, after_identity.st_ino, after_identity.st_size) == (
+        identity.st_dev, identity.st_ino, identity.st_size,
+    )
+    assert lock_path.read_bytes() == b"\0"
+
+
 def test_worker_lease_rejects_redirected_maintenance_directory(tmp_path: Path) -> None:
     import os
     import subprocess

@@ -208,20 +208,21 @@ def _exit_code(findings: Sequence[Finding]) -> int:
 
 
 def _superseded_resolved(state, job_id: str, lifecycle) -> bool:
-    if lifecycle.resolutionReason == "no-impact":
-        return True
-    seen = {job_id}
-    successor_id = lifecycle.supersededByJobId
-    while successor_id is not None and successor_id not in seen:
-        seen.add(successor_id)
-        successor = state.jobs.get(successor_id)
-        if successor is None:
+    seen: set[str] = set()
+    current_id = job_id
+    while current_id not in seen:
+        seen.add(current_id)
+        current = state.jobs.get(current_id)
+        if current is None:
             return False
-        if successor.status == "applied":
+        if current.resolutionReason == "no-impact" or current.status == "applied":
             return True
-        if successor.status != "stale":
+        if current.status != "stale":
             return False
-        successor_id = successor.supersededByJobId
+        successor_id = current.supersededByJobId
+        if successor_id is None:
+            return False
+        current_id = successor_id
     return False
 
 

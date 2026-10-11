@@ -232,7 +232,8 @@ def test_commit_to_approved_apply_to_verified_baseline(
     "authorization-missing-for-new-model", "authorization-extra-accepted-ref",
     "authorization-export-mismatch", "authorization-resume-mismatch",
     "disable-after-probe", "move-head-after-probe", "grant-revoked-after-probe",
-    "deferred-no-baseline", "deferred-interval",
+    "deferred-no-baseline", "deferred-interval", "deferred-shared-budget", "deferred-stale-proof",
+    "authorization-after-export-crash",
 ])
 def test_responded_attempt_recovery_and_explicit_retry(
     tmp_path: Path, monkeypatch, capsys, scenario: str,
@@ -284,7 +285,7 @@ def test_responded_attempt_recovery_and_explicit_retry(
         maint.replace_state(dataclasses.replace(maint.read_state(), enabled=True,
                                                 policy=MaintenancePolicy("ask", 1, ("skill",))))
 
-    if scenario == "deferred-interval":
+    if scenario in {"deferred-interval", "deferred-shared-budget", "deferred-stale-proof"}:
         with store.mutation():
             maint.replace_state(dataclasses.replace(maint.read_state(), appliedBaseline=base_commit))
         (root / "src.py").write_text("print('intermediate')\n", encoding="utf-8")
@@ -297,6 +298,18 @@ def test_responded_attempt_recovery_and_explicit_retry(
         monkeypatch.setattr(maintenance_git, "MAX_CONTEXT_FILE_BYTES", 1)
         assert enqueue_event(store, deferred_event, compare_commits(root, base_commit, intermediate)) is None
         assert maint.read_state().deferredEvents[0].targetCommit == intermediate
+        if scenario == "deferred-shared-budget":
+            (root / "src.py").write_text("print('intermediate two')\n", encoding="utf-8")
+            git("add", "src.py")
+            git("commit", "-qm", "intermediate two")
+            intermediate_two = git("rev-parse", "HEAD")
+            second_deferred = GitEvent(
+                "git-event_2223456789abcdef01234567", "post-commit", "cursor-intermediate-two",
+                intermediate_two,
+            )
+            assert enqueue_event(
+                store, second_deferred, compare_commits(root, base_commit, intermediate_two),
+            ) is None
         monkeypatch.setattr(maintenance_git, "MAX_CONTEXT_FILE_BYTES", 1024 * 1024)
     elif scenario == "deferred-no-baseline":
         with store.mutation():
@@ -313,7 +326,7 @@ def test_responded_attempt_recovery_and_explicit_retry(
                                  "manual:rebuild-target", target)
         job = enqueue_event(store, rebuild_event, bootstrap_commit(root, target),
                             allow_baseline_bootstrap=True, impact_projection="tree-bootstrap")
-    elif scenario == "deferred-interval":
+    elif scenario in {"deferred-interval", "deferred-shared-budget", "deferred-stale-proof"}:
         job = enqueue_event(store, event, compare_commits(root, base_commit, target))
     else:
         job = enqueue_event(store, event, bootstrap_commit(root, target), allow_baseline_bootstrap=True)
@@ -371,7 +384,7 @@ def test_responded_attempt_recovery_and_explicit_retry(
             return original_persist(ledger, journal)
 
         monkeypatch.setattr(maintenance_apply, "_persist_apply_journal", fail_first_applied_phase)
-    if scenario == "export-before-baseline-crash":
+    if scenario in {"export-before-baseline-crash", "authorization-after-export-crash"}:
         from repo2skill import maintenance_apply
         original_persist = maintenance_apply._persist_apply_journal
         crash_once = [True]
@@ -379,6 +392,12 @@ def test_responded_attempt_recovery_and_explicit_retry(
         def fail_exported_phase(ledger, journal):
             if journal.status == "exported" and crash_once[0]:
                 crash_once[0] = False
+                if scenario == "authorization-after-export-crash":
+                    active = maint.read_state().jobs[job.jobId].activeAttemptId
+                    assert active is not None
+                    response_path = (store.state_dir / "maintenance" / "attempts"
+                                     / active / "response.bin")
+                    response_path.write_bytes(b"corrupt-after-export")
                 raise OSError("simulated interruption after export pointer")
             return original_persist(ledger, journal)
 
@@ -504,6 +523,65 @@ def test_responded_attempt_recovery_and_explicit_retry(
             return AgentResponse("nonzero-exit", b"", "fake CLI failed", 17)
         return AgentResponse("ok", response_bytes, None)
 
+    if scenario == "deferred-shared-budget":
+        from repo2skill import maintenance_apply, maintenance_context, maintenance_git
+        from repo2skill.maintenance_git import MaintenanceGitError
+        ancestry_calls = []
+        original_proves_ancestor = maintenance_git._proves_ancestor
+        original_plan = maintenance_apply._plan_deferred_resolutions
+        manifest_reads = []
+
+        def count_manifest_for_plan(ledger, planned_job, events):
+            original_manifest = maintenance_context._context_manifest
+
+            def counted_manifest(*args, **kwargs):
+                manifest_reads.append(True)
+                return original_manifest(*args, **kwargs)
+
+            monkeypatch.setattr(maintenance_context, "_context_manifest", counted_manifest)
+            try:
+                return original_plan(ledger, planned_job, events)
+            finally:
+                monkeypatch.setattr(maintenance_context, "_context_manifest", original_manifest)
+
+        def expire_shared_budget(repo_root, ancestor, descendant, budget):
+            ancestry_calls.append((store._mutation_active, id(budget)))
+            if len(ancestry_calls) == 3:
+                raise MaintenanceGitError("maintenance.git-timeout", "injected shared deadline")
+            return original_proves_ancestor(repo_root, ancestor, descendant, budget)
+
+        monkeypatch.setattr(maintenance_git, "_proves_ancestor", expire_shared_budget)
+        monkeypatch.setattr(maintenance_apply, "_plan_deferred_resolutions", count_manifest_for_plan)
+    if scenario == "deferred-stale-proof":
+        from repo2skill import maintenance_apply, maintenance_worker
+        from repo2skill.maintenance_worker import WorkerResult
+        original_plan = maintenance_apply._plan_deferred_resolutions
+        mutated = [False]
+        proof_baselines = []
+
+        def append_after_proof(ledger, planned_job, events):
+            proof_baselines.append(maint.read_state().appliedBaseline)
+            proofs = original_plan(ledger, planned_job, events)
+            if not mutated[0]:
+                mutated[0] = True
+                new_event = GitEvent(
+                    "git-event_2323456789abcdef01234567", "post-commit", "cursor-arrived-during-proof",
+                    target,
+                )
+                with ledger.mutation():
+                    current = maint.read_state()
+                    maint.replace_state(dataclasses.replace(
+                        current, deferredEvents=(*current.deferredEvents, new_event),
+                    ))
+                assert len(maint.read_state().deferredEvents) == len(events) + 1
+            return proofs
+
+        monkeypatch.setattr(maintenance_apply, "_plan_deferred_resolutions", append_after_proof)
+        monkeypatch.setattr(
+            maintenance_worker, "_recover_apply_after_error",
+            lambda *_args, **_kwargs: WorkerResult("failed", job.jobId, "stale deferred proof"),
+        )
+
     initial_p0 = store.read_state()
     queued = []
 
@@ -513,16 +591,21 @@ def test_responded_attempt_recovery_and_explicit_retry(
         probe=fake_probe,
         invoke=fake_invoke,
     )
+    if scenario == "deferred-stale-proof":
+        assert mutated == [True], (result, maint.read_state().deferredEvents)
+        assert proof_baselines == [base_commit], proof_baselines
 
     if scenario in {"disable-mid-call", "disable-after-probe", "move-head-after-probe",
                     "grant-revoked-after-probe",
                     "finalization-p0-race", "move-head-queue", "failed-agent",
                     "move-head-after-stage", "authorization-response-mismatch",
                     "authorization-missing-for-new-model", "authorization-extra-accepted-ref",
-                    "authorization-export-mismatch", "authorization-resume-mismatch"}:
+                    "authorization-export-mismatch", "authorization-resume-mismatch",
+                    "authorization-after-export-crash", "deferred-stale-proof"}:
         assert result.status != "applied", result.message
         after = store.read_state()
-        assert MaintenanceStore(root, store).read_state().appliedBaseline is None
+        expected_prior_baseline = base_commit if scenario == "deferred-stale-proof" else None
+        assert MaintenanceStore(root, store).read_state().appliedBaseline == expected_prior_baseline
         if scenario == "disable-mid-call":
             assert calls == ["probe", "invoke"]
             assert MaintenanceStore(root, store).read_state().enabled is False
@@ -581,6 +664,51 @@ def test_responded_attempt_recovery_and_explicit_retry(
             assert not (root / "AGENTS.md").exists()
             assert not (root / ".agents").exists()
             assert calls == []
+        elif scenario == "authorization-after-export-crash":
+            assert after.currentRunId != initial_p0.currentRunId
+            assert after.activeExportId is not None
+            assert after.activeManifestSetId is not None
+            assert MaintenanceStore(root, store).read_state().appliedBaseline is None
+            assert calls == []
+            from repo2skill.maintenance_apply import _read_apply_journal
+            from repo2skill.maintenance_models import CommittedSourceGuard
+            from repo2skill.models import RepositoryIdentity
+            from repo2skill.ownership import resume_export
+
+            intent = _read_apply_journal(store, job.jobId)
+            assert intent is not None and intent.exportId is not None
+            run = store.read_run(intent.intendedRunId)
+            assert run is not None
+            recovery_guard = CommittedSourceGuard(
+                job.jobId, job.targetCommit, job.sourceContextHash, job.policyRevision,
+                run.applicationAuthorizationId,
+            )
+            identity = RepositoryIdentity(run.snapshot.repositoryId, root, "head", job.targetCommit,
+                                          run.snapshot.branch, False, {})
+            resume_args = dict(
+                store=store, current_identity=identity, current_root_label=project.rootLabel,
+                current_policy_revision=job.policyRevision, current_extractor_versions={},
+                excluded_paths=(), source_guard=recovery_guard,
+            )
+            with pytest.raises(ValueError, match="application authorization|durable response|attempt response blob"):
+                with store.mutation():
+                    resume_export(intent.exportId, {}, **resume_args)
+
+            real_read_journal = store.read_export_journal
+            def report_active_incomplete_journal(path):
+                journal = real_read_journal(path)
+                if path == f"exports/{intent.exportId}.json" and journal is not None:
+                    return dataclasses.replace(journal, status="incomplete")
+                return journal
+            monkeypatch.setattr(store, "read_export_journal", report_active_incomplete_journal)
+            with pytest.raises(ValueError, match="application authorization|durable response|attempt response blob"):
+                with store.mutation():
+                    resume_export(intent.exportId, {}, **resume_args)
+        elif scenario == "deferred-stale-proof":
+            assert mutated == [True]
+            assert len(maint.read_state().deferredEvents) == 2
+            assert maint.read_state().appliedBaseline == base_commit
+            assert result.status == "failed"
         else:
             assert after.currentRunId == initial_p0.currentRunId
             assert after.activeExportId == initial_p0.activeExportId
@@ -626,6 +754,14 @@ def test_responded_attempt_recovery_and_explicit_retry(
         assert code == 0
         assert status["result"]["deferredEvents"] == []
         assert status["result"]["resolvedDeferredEvents"][0]["resolvedByJobId"] == job.jobId
+    if scenario == "deferred-shared-budget":
+        assert len(ancestry_calls) == 3
+        assert all(not under_mutation for under_mutation, _budget in ancestry_calls)
+        assert len({budget for _mutation, budget in ancestry_calls}) == 1
+        assert len(manifest_reads) == 1
+        pending = maint.read_state().deferredEvents
+        assert len(pending) == 1
+        assert pending[0].targetCommit != job.targetCommit
     if scenario == "accepted-claim":
         applied_state = store.read_state()
         applied_run = store.read_run(applied_state.currentRunId)

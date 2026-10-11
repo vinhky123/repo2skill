@@ -753,16 +753,28 @@ def resume_export(
     state = store.read_state()
     if state is None:
         raise FileNotFoundError("project state is required")
+
+    def verify_machine_recovery_authority() -> None:
+        if source_guard is None:
+            return
+        run = store.read_run(journal.runId)
+        if run is None or run.applicationAuthorizationId != source_guard.authorizationId:
+            raise ValueError("resumed export run differs from its exact application authorization")
+        from .maintenance_context import verify_application_authorization
+        verify_application_authorization(store, run)
+
     if journal.status == "committed":
         if source_guard is not None:
             from .maintenance_context import recheck_committed_source
             recheck_committed_source(store, source_guard)
+            verify_machine_recovery_authority()
         return _result(journal)
     store.require_no_unresolved_export(resume_export_id=export_id)
     if state.activeExportId == journal.exportId and state.activeManifestSetId == journal.manifestSetId:
         if source_guard is not None:
             from .maintenance_context import recheck_committed_source
             recheck_committed_source(store, source_guard)
+            verify_machine_recovery_authority()
         manifest_set = store.read_manifest_set(f"manifests/{journal.exportId}/{journal.manifestSetId}.json") if journal.manifestSetId else None
         if (manifest_set is None or manifest_set.exportId != journal.exportId
                 or manifest_set.manifestSetId != journal.manifestSetId):

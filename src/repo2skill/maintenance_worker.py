@@ -40,11 +40,12 @@ def _worker_lease(root: Path, *, state_dir: Path | None = None) -> Iterator[None
         raise ValueError("worker state directory must be inside project root") from error
     store = LedgerStore(root, state_dir)
     with store.mutation():
-        existing = store.read_immutable_bytes("maintenance/worker.lock")
-        if existing is None:
+        try:
             store.write_immutable_bytes("maintenance/worker.lock", b"\0")
-        elif existing != b"\0":
-            raise ValueError("maintenance worker lease file has invalid contents")
+        except FileExistsError:
+            # Do not read the lock byte until its OS lease is held: on Windows
+            # another process's byte-range lock also denies this preliminary read.
+            pass
     guards = []
     opened = None
     try:
@@ -59,6 +60,7 @@ def _worker_lease(root: Path, *, state_dir: Path | None = None) -> Iterator[None
         if opened.stat_before.st_size != 1:
             raise ValueError("maintenance worker lease file has invalid size")
         descriptor = opened._descriptor
+        os.lseek(descriptor, 0, os.SEEK_SET)
         if os.name == "nt":
             import msvcrt
             try:
@@ -72,10 +74,14 @@ def _worker_lease(root: Path, *, state_dir: Path | None = None) -> Iterator[None
             except OSError as error:
                 raise LockBusyError("maintenance worker lease is held") from error
         try:
+            payload = opened.read_bounded(1)
+            if payload != b"\0" or not opened.stable_after_read():
+                raise ValueError("maintenance worker lease file has invalid contents")
             yield
         finally:
             if os.name == "nt":
                 import msvcrt
+                os.lseek(descriptor, 0, os.SEEK_SET)
                 msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl

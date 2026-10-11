@@ -48,13 +48,10 @@ def _prefix(job_id: str) -> str:
     return f"maintenance/apply/{job_id}"
 
 
-def _deferred_resolution(store: LedgerStore, job: MaintenanceJob, event) -> str | None:
-    from .maintenance_context import _context_manifest
-    from .maintenance_git import GitReadBudget, MaintenanceGitError, _proves_ancestor
+def _deferred_resolution(store: LedgerStore, job: MaintenanceJob, event, manifest, budget) -> str | None:
+    from .maintenance_git import MaintenanceGitError, _proves_ancestor
 
-    budget = GitReadBudget()
     try:
-        manifest = _context_manifest(store, job)
         tree_bootstrap = manifest.get("impactProjection") == "tree-bootstrap"
         if tree_bootstrap and _proves_ancestor(store.root, event.targetCommit, job.targetCommit, budget):
             return "covered-by-tree-bootstrap"
@@ -68,6 +65,34 @@ def _deferred_resolution(store: LedgerStore, job: MaintenanceJob, event) -> str 
     except (MaintenanceGitError, ValueError, OSError):
         return None
     return None
+
+
+_MAX_DEFERRED_RESOLUTION_CANDIDATES = 32
+
+
+def _plan_deferred_resolutions(store: LedgerStore, job: MaintenanceJob, events):
+    """Prove a bounded deferred-event prefix without holding the ledger mutation."""
+    from .maintenance_context import _context_manifest
+    from .maintenance_git import GitReadBudget, MaintenanceGitError
+
+    candidates = tuple(events[:_MAX_DEFERRED_RESOLUTION_CANDIDATES])
+    if not candidates:
+        return tuple()
+    budget = GitReadBudget()
+    try:
+        manifest = _context_manifest(store, job)
+    except (MaintenanceGitError, ValueError, OSError):
+        return tuple((event, None) for event in candidates)
+    resolutions = []
+    for event in candidates:
+        # One shared deadline/output allowance covers the entire candidate batch.
+        try:
+            budget.limits(1)
+        except MaintenanceGitError:
+            resolutions.append((event, None))
+            break
+        resolutions.append((event, _deferred_resolution(store, job, event, manifest, budget)))
+    return tuple(resolutions)
 
 
 def _read_apply_journal(store: LedgerStore, job_id: str) -> ApplyJournal | None:
@@ -154,6 +179,11 @@ def _verify_active_apply(store: LedgerStore, intent: ApplyJournal):
 def _finalize(store: LedgerStore, job: MaintenanceJob, intent: ApplyJournal, guard: CommittedSourceGuard) -> str:
     from .maintenance_approval import verify_approval_binding
     maintenance = MaintenanceStore(store.root, store)
+    proof_snapshot = maintenance.read_state()
+    if proof_snapshot is None:
+        raise ValueError("maintenance state disappeared before deferred resolution")
+    captured_deferred = proof_snapshot.deferredEvents
+    deferred_proofs = _plan_deferred_resolutions(store, job, captured_deferred)
     with store.mutation():
         current = maintenance.read_state()
         lifecycle = current.jobs.get(job.jobId)
@@ -169,14 +199,22 @@ def _finalize(store: LedgerStore, job: MaintenanceJob, intent: ApplyJournal, gua
         # Recheck authorization/source while holding the same ledger lock as the baseline pointer.
         recheck_committed_source(store, guard)
         verify_approval_binding(store, job, lifecycle)
+        run = store.read_run(intent.intendedRunId)
+        if run is None or run.applicationAuthorizationId != guard.authorizationId:
+            raise ValueError("intended run does not match the exact application authorization")
+        from .maintenance_context import verify_application_authorization
+        verify_application_authorization(store, run)
         _verify_active_apply(store, intent)
         current = maintenance.read_state()
         lifecycle = current.jobs.get(job.jobId)
         if lifecycle is None:
             raise ValueError("maintenance lifecycle disappeared during finalization")
+        if current.deferredEvents != captured_deferred:
+            raise ValueError("deferred-event proof changed before baseline finalization")
         jobs = dict(current.jobs)
         jobs[job.jobId] = replace(lifecycle, status="applied", failureCode=None)
-        covered_deferred = tuple((item, _deferred_resolution(store, job, item))
+        proof_by_id = {item.eventId: resolution for item, resolution in deferred_proofs}
+        covered_deferred = tuple((item, proof_by_id.get(item.eventId))
                                  for item in current.deferredEvents)
         resolved_deferred = tuple(item for item, resolution in covered_deferred if resolution is None)
         resolved_history = current.resolvedDeferredEvents + tuple(

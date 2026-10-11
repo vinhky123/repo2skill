@@ -458,6 +458,104 @@ def test_status_resolves_applied_supersession_but_keeps_unrelated_stale(tmp_path
     assert [item["details"]["jobId"] for item in payload["findings"]] == [unrelated_id]
 
 
+def test_real_noimpact_supersession_chain_resolves_through_catch_up_but_keeps_bad_successors(
+    tmp_path: Path, capsys,
+) -> None:
+    from repo2skill.maintenance_git import compare_commits, enqueue_event
+    from repo2skill.maintenance_models import GitEvent
+
+    root = tmp_path / "repo"
+    ledger, maint = _repo(root)
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(root), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    (root / "src.py").write_text("baseline\n", encoding="utf-8")
+    git("add", "src.py")
+    git("commit", "-qm", "B")
+    baseline = git("rev-parse", "HEAD")
+    with ledger.mutation():
+        maint.replace_state(dataclasses.replace(maint.read_state(), enabled=True, appliedBaseline=baseline))
+
+    (root / "src.py").write_text("change C\n", encoding="utf-8")
+    git("add", "src.py")
+    git("commit", "-qm", "C")
+    commit_c = git("rev-parse", "HEAD")
+    event_c = GitEvent("git-event_3123456789abcdef01234567", "post-commit", "cursor-C", commit_c)
+    first = enqueue_event(ledger, event_c, compare_commits(root, baseline, commit_c))
+    assert first is not None
+
+    (root / "src.py").write_text("change D\n", encoding="utf-8")
+    git("add", "src.py")
+    git("commit", "-qm", "D")
+    commit_d = git("rev-parse", "HEAD")
+    event_d = GitEvent("git-event_4123456789abcdef01234567", "post-commit", "cursor-D", commit_d)
+    second = enqueue_event(ledger, event_d, compare_commits(root, baseline, commit_d))
+    assert second is not None and second.jobId != first.jobId
+    assert maint.read_state().jobs[first.jobId].supersededByJobId == second.jobId
+
+    (root / "src.py").write_text("baseline\n", encoding="utf-8")
+    git("add", "src.py")
+    git("commit", "-qm", "E restores B's relevant tree")
+    commit_e = git("rev-parse", "HEAD")
+
+    # This invokes real catch-up and its verified empty-impact branch.
+    code, payload, _stderr = _invoke(root, capsys, "catch-up")
+
+    assert code == 0, payload
+    assert payload["result"]["jobs"] == []
+    state = maint.read_state()
+    assert state.jobs[second.jobId].resolutionReason == "no-impact"
+    assert state.appliedBaseline == baseline
+
+    unrelated_id = "maintenance-job_5123456789abcdef01234567"
+    missing_id = "maintenance-job_6123456789abcdef01234567"
+    cycle_a_id = "maintenance-job_7123456789abcdef01234567"
+    cycle_b_id = "maintenance-job_8123456789abcdef01234567"
+    base_job = maint.read_job(first.jobId)
+    assert base_job is not None
+    controls = {
+        unrelated_id: dataclasses.replace(base_job, jobId=unrelated_id,
+            eventIds=("git-event_5123456789abcdef01234567",), targetCommit=commit_e),
+        missing_id: dataclasses.replace(base_job, jobId=missing_id,
+            eventIds=("git-event_6123456789abcdef01234567",), targetCommit=commit_e),
+        cycle_a_id: dataclasses.replace(base_job, jobId=cycle_a_id,
+            eventIds=("git-event_7123456789abcdef01234567",), targetCommit=commit_e),
+        cycle_b_id: dataclasses.replace(base_job, jobId=cycle_b_id,
+            eventIds=("git-event_8123456789abcdef01234567",), targetCommit=commit_e),
+    }
+    with ledger.mutation():
+        current = maint.read_state()
+        jobs = dict(current.jobs)
+        for job_id, job in controls.items():
+            maint.write_job(job)
+            successor = {
+                missing_id: "maintenance-job_9123456789abcdef01234567",
+                cycle_a_id: cycle_b_id,
+                cycle_b_id: cycle_a_id,
+            }.get(job_id)
+            jobs[job_id] = dataclasses.replace(
+                current.jobs[first.jobId], status="stale", activeAttemptId=None,
+                supersededByJobId=successor, resolutionReason=None,
+            )
+        maint.replace_state(dataclasses.replace(current, jobs=jobs))
+
+    status_code, status_payload, _stderr = _invoke(root, capsys, "status")
+    status_jobs = {item["jobId"]: item for item in status_payload["result"]["jobs"]}
+    assert status_code == 4
+    assert status_jobs[first.jobId]["resolved"] is True
+    assert status_jobs[second.jobId]["resolved"] is True
+    assert all(status_jobs[key]["resolved"] is False for key in controls)
+
+    catch_code, catch_payload, _stderr = _invoke(root, capsys, "catch-up")
+    catch_ids = {item["jobId"] for item in catch_payload["result"]["jobs"]}
+    assert catch_code == 4
+    assert catch_ids == set(controls)
+
+
 @pytest.mark.parametrize(("job_status", "exit_code"), [("approved", 4), ("failed", 6)])
 def test_catch_up_keeps_approved_or_failed_work_visible(
     tmp_path: Path, capsys, job_status: str, exit_code: int,
